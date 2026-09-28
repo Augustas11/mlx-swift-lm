@@ -81,6 +81,29 @@ func testMTPDrafterContainerPerform() async {
     #expect(modelIsMock)
 }
 
+@Test
+func testMTPDrafterContainerPerformWithNonSendableValue() async {
+    final class Value {
+        let token: Int
+
+        init(token: Int) {
+            self.token = token
+        }
+    }
+
+    let drafter = MockMTPDrafter()
+    let config = ModelConfiguration(id: "test/mock-drafter", defaultPrompt: "")
+    let container = MTPDrafterContainer(
+        context: MTPDrafterContext(configuration: config, model: drafter))
+
+    let token = await container.perform(nonSendable: Value(token: 17)) { context, value in
+        #expect(context.model is MockMTPDrafter)
+        return value.token
+    }
+
+    #expect(token == 17)
+}
+
 /// Minimal LanguageModel implementation for test plumbing only.
 private final class DummyLanguageModel: Module, LanguageModel, KVCacheDimensionProvider {
     var kvHeads: [Int] { [] }

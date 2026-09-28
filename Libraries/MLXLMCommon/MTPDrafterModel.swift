@@ -253,6 +253,24 @@ public final class MTPDrafterContainer: Sendable {
             try await action($0)
         }
     }
+
+    /// Perform an action on the ``MTPDrafterContext`` with additional
+    /// non-`Sendable` context values.
+    ///
+    /// This mirrors ``ModelContainer/perform(nonSendable:_:)`` so callers can
+    /// move row-owned ``MTPDrafterState`` through serialized drafter access
+    /// without storing transient state on the model or using unsafe captures.
+    /// Callers _must_ eval any `MLXArray` before returning because `MLXArray`
+    /// is not `Sendable`.
+    public func perform<V, R: Sendable>(
+        nonSendable values: consuming V,
+        _ action: @Sendable (MTPDrafterContext, V) async throws -> R
+    ) async rethrows -> sending R {
+        let values = SendableBox(values)
+        return try await context.read {
+            try await action($0, values.consume())
+        }
+    }
 }
 
 // MARK: - Cross-model state keys
