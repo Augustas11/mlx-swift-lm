@@ -23,7 +23,10 @@ public enum Qwen35TextMTPRegistration {
             creator: { data in
                 let config = try JSONDecoder.json5().decode(
                     Qwen35Configuration.self, from: data)
-                return Qwen35MTPDraftModel(config, preconvertedNorms: true)
+                return Qwen35MTPDraftModel(
+                    config,
+                    preconvertedNorms: true,
+                    standaloneCheckpoint: true)
             }
         )
         await MTPDrafterTypeRegistry.shared.registerModelType(

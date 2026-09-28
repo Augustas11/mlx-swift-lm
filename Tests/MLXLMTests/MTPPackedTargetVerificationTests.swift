@@ -21,10 +21,12 @@ private final class PackedVerificationCache: MTPPackedVerificationCache {
     private(set) var finalizeCallCount = 0
     var batchOffset: MLXArray
     let maxSize: Int?
+    let mtpPackedCheckpointIndex: Int?
 
-    init(offsets: [Int], maxSize: Int? = nil) {
+    init(offsets: [Int], maxSize: Int? = nil, checkpointIndex: Int? = nil) {
         self.batchOffset = MLXArray(int64: offsets)
         self.maxSize = maxSize
+        self.mtpPackedCheckpointIndex = checkpointIndex
     }
 
     var offset: Int { batchOffset.asArray(Int.self).max() ?? 0 }
@@ -81,7 +83,8 @@ private final class PackedVerificationCache: MTPPackedVerificationCache {
     func copy() -> any KVCache {
         PackedVerificationCache(
             offsets: batchOffset.asArray(Int.self),
-            maxSize: maxSize)
+            maxSize: maxSize,
+            checkpointIndex: mtpPackedCheckpointIndex)
     }
 
     func finishPackedForward(wrongOffsetRow: Int? = nil) {
@@ -105,6 +108,7 @@ private final class PackedVerificationModel: Module, LanguageModel, KVCacheDimen
     private(set) var receivedTokens: [Int] = []
     private(set) var receivedMask: [Int] = []
     private(set) var receivedEmitFlag: Bool?
+    private(set) var receivedCheckpointIndex: Int?
     private(set) var receivedOpaqueState: Int?
     private(set) var observedActiveLengths: [Int]?
     private(set) var observedActiveRowMaps: [MTPPackedVerificationRowMap]?
@@ -136,6 +140,7 @@ private final class PackedVerificationModel: Module, LanguageModel, KVCacheDimen
         receivedTokens = input.tokens.asArray(Int.self)
         receivedMask = input.mask?.asArray(Int.self) ?? []
         receivedEmitFlag = state?[mtpEmitFlagKey]
+        receivedCheckpointIndex = state?[mtpCacheCheckpointIndexKey]
         receivedOpaqueState = state?[packedOutputStateKey]
         observedActiveLengths = (cache?.first as? PackedVerificationCache)?.activeLengths
         observedActiveRowMaps = (cache?.first as? PackedVerificationCache)?.activeRowMaps
@@ -316,6 +321,81 @@ struct MTPPackedTargetVerificationTests {
         #expect(cache.finalizeCallCount == 1)
         #expect(cache.activeLengths == nil)
         #expect(cache.activeRowMaps == nil)
+    }
+
+    @Test func recurrentCacheRequestsUnconditionalPrefixCheckpoint() throws {
+        let model = PackedVerificationModel()
+        let attention = PackedVerificationCache(offsets: [3, 7])
+        let recurrent = PackedVerificationCache(
+            offsets: [3, 7], checkpointIndex: 1)
+        let maps = [
+            MTPPackedVerificationRowMap(
+                rowIndex: 0, queryOffset: 3, inputCount: 2, proposalCount: 1),
+            MTPPackedVerificationRowMap(
+                rowIndex: 1, queryOffset: 7, inputCount: 2, proposalCount: 1),
+        ]
+
+        _ = try verifyMTPPackedTargets(
+            model: model,
+            tokens: MLXArray([10, 11, 20, 21]).reshaped(2, 2),
+            rowMaps: maps,
+            cache: [attention, recurrent])
+
+        #expect(model.receivedCheckpointIndex == 1)
+        #expect(attention.finalizeCallCount == 1)
+        #expect(recurrent.finalizeCallCount == 1)
+    }
+
+    @Test func recurrentCheckpointRequiresAtLeastOneSpeculativeColumn() throws {
+        let model = PackedVerificationModel()
+        let cache = PackedVerificationCache(offsets: [0], checkpointIndex: 1)
+
+        #expect(throws: MTPPackedVerificationError.invalidCheckpointIndex(1)) {
+            try verifyMTPPackedTargets(
+                model: model,
+                tokens: MLXArray([7]).reshaped(1, 1),
+                rowMaps: [
+                    .init(rowIndex: 0, queryOffset: 0, inputCount: 1, proposalCount: 0)
+                ],
+                cache: [cache])
+        }
+
+        #expect(model.callCount == 0)
+    }
+
+    @Test func packedMambaRowsResolveAcceptedAndRejectedProposalsIndependently() throws {
+        let first = MambaCache()
+        first.state = [
+            MLXArray([Float(1)]).reshaped(1, 1),
+            MLXArray([Float(2)]).reshaped(1, 1),
+        ]
+        let second = MambaCache()
+        second.state = [
+            MLXArray([Float(3)]).reshaped(1, 1),
+            MLXArray([Float(4)]).reshaped(1, 1),
+        ]
+        let batch = try MTPPackedMambaBatchCache(rowCaches: [first, second])
+        try batch.prepareMTPPackedVerification(rowMaps: [
+            .init(rowIndex: 0, queryOffset: 5, inputCount: 2, proposalCount: 1),
+            .init(rowIndex: 1, queryOffset: 9, inputCount: 2, proposalCount: 1),
+        ])
+        batch.saveSpeculativeCheckpoint(
+            convState: MLXArray([Float(10), 30]).reshaped(2, 1),
+            recurrentState: MLXArray([Float(20), 40]).reshaped(2, 1),
+            advancedBy: 1)
+        batch.state = [
+            MLXArray([Float(11), 31]).reshaped(2, 1),
+            MLXArray([Float(21), 41]).reshaped(2, 1),
+        ]
+
+        let transactions = try batch.rowTransactions()
+        try transactions[0].commit(retaining: 1)
+        try transactions[1].commit(retaining: 2)
+
+        #expect(first.state[0].asArray(Float.self) == [10])
+        #expect(first.state[1].asArray(Float.self) == [20])
+        #expect(second.state[0].asArray(Float.self) == [31])
+        #expect(second.state[1].asArray(Float.self) == [41])
     }
 
     @Test func ordinaryRowMaySharePackedForwardWithoutProposals() throws {

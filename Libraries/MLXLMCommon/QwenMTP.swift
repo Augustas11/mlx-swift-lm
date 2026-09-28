@@ -8,9 +8,17 @@ package func qwenMTPSanitizeWeights(
     weights: [String: MLXArray],
     mtpNumHiddenLayers: Int,
     numExperts: Int,
-    shiftNormWeights: Bool
+    shiftNormWeights: Bool,
+    standaloneCheckpoint: Bool = false
 ) -> [String: MLXArray] {
-    var sanitized = weights.filter { key, _ in key.hasPrefix("mtp.") }
+    var sanitized: [String: MLXArray] = [:]
+    for (key, value) in weights {
+        if key.hasPrefix("mtp.") {
+            sanitized[key] = value
+        } else if standaloneCheckpoint {
+            sanitized["mtp.\(key)"] = value
+        }
+    }
 
     for layer in 0 ..< max(mtpNumHiddenLayers, 1) {
         let prefix = "mtp.layers.\(layer).mlp"

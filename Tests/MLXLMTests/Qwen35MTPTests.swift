@@ -61,13 +61,21 @@ func testQwen35StandaloneMTPDoesNotDoubleShiftConvertedNorms() throws {
     let cfg = try JSONDecoder().decode(
         MLXLLM.Qwen35Configuration.self,
         from: Data(qwen35StandaloneMTPConfigJSON().utf8))
-    let drafter = MLXLLM.Qwen35MTPDraftModel(cfg, preconvertedNorms: true)
+    let drafter = MLXLLM.Qwen35MTPDraftModel(
+        cfg,
+        preconvertedNorms: true,
+        standaloneCheckpoint: true)
 
     let weight = MLXArray.zeros([16])
-    let sanitized = drafter.sanitize(weights: ["mtp.norm.weight": weight])
+    let fc = MLXArray.zeros([16, 32])
+    let sanitized = drafter.sanitize(weights: [
+        "norm.weight": weight,
+        "fc.weight": fc,
+    ])
     let norm = try #require(sanitized["mtp.norm.weight"])
     eval(norm)
     #expect(allClose(norm, weight, rtol: 0, atol: 0).item(Bool.self))
+    #expect(sanitized["mtp.fc.weight"]?.shape == [16, 32])
 }
 
 @Test

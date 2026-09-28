@@ -25,6 +25,16 @@ public protocol MTPPackedVerificationCache: BatchPositionedKVCache {
     /// `rowIndex` identifies scheduler-owned transaction state, while
     /// `queryOffset` is the absolute position of `lastCommitted`.
     func prepareMTPPackedVerification(rowMaps: [MTPPackedVerificationRowMap]) throws
+
+    /// Target-native recurrent checkpoint requested for this packed call.
+    ///
+    /// Hybrid caches return the number of leading verification columns that
+    /// are unconditionally retained. Attention-only caches use `nil`.
+    var mtpPackedCheckpointIndex: Int? { get }
+}
+
+extension MTPPackedVerificationCache {
+    public var mtpPackedCheckpointIndex: Int? { nil }
 }
 
 /// Maps one packed target-model row back to a scheduler-owned sequence.
@@ -91,6 +101,168 @@ public struct MTPPackedVerificationOutput {
     public let rows: [MTPPackedVerificationRowOutput]
 }
 
+/// Resolution failures from ``MTPPackedMambaBatchCache``.
+public enum MTPPackedMambaCacheError: Error, Equatable {
+    case invalidRowMaps
+    case incompatibleRowState
+    case missingForwardState
+    case missingCheckpoint
+    case invalidRetainedInputCount(retaining: Int, inputCount: Int)
+    case unsupportedPartialRetention(retaining: Int, proposalCount: Int)
+}
+
+/// One row-local recurrent-state transaction produced by a packed MTP call.
+///
+/// The source row remains unchanged until ``commit(retaining:)``. Dropping the
+/// transaction therefore rolls back without work.
+public final class MTPPackedMambaRowTransaction {
+    public let inputCount: Int
+    public let proposalCount: Int
+
+    private let rowCache: MambaCache
+    private let baseState: [MLXArray]
+    private let finalState: [MLXArray]
+
+    package init(
+        rowCache: MambaCache,
+        inputCount: Int,
+        proposalCount: Int,
+        baseState: [MLXArray],
+        finalState: [MLXArray]
+    ) {
+        self.rowCache = rowCache
+        self.inputCount = inputCount
+        self.proposalCount = proposalCount
+        self.baseState = baseState
+        self.finalState = finalState
+    }
+
+    /// Commit an exact leading prefix of the packed verification input.
+    ///
+    /// Current hybrid Qwen checkpoints support the unconditional base column
+    /// or the complete one-proposal write.
+    public func commit(retaining: Int) throws {
+        guard retaining > 0, retaining <= inputCount else {
+            throw MTPPackedMambaCacheError.invalidRetainedInputCount(
+                retaining: retaining, inputCount: inputCount)
+        }
+        let selected: [MLXArray]
+        if retaining == inputCount {
+            selected = finalState
+        } else if retaining == 1, proposalCount == 1 {
+            selected = baseState
+        } else {
+            throw MTPPackedMambaCacheError.unsupportedPartialRetention(
+                retaining: retaining, proposalCount: proposalCount)
+        }
+        rowCache.state = selected
+        eval(selected)
+    }
+}
+
+/// Transactional batched recurrent cache for packed hybrid-model MTP.
+///
+/// The target sees a concrete `MambaCache`, while row-owned caches remain
+/// isolated until the scheduler resolves each returned row transaction.
+public final class MTPPackedMambaBatchCache: MambaCache, MTPPackedVerificationCache {
+    private let rowCaches: [MambaCache]
+    private var preparedRowMaps: [MTPPackedVerificationRowMap]?
+    private var pendingTransactions: [MTPPackedMambaRowTransaction]?
+
+    public init(rowCaches: [MambaCache]) throws {
+        self.rowCaches = rowCaches
+        super.init()
+        try packRows()
+    }
+
+    public var batchOffset: MLXArray {
+        MLXArray(
+            (preparedRowMaps?.map(\.queryOffset) ?? rowCaches.map(\.offset))
+                .map(Int32.init))
+    }
+
+    public var mtpPackedCheckpointIndex: Int? {
+        guard let preparedRowMaps,
+              preparedRowMaps.contains(where: { $0.proposalCount > 0 })
+        else { return nil }
+        return 1
+    }
+
+    public func prepareMTPPackedVerification(
+        rowMaps: [MTPPackedVerificationRowMap]
+    ) throws {
+        guard rowMaps.count == rowCaches.count,
+              rowMaps.allSatisfy({
+                  $0.queryOffset >= 0
+                      && $0.inputCount == $0.proposalCount + 1
+                      && (0 ... 1).contains($0.proposalCount)
+              })
+        else { throw MTPPackedMambaCacheError.invalidRowMaps }
+        preparedRowMaps = rowMaps
+        pendingTransactions = nil
+    }
+
+    /// Capture row-local commit handles after the packed target forward.
+    public func rowTransactions() throws -> [MTPPackedMambaRowTransaction] {
+        if let pendingTransactions { return pendingTransactions }
+        guard let preparedRowMaps,
+              preparedRowMaps.count == rowCaches.count,
+              state.count == 2
+        else { throw MTPPackedMambaCacheError.missingForwardState }
+
+        let completeState = state
+        let needsCheckpoint = preparedRowMaps.contains(where: { $0.proposalCount > 0 })
+        let checkpointState: [MLXArray]
+        if needsCheckpoint {
+            guard restoreSpeculativeCheckpoint(), state.count == 2 else {
+                throw MTPPackedMambaCacheError.missingCheckpoint
+            }
+            checkpointState = state
+            state = completeState
+        } else {
+            checkpointState = completeState
+        }
+
+        let transactions = preparedRowMaps.enumerated().map { rowIndex, map in
+            MTPPackedMambaRowTransaction(
+                rowCache: rowCaches[rowIndex],
+                inputCount: map.inputCount,
+                proposalCount: map.proposalCount,
+                baseState: checkpointState.map {
+                    $0[rowIndex ..< rowIndex + 1, .ellipsis]
+                },
+                finalState: completeState.map {
+                    $0[rowIndex ..< rowIndex + 1, .ellipsis]
+                })
+        }
+        pendingTransactions = transactions
+        return transactions
+    }
+
+    private func packRows() throws {
+        let rowStates = rowCaches.map(\.state)
+        let slotCount = rowStates.map(\.count).max() ?? 0
+        guard slotCount > 0 else { return }
+        for slot in 0 ..< slotCount {
+            guard let first = rowStates.first(where: { $0.indices.contains(slot) })?[slot]
+            else { throw MTPPackedMambaCacheError.incompatibleRowState }
+            let arrays = rowStates.map { states in
+                states.indices.contains(slot)
+                    ? states[slot]
+                    : MLXArray.zeros(
+                        [1] + Array(first.shape.dropFirst()), dtype: first.dtype)
+            }
+            guard arrays.allSatisfy({
+                $0.ndim >= 1
+                    && $0.dim(0) == 1
+                    && Array($0.shape.dropFirst()) == Array(first.shape.dropFirst())
+                    && $0.dtype == first.dtype
+            }) else { throw MTPPackedMambaCacheError.incompatibleRowState }
+            self[slot] = concatenated(arrays, axis: 0)
+        }
+    }
+}
+
 /// Target state for one packed row's next MTP drafter call.
 ///
 /// Every array keeps a leading batch dimension of one. Shared K/V arrays are
@@ -154,6 +326,8 @@ public enum MTPPackedVerificationError: Error, Equatable {
         cacheIndex: Int, rowIndex: Int, expected: Int, actual: Int)
     case missingFullAttentionSharedKV
     case invalidPositionDeltasShape(expectedBatch: Int, actualShape: [Int])
+    case inconsistentCheckpointIndices([Int])
+    case invalidCheckpointIndex(Int)
 }
 
 /// Verify ragged MTP proposal rows with exactly one target-model call.
@@ -289,6 +463,20 @@ public func verifyMTPPackedTargets(
     }
     for entry in packedCache {
         try entry.prepareMTPPackedVerification(rowMaps: rowMaps)
+    }
+    let checkpointIndices = Set(packedCache.compactMap(\.mtpPackedCheckpointIndex))
+    guard checkpointIndices.count <= 1 else {
+        throw MTPPackedVerificationError.inconsistentCheckpointIndices(
+            checkpointIndices.sorted())
+    }
+    if let checkpointIndex = checkpointIndices.first {
+        guard checkpointIndex > 0,
+              rowMaps.allSatisfy({ checkpointIndex <= $0.inputCount }),
+              rowMaps.contains(where: { checkpointIndex < $0.inputCount })
+        else {
+            throw MTPPackedVerificationError.invalidCheckpointIndex(checkpointIndex)
+        }
+        targetState[mtpCacheCheckpointIndexKey] = checkpointIndex
     }
     for entry in cache {
         entry.prepare(lengths: rowMaps.map(\.inputCount))
