@@ -23,6 +23,19 @@ import MLXNN
 /// `draftBlock(...)` as a method parameter. This makes drafter instances safe
 /// to share across iterators without per-iterator mutable state.
 public protocol MTPDrafterModel: BaseLanguageModel {
+    /// Largest total verification block the drafter can produce efficiently.
+    /// `nil` leaves the choice to the caller.
+    var maximumBlockSize: Int? { get }
+
+    /// Whether the drafter consumes target-emitted shared K/V state.
+    var requiresSharedTargetKV: Bool { get }
+
+    /// Whether the drafter needs a shifted-prompt prefill before proposing.
+    var requiresPromptPrefill: Bool { get }
+
+    /// Whether only greedy sampling currently has exact acceptance semantics.
+    var requiresGreedySampling: Bool { get }
+
     /// K-step drafting from a constant position.
     ///
     /// Returns the proposed tokens as a `[B, blockSize - 1]` MLXArray. The
@@ -57,6 +70,132 @@ public protocol MTPDrafterModel: BaseLanguageModel {
         blockSize: Int,
         sampler: any LogitSampler
     ) -> MLXArray
+}
+
+extension MTPDrafterModel {
+    public var maximumBlockSize: Int? { nil }
+    public var requiresSharedTargetKV: Bool { true }
+    public var requiresPromptPrefill: Bool { false }
+    public var requiresGreedySampling: Bool { false }
+
+    /// Position-aware drafting entry point used by packed schedulers.
+    ///
+    /// The compatibility default preserves the 3.31.4 stateless-drafter
+    /// behavior. Architectures with target-specific continuation positions can
+    /// override it without changing existing conformers.
+    public func draftBlock(
+        target: any LanguageModel,
+        lastToken: MLXArray,
+        lastHidden: MLXArray,
+        sharedKV: [String: (MLXArray, MLXArray)],
+        positionDeltas _: MLXArray?,
+        queryOffset: Int,
+        blockSize: Int,
+        sampler: any LogitSampler
+    ) -> MLXArray {
+        draftBlock(
+            target: target,
+            lastToken: lastToken,
+            lastHidden: lastHidden,
+            sharedKV: sharedKV,
+            queryOffset: queryOffset,
+            blockSize: blockSize,
+            sampler: sampler)
+    }
+}
+
+/// Target capability for an exact in-place speculative cache rewind.
+public protocol SpeculativeCacheRewindModel {
+    var maximumNativeTargetCacheRewind: Int { get }
+}
+
+/// Iterator- or scheduler-owned transient state for a stateful MTP drafter.
+public struct MTPDrafterState {
+    public var cache: [KVCache]
+    public var nextPosition: Int
+    public var seedToken: MLXArray?
+    public var seedHidden: MLXArray?
+    public var proposalAppended: Int
+
+    public init(
+        cache: [KVCache],
+        nextPosition: Int = 0,
+        seedToken: MLXArray? = nil,
+        seedHidden: MLXArray? = nil,
+        proposalAppended: Int = 0
+    ) {
+        self.cache = cache
+        self.nextPosition = nextPosition
+        self.seedToken = seedToken
+        self.seedHidden = seedHidden
+        self.proposalAppended = proposalAppended
+    }
+}
+
+/// MTP drafter whose mutable row state is owned outside the model instance.
+public protocol StatefulMTPDrafterModel: MTPDrafterModel {
+    func makeState(parameters: GenerateParameters?) -> MTPDrafterState
+
+    func prepareDrafterState(
+        target: any LanguageModel,
+        promptTokens: MLXArray,
+        targetHidden: MLXArray,
+        firstBonus: MLXArray,
+        positionDeltas: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    )
+
+    func draftBlock(
+        target: any LanguageModel,
+        lastToken: MLXArray,
+        lastHidden: MLXArray,
+        sharedKV: [String: (MLXArray, MLXArray)],
+        positionDeltas: MLXArray?,
+        queryOffset: Int,
+        blockSize: Int,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) -> MLXArray
+
+    func commitDrafterState(
+        target: any LanguageModel,
+        targetHidden: MLXArray,
+        draftTokens: MLXArray,
+        acceptedCount: Int,
+        finalToken: MLXArray,
+        positionDeltas: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    )
+}
+
+extension StatefulMTPDrafterModel {
+    public func prepareDrafterState(
+        target _: any LanguageModel,
+        promptTokens _: MLXArray,
+        targetHidden _: MLXArray,
+        firstBonus _: MLXArray,
+        positionDeltas _: MLXArray?,
+        state _: inout MTPDrafterState,
+        sampler _: any LogitSampler
+    ) {}
+
+    public func commitDrafterState(
+        target _: any LanguageModel,
+        targetHidden _: MLXArray,
+        draftTokens: MLXArray,
+        acceptedCount: Int,
+        finalToken _: MLXArray,
+        positionDeltas _: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler _: any LogitSampler
+    ) {
+        let rejected = draftTokens.dim(-1) - acceptedCount
+        if rejected > 0 {
+            trimPromptCache(state.cache, numTokens: rejected)
+        }
+    }
 }
 
 /// Lightweight context for an MTP drafter — simpler than `ModelContext`
@@ -101,6 +240,18 @@ public final class MTPDrafterContainer: Sendable {
             try await action($0)
         }
     }
+
+    /// Perform serialized access while moving row-owned non-Sendable state
+    /// into and out of the isolation domain.
+    public func perform<V, R>(
+        nonSendable values: consuming V,
+        _ action: @Sendable (MTPDrafterContext, V) async throws -> R
+    ) async rethrows -> sending R {
+        let values = SendableBox(values)
+        return try await context.read {
+            SendableBox(try await action($0, values.consume()))
+        }.consume()
+    }
 }
 
 // MARK: - Cross-model state keys
@@ -125,11 +276,27 @@ public let mtpLastHiddenStatesKey =
 public let mtpSharedKVStatesKey =
     LMOutput.Key<[String: (MLXArray, MLXArray)]>("mtp.sharedKVStates")
 
+/// Absolute target cache offsets for each emitted shared-K/V layer type.
+public let mtpSharedKVOffsetsKey =
+    LMOutput.Key<[String: Int]>("mtp.sharedKVOffsets")
+
+/// Optional target-specific position delta state for continuation.
+public let mtpPositionDeltasKey =
+    LMOutput.Key<MLXArray>("mtp.positionDeltas")
+
 /// The MTP iterator sets this key on the ``LMOutput/State`` it passes into
 /// the main model on each call to opt the target into emitting
 /// ``mtpLastHiddenStatesKey`` and ``mtpSharedKVStatesKey``. An absent key
 /// reads as `false` (no emit), so non-MTP callers are unaffected.
 public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
+
+/// Requests a recurrent checkpoint after this many verification inputs.
+public let mtpCacheCheckpointIndexKey =
+    LMOutput.Key<Int>("mtp.cacheCheckpointIndex")
+
+/// Cache entry that supplied each shared-K/V tuple.
+public let mtpSharedKVSourceIndicesKey =
+    LMOutput.Key<[String: Int]>("mtp.sharedKVSourceIndices")
 
 // MARK: - Iterator stats surface
 

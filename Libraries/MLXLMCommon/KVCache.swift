@@ -65,6 +65,9 @@ public protocol KVCache: Evaluatable {
     /// whether this cache can be trimmed
     var isTrimmable: Bool { get }
 
+    /// Whether an exact trim remains possible after appending `positions`.
+    func isTrimmable(after positions: Int) -> Bool
+
     /// trim n tokens from the cache, returning actual number trimmed
     @discardableResult
     func trim(_ n: Int) -> Int
@@ -99,6 +102,10 @@ public protocol KVCache: Evaluatable {
 extension KVCache {
     public var ropeOffset: RoPEOffset {
         .scalar(offset)
+    }
+
+    public func isTrimmable(after positions: Int) -> Bool {
+        isTrimmable
     }
 
     public func prepare(lengths: [Int]?) {}
@@ -199,6 +206,10 @@ open class BaseKVCache: KVCache {
     }
 
     open var isTrimmable: Bool { false }
+
+    open func isTrimmable(after positions: Int) -> Bool {
+        isTrimmable
+    }
 
     @discardableResult
     open func trim(_ n: Int) -> Int { 0 }
@@ -568,6 +579,28 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         }
     }
 
+    /// Return the newest cache entries in chronological order without writing.
+    package func logicalView(tail: Int) -> (MLXArray, MLXArray)? {
+        guard let keys, let values else { return nil }
+        let orderedKeys = temporalOrder(keys)
+        let orderedValues = temporalOrder(values)
+        let available = orderedKeys.dim(2)
+        let requested = Swift.min(Swift.max(tail, 0), available)
+        let bound = Swift.max(requested, Swift.min(keep, available))
+        let trimSize = available - bound
+        guard trimSize > 0 else { return (orderedKeys, orderedValues) }
+        if keep == 0 {
+            return (
+                orderedKeys[.ellipsis, trimSize..., 0...],
+                orderedValues[.ellipsis, trimSize..., 0...]
+            )
+        }
+        return (
+            trim(trimSize: trimSize, orderedKeys),
+            trim(trimSize: trimSize, orderedValues)
+        )
+    }
+
     private func updateConcat(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         if self.keys == nil {
             self.keys = keys
@@ -716,6 +749,10 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     public override var isTrimmable: Bool {
         return offset < maxCacheSize
+    }
+
+    public override func isTrimmable(after positions: Int) -> Bool {
+        offset + positions < maxCacheSize
     }
 
     @discardableResult
@@ -1397,8 +1434,48 @@ public class ArraysCache: BaseKVCache {
 
 /// Simple cache for Mamba-style state space models
 public class MambaCache: ArraysCache {
+    private struct SpeculativeCheckpoint {
+        var state: [MLXArray?]
+        var offset: Int
+        var leftPadding: MLXArray?
+        var lengths: MLXArray?
+    }
+
+    private var speculativeCheckpoint: SpeculativeCheckpoint?
+
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
+    }
+
+    package func saveSpeculativeCheckpoint(
+        convState: MLXArray,
+        recurrentState: MLXArray,
+        advancedBy tokenCount: Int
+    ) {
+        speculativeCheckpoint = SpeculativeCheckpoint(
+            state: [convState, recurrentState],
+            offset: offset,
+            leftPadding: leftPadding.map { $0 - tokenCount },
+            lengths: lengths.map { $0 - tokenCount })
+    }
+
+    package var hasSpeculativeCheckpoint: Bool {
+        speculativeCheckpoint != nil
+    }
+
+    @discardableResult
+    package func restoreSpeculativeCheckpoint() -> Bool {
+        guard let checkpoint = speculativeCheckpoint else { return false }
+        cache = checkpoint.state
+        offset = checkpoint.offset
+        leftPadding = checkpoint.leftPadding
+        lengths = checkpoint.lengths
+        speculativeCheckpoint = nil
+        return true
+    }
+
+    package func discardSpeculativeCheckpoint() {
+        speculativeCheckpoint = nil
     }
 
     public override func copy() -> any KVCache {
@@ -1872,6 +1949,39 @@ public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
     guard canTrimPromptCache(cache), !cache.isEmpty else { return 0 }
     cache.dropFirst().forEach { $0.trim(numTokens) }
     return cache.first?.trim(numTokens) ?? 0
+}
+
+/// Rewind a one-token speculative tail in a hybrid attention/recurrent cache.
+@discardableResult
+package func rewindSpeculativePromptCache(
+    _ cache: [KVCache], numTokens: Int
+) -> Int {
+    guard numTokens == 1,
+        cache.allSatisfy({ entry in
+            entry.isTrimmable
+                ? entry.offset >= numTokens
+                : (entry as? MambaCache)?.hasSpeculativeCheckpoint == true
+        })
+    else { return 0 }
+
+    for entry in cache {
+        if entry.isTrimmable {
+            guard entry.trim(numTokens) == numTokens else {
+                preconditionFailure("Speculative cache validation and rewind diverged")
+            }
+        } else {
+            guard (entry as? MambaCache)?.restoreSpeculativeCheckpoint() == true else {
+                preconditionFailure("Missing recurrent speculative checkpoint")
+            }
+        }
+    }
+    return numTokens
+}
+
+package func discardSpeculativePromptCacheCheckpoints(_ cache: [KVCache]) {
+    for case let entry as MambaCache in cache {
+        entry.discardSpeculativeCheckpoint()
+    }
 }
 
 // MARK: - Type Aliases
