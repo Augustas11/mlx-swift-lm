@@ -26,7 +26,10 @@ public enum Qwen35VLMMTPRegistration {
             creator: { data in
                 let config = try JSONDecoder.json5().decode(
                     Qwen35Configuration.self, from: data)
-                return Qwen35VLMNextNDraftModel(config, preconvertedNorms: true)
+                return Qwen35VLMNextNDraftModel(
+                    config,
+                    preconvertedNorms: true,
+                    standaloneCheckpoint: true)
             }
         )
         await MTPDrafterTypeRegistry.shared.registerModelType(

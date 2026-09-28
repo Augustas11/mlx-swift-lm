@@ -72,24 +72,31 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = true
     private let preconvertedNorms: Bool
+    private let standaloneCheckpoint: Bool
 
     @ModuleInfo(key: "mtp") var mtp: Qwen35MTPPredictor
 
     public init(
         _ configuration: Qwen35TextConfiguration,
-        preconvertedNorms: Bool = false
+        preconvertedNorms: Bool = false,
+        standaloneCheckpoint: Bool = false
     ) {
         self.configuration = configuration
         self.preconvertedNorms = preconvertedNorms
+        self.standaloneCheckpoint = standaloneCheckpoint
         _mtp.wrappedValue = Qwen35MTPPredictor(configuration)
         super.init()
     }
 
     public convenience init(
         _ configuration: Qwen35Configuration,
-        preconvertedNorms: Bool = false
+        preconvertedNorms: Bool = false,
+        standaloneCheckpoint: Bool = false
     ) {
-        self.init(configuration.textConfig, preconvertedNorms: preconvertedNorms)
+        self.init(
+            configuration.textConfig,
+            preconvertedNorms: preconvertedNorms,
+            standaloneCheckpoint: standaloneCheckpoint)
     }
 
     public func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
@@ -241,7 +248,8 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
             weights: weights,
             mtpNumHiddenLayers: configuration.mtpNumHiddenLayers,
             numExperts: configuration.numExperts,
-            shiftNormWeights: !preconvertedNorms
+            shiftNormWeights: !preconvertedNorms,
+            standaloneCheckpoint: standaloneCheckpoint
         )
     }
 
