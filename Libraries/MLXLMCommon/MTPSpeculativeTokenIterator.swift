@@ -774,28 +774,6 @@ extension MTPSpeculativeTokenIterator {
 func reconcileSharedKVState(
     _ state: inout LMOutput.State?, discarding: Int, lengths: (Int) -> Int
 ) -> Bool {
-    guard let sharedKV = state?[mtpSharedKVStatesKey] else { return true }
-    guard let sources = state?[mtpSharedKVSourceIndicesKey],
-        sharedKV.keys.allSatisfy({ sources[$0] != nil })
-    else { return false }
-
-    state?[mtpSharedKVStatesKey] = sharedKV.reduce(into: [:]) { result, entry in
-        let (key, kv) = entry
-        var length = kv.0.dim(-2)
-        if discarding > 0 {
-            length = Swift.max(0, length - discarding)
-        }
-        let bound = lengths(sources[key]!)
-        let start = Swift.max(0, length - bound)
-        result[key] = (
-            kv.0[.ellipsis, start ..< length, 0...],
-            kv.1[.ellipsis, start ..< length, 0...]
-        )
-    }
-    if discarding > 0, let offsets = state?[mtpSharedKVOffsetsKey] {
-        state?[mtpSharedKVOffsetsKey] = offsets.mapValues {
-            Swift.max(0, $0 - discarding)
-        }
-    }
-    return true
+    reconcileMTPSharedKVState(
+        &state, discarding: discarding, emittedLength: lengths)
 }
