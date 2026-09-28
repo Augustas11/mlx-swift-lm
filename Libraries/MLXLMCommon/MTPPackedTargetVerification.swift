@@ -74,16 +74,49 @@ public struct MTPPackedVerificationRowOutput {
     /// is accepted. It is intentionally separate from ``proposalLogits``.
     public let bonusLogits: MLXArray
 
-    /// Target hidden states for the valid input prefix, when emitted.
-    ///
-    /// This is the only model state this facade consumes or exposes.
+    /// Compatibility view of target hidden states for the valid input prefix,
+    /// shaped `[inputCount, hiddenSize]`, when emitted.
     public let lastHidden: MLXArray?
+
+    /// Exact row-local target state for another drafter round.
+    ///
+    /// This is populated only by the strict overload that sets
+    /// `requireContinuationState`.
+    public let continuationState: MTPPackedVerificationRowState?
 }
 
 /// Result of one packed target-model verification call.
 public struct MTPPackedVerificationOutput {
     /// Per-row logit slices in packed-input order.
     public let rows: [MTPPackedVerificationRowOutput]
+}
+
+/// Target state for one packed row's next MTP drafter call.
+///
+/// Every array keeps a leading batch dimension of one. Shared K/V arrays are
+/// also trimmed to the row's live chronological sequence span, so they contain
+/// neither another packed row nor right-padding from this one.
+public struct MTPPackedVerificationRowState {
+    /// Target hidden states for this row's valid verification input, shaped
+    /// `[1, inputCount, hiddenSize]`.
+    public let lastHidden: MLXArray
+
+    /// Target K/V snapshots keyed by layer type. Each tuple keeps the target's
+    /// original rank with batch size one and a row-local live sequence axis.
+    public let sharedKV: [String: (MLXArray, MLXArray)]
+
+    /// Cache entry that supplied each shared K/V tuple.
+    public let sharedKVSourceIndices: [String: Int]
+
+    /// Absolute post-forward cache offset for each shared K/V tuple.
+    public let sharedKVOffsets: [String: Int]
+
+    /// Absolute position for the next drafter query. This is the resolved
+    /// `full_attention` shared-K/V offset for this row.
+    public let queryOffset: Int
+
+    /// Row-sliced target position deltas, when the model emitted them.
+    public let positionDeltas: MLXArray?
 }
 
 /// Validation failures from ``verifyMTPPackedTargets(model:tokens:rowMaps:cache:)``.
@@ -98,12 +131,29 @@ public enum MTPPackedVerificationError: Error, Equatable {
     case invalidProposalCount(rowIndex: Int, proposalCount: Int, inputCount: Int)
     case invalidVerificationInputCount(
         rowIndex: Int, inputCount: Int, expectedForProposalCount: Int)
+    case postForwardCacheOffsetOverflow(rowIndex: Int, queryOffset: Int, inputCount: Int)
     case emptyCache
     case unsupportedCache(cacheIndex: Int)
     case cacheOffsetMismatch(cacheIndex: Int, expected: [Int], actual: [Int])
     case invalidCacheOffsetShape(cacheIndex: Int, expectedCount: Int, actualShape: [Int])
     case invalidLogitsShape(expectedBatch: Int, expectedWidth: Int, actualShape: [Int])
     case invalidLastHiddenShape(expectedBatch: Int, expectedWidth: Int, actualShape: [Int])
+    case missingLastHidden
+    case missingSharedKV
+    case emptySharedKV
+    case missingSharedKVSourceIndices
+    case sharedKVSourceKeyMismatch(expected: [String], actual: [String])
+    case invalidSharedKVSource(layerType: String, sourceIndex: Int)
+    case invalidSharedKVShape(layerType: String, keysShape: [Int], valuesShape: [Int])
+    case invalidSharedKVBatch(layerType: String, expectedBatch: Int, actualBatch: Int)
+    case insufficientSharedKVSequenceSpan(
+        layerType: String, rowIndex: Int, expected: Int, actual: Int)
+    case invalidPostForwardCacheOffsetShape(
+        cacheIndex: Int, expectedCount: Int, actualShape: [Int])
+    case postForwardCacheOffsetMismatch(
+        cacheIndex: Int, rowIndex: Int, expected: Int, actual: Int)
+    case missingFullAttentionSharedKV
+    case invalidPositionDeltasShape(expectedBatch: Int, actualShape: [Int])
 }
 
 /// Verify ragged MTP proposal rows with exactly one target-model call.
@@ -119,16 +169,43 @@ public enum MTPPackedVerificationError: Error, Equatable {
 /// metadata. This fails closed rather than running ragged rows with scalar
 /// positions, padding-blind writes, or shared commit/discard ownership.
 ///
-/// This v0.1 facade deliberately creates fresh target state, requests MTP last
-/// hidden states, and discards every other returned state key. It does not
-/// support shared-target-KV state, model-specific position deltas, or native
-/// recurrent checkpoint state. The external scheduler owns independent row
-/// transactions and resolves their commit/discard policy after verification.
+/// The compatibility overload returns logits and optional hidden states exactly
+/// as before. Call the strict overload with `requireContinuationState: true`
+/// when a scheduler also needs row-isolated target state for another MTP round.
+/// The external scheduler still owns each row transaction and resolves its
+/// commit/discard policy after verification.
 public func verifyMTPPackedTargets(
     model: any LanguageModel,
     tokens: MLXArray,
     rowMaps: [MTPPackedVerificationRowMap],
     cache: [KVCache]
+) throws -> MTPPackedVerificationOutput {
+    try verifyMTPPackedTargets(
+        model: model,
+        tokens: tokens,
+        rowMaps: rowMaps,
+        cache: cache,
+        requireContinuationState: false)
+}
+
+/// Verify packed targets and optionally require exact row-local continuation state.
+///
+/// Set `requireContinuationState` for multi-round MTP. In that mode every
+/// target-emitted shared K/V tensor must be batch-major and its source cache
+/// must expose an exact post-forward ``BatchPositionedKVCache/batchOffset``.
+/// The cache state must store each row's live chronological K/V in the leading
+/// sequence prefix and any unused capacity as right padding. The facade uses
+/// those offsets to remove padding and refuses missing or ambiguous state.
+///
+/// The overload without `requireContinuationState` preserves the original
+/// single-round API and leaves ``MTPPackedVerificationRowOutput/continuationState``
+/// unset.
+public func verifyMTPPackedTargets(
+    model: any LanguageModel,
+    tokens: MLXArray,
+    rowMaps: [MTPPackedVerificationRowMap],
+    cache: [KVCache],
+    requireContinuationState: Bool
 ) throws -> MTPPackedVerificationOutput {
     guard tokens.ndim == 2 else {
         throw MTPPackedVerificationError.tokensMustBeMatrix(actualRank: tokens.ndim)
@@ -173,6 +250,14 @@ public func verifyMTPPackedTargets(
                 rowIndex: map.rowIndex,
                 inputCount: map.inputCount,
                 expectedForProposalCount: expectedInputCount)
+        }
+        let (_, postForwardOffsetOverflow) = map.queryOffset.addingReportingOverflow(
+            map.inputCount)
+        guard !postForwardOffsetOverflow else {
+            throw MTPPackedVerificationError.postForwardCacheOffsetOverflow(
+                rowIndex: map.rowIndex,
+                queryOffset: map.queryOffset,
+                inputCount: map.inputCount)
         }
     }
 
@@ -235,6 +320,15 @@ public func verifyMTPPackedTargets(
         }
     }
 
+    let continuationStates = try requireContinuationState
+        ? extractMTPPackedContinuationStates(
+            output.state,
+            rowMaps: rowMaps,
+            cache: packedCache,
+            batchSize: batchSize,
+            paddedWidth: paddedWidth)
+        : nil
+
     let rows = rowMaps.enumerated().map { packedRow, map in
         let rowLogits = output.logits[packedRow]
         return MTPPackedVerificationRowOutput(
@@ -242,9 +336,159 @@ public func verifyMTPPackedTargets(
             proposalLogits: rowLogits[0 ..< map.proposalCount, 0...],
             bonusLogits: rowLogits[(map.inputCount - 1) ..< map.inputCount, 0...],
             lastHidden: lastHidden?[
-                packedRow, 0 ..< map.inputCount, 0...])
+                packedRow, 0 ..< map.inputCount, 0...],
+            continuationState: continuationStates?[packedRow])
     }
     return MTPPackedVerificationOutput(rows: rows)
+}
+
+private func extractMTPPackedContinuationStates(
+    _ state: LMOutput.State?,
+    rowMaps: [MTPPackedVerificationRowMap],
+    cache: [any MTPPackedVerificationCache],
+    batchSize: Int,
+    paddedWidth: Int
+) throws -> [MTPPackedVerificationRowState] {
+    guard let lastHidden = state?[mtpLastHiddenStatesKey] else {
+        throw MTPPackedVerificationError.missingLastHidden
+    }
+    guard lastHidden.ndim == 3,
+        lastHidden.dim(0) == batchSize,
+        lastHidden.dim(1) == paddedWidth
+    else {
+        throw MTPPackedVerificationError.invalidLastHiddenShape(
+            expectedBatch: batchSize,
+            expectedWidth: paddedWidth,
+            actualShape: lastHidden.shape)
+    }
+    guard let sharedKV = state?[mtpSharedKVStatesKey] else {
+        throw MTPPackedVerificationError.missingSharedKV
+    }
+    guard !sharedKV.isEmpty else {
+        throw MTPPackedVerificationError.emptySharedKV
+    }
+    guard let sources = state?[mtpSharedKVSourceIndicesKey] else {
+        throw MTPPackedVerificationError.missingSharedKVSourceIndices
+    }
+    let sharedKVKeys = sharedKV.keys.sorted()
+    let sourceKeys = sources.keys.sorted()
+    guard sharedKVKeys == sourceKeys else {
+        throw MTPPackedVerificationError.sharedKVSourceKeyMismatch(
+            expected: sharedKVKeys, actual: sourceKeys)
+    }
+
+    var postForwardOffsets = [[Int]?](repeating: nil, count: cache.count)
+    for sourceIndex in Set(sources.values) {
+        guard cache.indices.contains(sourceIndex) else {
+            let layerType = sources
+                .filter { $0.value == sourceIndex }
+                .map(\.key)
+                .sorted()
+                .first!
+            throw MTPPackedVerificationError.invalidSharedKVSource(
+                layerType: layerType, sourceIndex: sourceIndex)
+        }
+        let offsets = cache[sourceIndex].batchOffset
+        guard offsets.ndim == 1, offsets.dim(0) == batchSize else {
+            throw MTPPackedVerificationError.invalidPostForwardCacheOffsetShape(
+                cacheIndex: sourceIndex,
+                expectedCount: batchSize,
+                actualShape: offsets.shape)
+        }
+        let values = offsets.asArray(Int.self)
+        for (packedRow, map) in rowMaps.enumerated() {
+            let (expected, overflow) = map.queryOffset.addingReportingOverflow(map.inputCount)
+            guard !overflow else {
+                throw MTPPackedVerificationError.postForwardCacheOffsetOverflow(
+                    rowIndex: map.rowIndex,
+                    queryOffset: map.queryOffset,
+                    inputCount: map.inputCount)
+            }
+            guard values[packedRow] == expected else {
+                throw MTPPackedVerificationError.postForwardCacheOffsetMismatch(
+                    cacheIndex: sourceIndex,
+                    rowIndex: map.rowIndex,
+                    expected: expected,
+                    actual: values[packedRow])
+            }
+        }
+        postForwardOffsets[sourceIndex] = values
+    }
+
+    for (layerType, pair) in sharedKV {
+        let sourceIndex = sources[layerType]!
+        guard cache.indices.contains(sourceIndex) else {
+            throw MTPPackedVerificationError.invalidSharedKVSource(
+                layerType: layerType, sourceIndex: sourceIndex)
+        }
+        let keys = pair.0
+        let values = pair.1
+        guard keys.ndim >= 3, keys.shape == values.shape, keys.dim(-2) > 0 else {
+            throw MTPPackedVerificationError.invalidSharedKVShape(
+                layerType: layerType,
+                keysShape: keys.shape,
+                valuesShape: values.shape)
+        }
+        guard keys.dim(0) == batchSize else {
+            throw MTPPackedVerificationError.invalidSharedKVBatch(
+                layerType: layerType,
+                expectedBatch: batchSize,
+                actualBatch: keys.dim(0))
+        }
+    }
+
+    guard sharedKV["full_attention"] != nil else {
+        throw MTPPackedVerificationError.missingFullAttentionSharedKV
+    }
+
+    let positionDeltas = state?[mtpPositionDeltasKey]
+    if let positionDeltas {
+        guard positionDeltas.ndim == 0 || positionDeltas.dim(0) == batchSize else {
+            throw MTPPackedVerificationError.invalidPositionDeltasShape(
+                expectedBatch: batchSize,
+                actualShape: positionDeltas.shape)
+        }
+    }
+
+    return try rowMaps.enumerated().map { packedRow, map in
+        var rowSharedKV: [String: (MLXArray, MLXArray)] = [:]
+        var rowOffsets: [String: Int] = [:]
+        rowSharedKV.reserveCapacity(sharedKV.count)
+        rowOffsets.reserveCapacity(sharedKV.count)
+
+        for (layerType, pair) in sharedKV {
+            let sourceIndex = sources[layerType]!
+            let offsets = postForwardOffsets[sourceIndex]!
+            let offset = offsets[packedRow]
+            let liveLength = cache[sourceIndex].maxSize.map { Swift.min(offset, $0) } ?? offset
+            guard pair.0.dim(-2) >= liveLength else {
+                throw MTPPackedVerificationError.insufficientSharedKVSequenceSpan(
+                    layerType: layerType,
+                    rowIndex: map.rowIndex,
+                    expected: liveLength,
+                    actual: pair.0.dim(-2))
+            }
+            rowSharedKV[layerType] = (
+                pair.0[packedRow ..< (packedRow + 1), .ellipsis, 0 ..< liveLength, 0...],
+                pair.1[packedRow ..< (packedRow + 1), .ellipsis, 0 ..< liveLength, 0...]
+            )
+            rowOffsets[layerType] = offset
+        }
+
+        let queryOffset = rowOffsets["full_attention"]!
+        return MTPPackedVerificationRowState(
+            lastHidden: lastHidden[
+                packedRow ..< (packedRow + 1), 0 ..< map.inputCount, 0...],
+            sharedKV: rowSharedKV,
+            sharedKVSourceIndices: sources,
+            sharedKVOffsets: rowOffsets,
+            queryOffset: queryOffset,
+            positionDeltas: positionDeltas.map { deltas in
+                deltas.ndim == 0
+                    ? deltas.reshaped(1)
+                    : deltas[packedRow ..< (packedRow + 1)]
+            })
+    }
 }
 
 private func validateMTPPackedCacheOffsets(
