@@ -262,14 +262,14 @@ public final class MTPDrafterContainer: Sendable {
     /// without storing transient state on the model or using unsafe captures.
     /// Callers _must_ eval any `MLXArray` before returning because `MLXArray`
     /// is not `Sendable`.
-    public func perform<V, R: Sendable>(
+    public func perform<V, R>(
         nonSendable values: consuming V,
         _ action: @Sendable (MTPDrafterContext, V) async throws -> R
     ) async rethrows -> sending R {
         let values = SendableBox(values)
         return try await context.read {
-            try await action($0, values.consume())
-        }
+            SendableBox(try await action($0, values.consume()))
+        }.consume()
     }
 }
 

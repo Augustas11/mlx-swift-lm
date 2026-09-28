@@ -83,25 +83,22 @@ func testMTPDrafterContainerPerform() async {
 
 @Test
 func testMTPDrafterContainerPerformWithNonSendableValue() async {
-    final class Value {
-        let token: Int
-
-        init(token: Int) {
-            self.token = token
-        }
-    }
-
     let drafter = MockMTPDrafter()
     let config = ModelConfiguration(id: "test/mock-drafter", defaultPrompt: "")
     let container = MTPDrafterContainer(
         context: MTPDrafterContext(configuration: config, model: drafter))
 
-    let token = await container.perform(nonSendable: Value(token: 17)) { context, value in
+    let state = MTPDrafterState(cache: [], nextPosition: 17)
+    let updated = await container.perform(nonSendable: state) { context, state in
         #expect(context.model is MockMTPDrafter)
-        return value.token
+        var state = state
+        state.nextPosition += 1
+        state.proposalAppended = 2
+        return state
     }
 
-    #expect(token == 17)
+    #expect(updated.nextPosition == 18)
+    #expect(updated.proposalAppended == 2)
 }
 
 /// Minimal LanguageModel implementation for test plumbing only.
