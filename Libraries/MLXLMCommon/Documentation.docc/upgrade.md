@@ -272,3 +272,39 @@ The `defaultHubApi` global has been removed. Hugging Face Hub access is now prov
 - `ModelFactory._load(hub:configuration:progressHandler:)` → `_load(configuration: ResolvedModelConfiguration)`
 - `ModelFactory._loadContainer`: removed (base `loadContainer` now builds the container from `_load`)
 
+### `UserInput.Image`, `UserInput.Video` and `UserInput.Audio`
+
+These three media types were enums with these cases:
+
+- `UserInput.Image`: `ciImage`, `url` and `array`.
+- `UserInput.Video`: `avAsset`, `url` and `frames`.
+- `UserInput.Audio`: `url` and `array`.
+
+Each type is now a struct with a nested `Source` enum. `Source` has the old cases and their payloads. The struct also has a `source` property and an `init(source:)`.
+
+`UserInput.Image` also has an optional `label`. A vision message generator writes the label into the prompt as `[label]`, immediately before the image.
+
+Each old case is now a static function with the same name and argument labels. So the code that creates a media value still compiles:
+
+```swift
+let image = UserInput.Image.url(imageURL)
+let videos = urls.map(UserInput.Video.url)
+let audio: UserInput.Audio = .array(samples)
+```
+
+A `switch`, `if case`, `guard case` or `for case` that matches a media value against a case no longer compiles. Match against the `source` of the media value instead:
+
+```swift
+// Before
+switch video {
+case .url(let url): print(url)
+default: break
+}
+
+// After
+switch video.source {
+case .url(let url): print(url)
+default: break
+}
+```
+
