@@ -179,6 +179,8 @@ public protocol QuantizedKVCacheProtocol: KVCache {
 /// Base cache implementation providing default behaviors
 open class BaseKVCache: KVCache {
     public var offset: Int = 0
+
+    public init() {}
     public var maxSize: Int? { nil }
 
     public func innerState() -> [MLXArray] { [] }

@@ -155,7 +155,9 @@ public final class MTPPackedMambaRowTransaction {
                 retaining: retaining, proposalCount: proposalCount)
         }
         rowCache.state = selected
-        eval(selected)
+        // Publishing lazy row-local state is sufficient. Synchronizing here
+        // serializes packed commit across rows; the next cache consumer will
+        // evaluate the selected arrays together with its model graph.
     }
 }
 

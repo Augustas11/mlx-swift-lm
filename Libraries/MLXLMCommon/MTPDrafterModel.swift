@@ -132,6 +132,58 @@ public struct MTPDrafterState {
     }
 }
 
+/// One row whose accepted target result must advance a stateful drafter and
+/// produce the next depth-one proposal. All arrays retain batch size one.
+public struct MTPPackedDrafterAdvanceRow {
+    public let rowIndex: Int
+    public let targetHidden: MLXArray
+    public let draftTokens: MLXArray
+    public let acceptedCount: Int
+    public let finalToken: Int
+    public let positionDeltas: MLXArray?
+    public let state: MTPDrafterState
+
+    public init(
+        rowIndex: Int,
+        targetHidden: MLXArray,
+        draftTokens: MLXArray,
+        acceptedCount: Int,
+        finalToken: Int,
+        positionDeltas: MLXArray?,
+        state: MTPDrafterState
+    ) {
+        self.rowIndex = rowIndex
+        self.targetHidden = targetHidden
+        self.draftTokens = draftTokens
+        self.acceptedCount = acceptedCount
+        self.finalToken = finalToken
+        self.positionDeltas = positionDeltas
+        self.state = state
+    }
+}
+
+public struct MTPPackedDrafterAdvanceOutput {
+    public let rowIndex: Int
+    public let proposal: MLXArray
+    public let state: MTPDrafterState
+
+    public init(rowIndex: Int, proposal: MLXArray, state: MTPDrafterState) {
+        self.rowIndex = rowIndex
+        self.proposal = proposal
+        self.state = state
+    }
+}
+
+/// A genuine packed stateful drafter. Implementations perform one model-body
+/// call for the complete row set; no scalar compatibility loop is supplied.
+public protocol MTPPackedStatefulDrafterModel: StatefulMTPDrafterModel {
+    func advanceAndProposePacked(
+        target: any LanguageModel,
+        rows: [MTPPackedDrafterAdvanceRow],
+        sampler: any LogitSampler
+    ) throws -> [MTPPackedDrafterAdvanceOutput]
+}
+
 /// MTP drafter whose mutable row state is owned outside the model instance.
 public protocol StatefulMTPDrafterModel: MTPDrafterModel {
     func makeState(parameters: GenerateParameters?) -> MTPDrafterState
