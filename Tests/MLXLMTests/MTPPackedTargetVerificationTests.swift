@@ -398,6 +398,45 @@ struct MTPPackedTargetVerificationTests {
         #expect(second.state[1].asArray(Float.self) == [41])
     }
 
+    /// A zero-proposal row packed beside a one-proposal row is right-padded to
+    /// width 2. Committing its only valid column must restore the checkpoint
+    /// (post-column-1) state, not the complete state that absorbed the pad.
+    @Test func paddedZeroProposalRowCommitsCheckpointNotPaddedState() throws {
+        let proposing = MambaCache()
+        proposing.state = [
+            MLXArray([Float(1)]).reshaped(1, 1),
+            MLXArray([Float(2)]).reshaped(1, 1),
+        ]
+        let padded = MambaCache()
+        padded.state = [
+            MLXArray([Float(3)]).reshaped(1, 1),
+            MLXArray([Float(4)]).reshaped(1, 1),
+        ]
+        let batch = try MTPPackedMambaBatchCache(rowCaches: [proposing, padded])
+        try batch.prepareMTPPackedVerification(rowMaps: [
+            .init(rowIndex: 0, queryOffset: 5, inputCount: 2, proposalCount: 1),
+            .init(rowIndex: 1, queryOffset: 9, inputCount: 1, proposalCount: 0),
+        ])
+        batch.saveSpeculativeCheckpoint(
+            convState: MLXArray([Float(10), 30]).reshaped(2, 1),
+            recurrentState: MLXArray([Float(20), 40]).reshaped(2, 1),
+            advancedBy: 1)
+        // Complete-width state: row 1's values here include the pad column.
+        batch.state = [
+            MLXArray([Float(11), 31]).reshaped(2, 1),
+            MLXArray([Float(21), 41]).reshaped(2, 1),
+        ]
+
+        let transactions = try batch.rowTransactions()
+        try transactions[0].commit(retaining: 2)
+        try transactions[1].commit(retaining: 1)
+
+        #expect(proposing.state[0].asArray(Float.self) == [11])
+        #expect(proposing.state[1].asArray(Float.self) == [21])
+        #expect(padded.state[0].asArray(Float.self) == [30])
+        #expect(padded.state[1].asArray(Float.self) == [40])
+    }
+
     @Test func ordinaryRowMaySharePackedForwardWithoutProposals() throws {
         let model = PackedVerificationModel()
         let cache = PackedVerificationCache(offsets: [0])

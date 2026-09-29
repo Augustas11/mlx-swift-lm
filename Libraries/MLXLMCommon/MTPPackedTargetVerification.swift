@@ -231,7 +231,11 @@ public final class MTPPackedMambaBatchCache: MambaCache, MTPPackedVerificationCa
                 baseState: checkpointState.map {
                     $0[rowIndex ..< rowIndex + 1, .ellipsis]
                 },
-                finalState: completeState.map {
+                // A row whose valid input ends at the checkpoint column (no
+                // proposal) was right-padded to the packed width; its
+                // complete-width state absorbed the pad token.
+                finalState: (needsCheckpoint && map.inputCount == 1
+                    ? checkpointState : completeState).map {
                     $0[rowIndex ..< rowIndex + 1, .ellipsis]
                 })
         }
