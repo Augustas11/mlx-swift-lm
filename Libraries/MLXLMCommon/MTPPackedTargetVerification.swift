@@ -31,9 +31,39 @@ public protocol MTPPackedVerificationCache: BatchPositionedKVCache {
     /// Hybrid caches return the number of leading verification columns that
     /// are unconditionally retained. Attention-only caches use `nil`.
     var mtpPackedCheckpointIndex: Int? { get }
+
+    /// Host-side copy of ``BatchPositionedKVCache/batchOffset``, when the
+    /// cache derives its offsets from host integers.
+    ///
+    /// The facade validates pre- and post-forward row positions once per cache
+    /// layer. Reading `batchOffset` back from the device costs a blocking GPU
+    /// round trip per layer, so caches that already know these values on the
+    /// host return them here. The values must equal `batchOffset` element for
+    /// element. `nil` falls back to a device readback of `batchOffset`.
+    var mtpPackedHostBatchOffsets: [Int]? { get }
 }
 extension MTPPackedVerificationCache {
     public var mtpPackedCheckpointIndex: Int? { nil }
+    public var mtpPackedHostBatchOffsets: [Int]? { nil }
+}
+
+/// Row offsets of one packed cache, from the host mirror when available and
+/// otherwise from a single int32 device readback (no dtype conversion kernel).
+private func mtpPackedBatchOffsets(_ cache: any MTPPackedVerificationCache) -> (
+    values: [Int], shape: [Int]
+) {
+    if let host = cache.mtpPackedHostBatchOffsets {
+        return (host, [host.count])
+    }
+    let offsets = cache.batchOffset
+    guard offsets.ndim == 1 else { return ([], offsets.shape) }
+    let values: [Int]
+    switch offsets.dtype {
+    case .int32: values = offsets.asArray(Int32.self).map(Int.init)
+    case .int64: values = offsets.asArray(Int64.self).map(Int.init)
+    default: values = offsets.asType(.int32).asArray(Int32.self).map(Int.init)
+    }
+    return (values, offsets.shape)
 }
 
 /// Maps one packed target-model row back to a scheduler-owned sequence.
@@ -178,6 +208,10 @@ public final class MTPPackedMambaBatchCache: MambaCache, MTPPackedVerificationCa
         MLXArray(
             (preparedRowMaps?.map(\.queryOffset) ?? rowCaches.map(\.offset))
                 .map(Int32.init))
+    }
+
+    public var mtpPackedHostBatchOffsets: [Int]? {
+        preparedRowMaps?.map(\.queryOffset) ?? rowCaches.map(\.offset)
     }
 
     public var mtpPackedCheckpointIndex: Int? {
@@ -579,14 +613,13 @@ private func extractMTPPackedContinuationStates(
             throw MTPPackedVerificationError.invalidSharedKVSource(
                 layerType: layerType, sourceIndex: sourceIndex)
         }
-        let offsets = cache[sourceIndex].batchOffset
-        guard offsets.ndim == 1, offsets.dim(0) == batchSize else {
+        let (values, shape) = mtpPackedBatchOffsets(cache[sourceIndex])
+        guard shape.count == 1, values.count == batchSize else {
             throw MTPPackedVerificationError.invalidPostForwardCacheOffsetShape(
                 cacheIndex: sourceIndex,
                 expectedCount: batchSize,
-                actualShape: offsets.shape)
+                actualShape: shape)
         }
-        let values = offsets.asArray(Int.self)
         for (packedRow, map) in rowMaps.enumerated() {
             let (expected, overflow) = map.queryOffset.addingReportingOverflow(map.inputCount)
             guard !overflow else {
@@ -686,14 +719,13 @@ private func validateMTPPackedCacheOffsets(
     _ cache: [any MTPPackedVerificationCache], queryOffsets: [Int]
 ) throws {
     for (cacheIndex, entry) in cache.enumerated() {
-        let offsets = entry.batchOffset
-        guard offsets.ndim == 1, offsets.dim(0) == queryOffsets.count else {
+        let (actual, shape) = mtpPackedBatchOffsets(entry)
+        guard shape.count == 1, actual.count == queryOffsets.count else {
             throw MTPPackedVerificationError.invalidCacheOffsetShape(
                 cacheIndex: cacheIndex,
                 expectedCount: queryOffsets.count,
-                actualShape: offsets.shape)
+                actualShape: shape)
         }
-        let actual = offsets.asArray(Int.self)
         guard actual == queryOffsets else {
             throw MTPPackedVerificationError.cacheOffsetMismatch(
                 cacheIndex: cacheIndex,
