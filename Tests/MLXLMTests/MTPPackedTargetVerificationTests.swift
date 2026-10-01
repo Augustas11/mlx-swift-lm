@@ -403,6 +403,62 @@ struct MTPPackedTargetVerificationTests {
         #expect(second.state[1].asArray(Float.self) == [41])
     }
 
+    /// Deferred staging must publish exactly what `commit` publishes, for every
+    /// row and retention, so a scheduler can evaluate all rows in one `eval`.
+    @Test func stagedCommitPublishesSameRowStateAsCommit() throws {
+        func makeBatch() throws -> ([MambaCache], [MTPPackedMambaRowTransaction]) {
+            let rows = (0 ..< 3).map { index -> MambaCache in
+                let row = MambaCache()
+                row.state = [
+                    MLXArray([Float(index)]).reshaped(1, 1),
+                    MLXArray([Float(index + 100)]).reshaped(1, 1),
+                ]
+                return row
+            }
+            let batch = try MTPPackedMambaBatchCache(rowCaches: rows)
+            try batch.prepareMTPPackedVerification(rowMaps: [
+                .init(rowIndex: 0, queryOffset: 5, inputCount: 2, proposalCount: 1),
+                .init(rowIndex: 1, queryOffset: 9, inputCount: 1, proposalCount: 0),
+                .init(rowIndex: 2, queryOffset: 2, inputCount: 2, proposalCount: 1),
+            ])
+            batch.saveSpeculativeCheckpoint(
+                convState: MLXArray([Float(10), 30, 50]).reshaped(3, 1),
+                recurrentState: MLXArray([Float(20), 40, 60]).reshaped(3, 1),
+                advancedBy: 1)
+            batch.state = [
+                MLXArray([Float(11), 31, 51]).reshaped(3, 1),
+                MLXArray([Float(21), 41, 61]).reshaped(3, 1),
+            ]
+            return (rows, try batch.rowTransactions())
+        }
+        let retaining = [1, 1, 2]
+        let (committedRows, committed) = try makeBatch()
+        for (transaction, keep) in zip(committed, retaining) {
+            try transaction.commit(retaining: keep)
+        }
+        let (stagedRows, staged) = try makeBatch()
+        var dirty: [MLXArray] = []
+        for (transaction, keep) in zip(staged, retaining) {
+            dirty += try transaction.stageCommit(retaining: keep)
+        }
+        #expect(dirty.count == 6)
+        eval(dirty)
+
+        for (committedRow, stagedRow) in zip(committedRows, stagedRows) {
+            #expect(committedRow.state.count == stagedRow.state.count)
+            for (lhs, rhs) in zip(committedRow.state, stagedRow.state) {
+                #expect(lhs.asArray(Float.self) == rhs.asArray(Float.self))
+            }
+        }
+        #expect(stagedRows.map { $0.state[0].asArray(Float.self) } == [[10], [30], [51]])
+
+        let (untouchedRows, rejected) = try makeBatch()
+        #expect(throws: MTPPackedMambaCacheError.self) {
+            _ = try rejected[1].stageCommit(retaining: 2)
+        }
+        #expect(untouchedRows[1].state[0].asArray(Float.self) == [1])
+    }
+
     /// A zero-proposal row packed beside a one-proposal row is right-padded to
     /// width 2. Committing its only valid column must restore the checkpoint
     /// (post-column-1) state, not the complete state that absorbed the pad.
