@@ -22,6 +22,9 @@ private final class PackedVerificationCache: MTPPackedVerificationCache {
     var batchOffset: MLXArray
     let maxSize: Int?
     let mtpPackedCheckpointIndex: Int?
+    /// Host mirror reported to the facade; `nil` forces a device readback.
+    var hostOffsets: [Int]?
+    var mtpPackedHostBatchOffsets: [Int]? { hostOffsets }
 
     init(offsets: [Int], maxSize: Int? = nil, checkpointIndex: Int? = nil) {
         self.batchOffset = MLXArray(int64: offsets)
@@ -659,6 +662,75 @@ struct MTPPackedTargetVerificationTests {
         #expect(cache.finalizeCallCount == 1)
         #expect(cache.activeLengths == nil)
         #expect(cache.activeRowMaps == nil)
+    }
+
+    /// The facade trusts a cache's host offset mirror instead of reading
+    /// `batchOffset` back from the device, so a wrong mirror must still fail
+    /// closed even when the device offsets are correct.
+    @Test func hostOffsetMirrorIsValidatedWithoutDeviceReadback() throws {
+        let model = PackedVerificationModel()
+        let cache = PackedVerificationCache(offsets: [3, 11])
+        cache.hostOffsets = [3, 12]
+        let tokens = MLXArray.zeros([2, 3], dtype: .int32)
+
+        #expect(
+            throws: MTPPackedVerificationError.cacheOffsetMismatch(
+                cacheIndex: 0, expected: [3, 11], actual: [3, 12])
+        ) {
+            try verifyMTPPackedTargets(
+                model: model,
+                tokens: tokens,
+                rowMaps: [
+                    .init(rowIndex: 4, queryOffset: 3, inputCount: 3, proposalCount: 2),
+                    .init(rowIndex: 9, queryOffset: 11, inputCount: 2, proposalCount: 1),
+                ],
+                cache: [cache])
+        }
+        #expect(model.callCount == 0)
+        #expect(cache.finalizeCallCount == 1)
+    }
+
+    @Test func hostOffsetMirrorWithWrongCountFailsClosed() throws {
+        let model = PackedVerificationModel()
+        let cache = PackedVerificationCache(offsets: [3, 11])
+        cache.hostOffsets = [3]
+        let tokens = MLXArray.zeros([2, 3], dtype: .int32)
+
+        #expect(
+            throws: MTPPackedVerificationError.invalidCacheOffsetShape(
+                cacheIndex: 0, expectedCount: 2, actualShape: [1])
+        ) {
+            try verifyMTPPackedTargets(
+                model: model,
+                tokens: tokens,
+                rowMaps: [
+                    .init(rowIndex: 4, queryOffset: 3, inputCount: 3, proposalCount: 2),
+                    .init(rowIndex: 9, queryOffset: 11, inputCount: 2, proposalCount: 1),
+                ],
+                cache: [cache])
+        }
+        #expect(model.callCount == 0)
+    }
+
+    @Test func packedMambaHostOffsetMirrorMatchesDeviceOffsets() throws {
+        let first = MambaCache()
+        first.state = [
+            MLXArray([Float(1)]).reshaped(1, 1),
+            MLXArray([Float(2)]).reshaped(1, 1),
+        ]
+        let second = MambaCache()
+        second.state = [
+            MLXArray([Float(3)]).reshaped(1, 1),
+            MLXArray([Float(4)]).reshaped(1, 1),
+        ]
+        let batch = try MTPPackedMambaBatchCache(rowCaches: [first, second])
+        #expect(batch.mtpPackedHostBatchOffsets == batch.batchOffset.asArray(Int32.self).map(Int.init))
+        try batch.prepareMTPPackedVerification(rowMaps: [
+            .init(rowIndex: 0, queryOffset: 5, inputCount: 2, proposalCount: 1),
+            .init(rowIndex: 1, queryOffset: 9, inputCount: 1, proposalCount: 0),
+        ])
+        #expect(batch.mtpPackedHostBatchOffsets == [5, 9])
+        #expect(batch.batchOffset.asArray(Int32.self) == [5, 9])
     }
 
     @Test func invalidTargetLogitsStillFinalizeCache() throws {
