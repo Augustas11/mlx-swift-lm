@@ -172,6 +172,18 @@ public final class MTPPackedMambaRowTransaction {
     /// Current hybrid Qwen checkpoints support the unconditional base column
     /// or the complete one-proposal write.
     public func commit(retaining: Int) throws {
+        eval(try stageCommit(retaining: retaining))
+    }
+
+    /// Publish the same row state as ``commit(retaining:)`` without
+    /// evaluating it, and return the arrays the caller must evaluate.
+    ///
+    /// A scheduler resolving many rows and layers in one round evaluates every
+    /// returned array in a single `eval`, instead of one blocking GPU wait per
+    /// row per layer. The published values are identical to `commit`; only
+    /// the evaluation is deferred. Validation failures throw before the row
+    /// cache is touched.
+    public func stageCommit(retaining: Int) throws -> [MLXArray] {
         guard retaining > 0, retaining <= inputCount else {
             throw MTPPackedMambaCacheError.invalidRetainedInputCount(
                 retaining: retaining, inputCount: inputCount)
@@ -186,7 +198,7 @@ public final class MTPPackedMambaRowTransaction {
                 retaining: retaining, proposalCount: proposalCount)
         }
         rowCache.state = selected
-        eval(selected)
+        return selected
     }
 }
 
