@@ -134,6 +134,85 @@ public struct MTPDrafterState {
     }
 }
 
+/// One row of a packed drafter advance: the target's verdict for the row's
+/// last verification round, applied to the row's drafter state.
+public struct MTPPackedDrafterAdvanceRow {
+    /// Target hidden states for the row's verification input
+    /// `[lastCommitted, proposal1, ..., proposalN]`, shaped
+    /// `[1, inputCount, hiddenSize]`.
+    public let targetHidden: MLXArray
+
+    /// Proposal token IDs the target accepted, in order. Their count is the
+    /// accepted prefix length and must be below `targetHidden`'s width.
+    public let acceptedTokens: [Int]
+
+    /// Target-selected token that follows the accepted prefix.
+    public let finalToken: Int
+
+    /// Row-sliced target position deltas, when the target emitted them.
+    public let positionDeltas: MLXArray?
+
+    /// The row's drafter state before this advance. It is not mutated.
+    public let state: MTPDrafterState
+
+    public init(
+        targetHidden: MLXArray,
+        acceptedTokens: [Int],
+        finalToken: Int,
+        positionDeltas: MLXArray?,
+        state: MTPDrafterState
+    ) {
+        self.targetHidden = targetHidden
+        self.acceptedTokens = acceptedTokens
+        self.finalToken = finalToken
+        self.positionDeltas = positionDeltas
+        self.state = state
+    }
+}
+
+/// Result of one packed drafter advance.
+///
+/// Nothing is evaluated. Callers evaluate every state cache array and
+/// ``proposals`` together (for example in the same `eval` that resolves the
+/// target's row transactions) and read the proposals back with one transfer.
+public struct MTPPackedDrafterAdvanceResult {
+    /// Advanced row states in input order. Each state's `seedToken` is the
+    /// row's next depth-one proposal, shaped `[1, 1]`.
+    public let states: [MTPDrafterState]
+
+    /// Every row's next proposal, shaped `[rows, 1]`, in input order.
+    public let proposals: MLXArray
+
+    public init(states: [MTPDrafterState], proposals: MLXArray) {
+        self.states = states
+        self.proposals = proposals
+    }
+}
+
+/// Validation failures from a packed drafter advance. Each is thrown before
+/// any row state is touched.
+public enum MTPPackedDrafterError: Error, Equatable {
+    case invalidTargetHidden(row: Int, shape: [Int])
+    case invalidAcceptedCount(row: Int, acceptedCount: Int, inputCount: Int)
+    case incompatibleState(row: Int)
+    case positionMismatch(row: Int, nextPosition: Int, cacheOffset: Int)
+}
+
+/// A stateful drafter that advances many rows with one drafter forward.
+///
+/// ``advanceAndProposePacked(target:rows:sampler:)`` must leave every row's
+/// state exactly as ``StatefulMTPDrafterModel/commitDrafterState`` would for
+/// the same accepted prefix and final token, up to the numerical differences
+/// of evaluating the rows as one batch, and must return the following
+/// proposal. Rows never read each other's state.
+public protocol MTPPackedStatefulDrafterModel: StatefulMTPDrafterModel {
+    func advanceAndProposePacked(
+        target: any LanguageModel,
+        rows: [MTPPackedDrafterAdvanceRow],
+        sampler: any LogitSampler
+    ) throws -> MTPPackedDrafterAdvanceResult
+}
+
 /// Optional capability for MTP drafters that maintain per-stream state.
 ///
 /// This keeps the base ``MTPDrafterModel`` surface minimal for stateless

@@ -44,7 +44,7 @@ final class Qwen35MTPPredictor: Module {
         inputsEmbeds: MLXArray,
         hiddenStates previousHidden: MLXArray,
         cache: [KVCache],
-        positionOffset: Int
+        positionOffset: Int?
     ) -> MLXArray {
         var hiddenStates = concatenated(
             [preFCNormEmbedding(inputsEmbeds), preFCNormHidden(previousHidden)], axis: -1)
@@ -65,7 +65,7 @@ final class Qwen35MTPPredictor: Module {
     }
 }
 
-public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
+public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
     public let configuration: Qwen35TextConfiguration
     public let maximumBlockSize: Int? = 2
     public let requiresSharedTargetKV = false
@@ -241,6 +241,128 @@ public final class Qwen35MTPDraftModel: Module, StatefulMTPDrafterModel {
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
             lmHead: lmHead, sampler: sampler)
         state.proposalAppended = 0
+    }
+
+    /// Advance every row by its accepted prefix and final token with one MTP
+    /// forward, then propose each row's next token from the same forward.
+    ///
+    /// Row `r` feeds exactly the columns ``commitDrafterState`` would:
+    /// accepted proposals not already in the drafter cache, then the final
+    /// token, paired with the target hidden states at the same verification
+    /// columns. Rows are right-padded to the widest row; padded columns are
+    /// masked out of every row's attention and dropped from its cache. The
+    /// next proposal is sampled from the hidden state at each row's last valid
+    /// column. Input states are not mutated; nothing is evaluated.
+    public func advanceAndProposePacked(
+        target: any LanguageModel,
+        rows: [MTPPackedDrafterAdvanceRow],
+        sampler: any LogitSampler
+    ) throws -> MTPPackedDrafterAdvanceResult {
+        guard !rows.isEmpty else {
+            return MTPPackedDrafterAdvanceResult(
+                states: [], proposals: MLXArray.zeros([0, 1], dtype: .int32))
+        }
+        let layerCount = mtp.layers.count
+        var rowStates: [[[MLXArray]]] = []
+        var columnTokens: [[Int32]] = []
+        var columnHidden: [MLXArray] = []
+        var nextPositions: [Int] = []
+        rowStates.reserveCapacity(rows.count)
+        for (index, row) in rows.enumerated() {
+            let hidden = row.targetHidden
+            guard hidden.ndim == 3, hidden.dim(0) == 1, hidden.dim(1) > 0 else {
+                throw MTPPackedDrafterError.invalidTargetHidden(row: index, shape: hidden.shape)
+            }
+            let acceptedCount = row.acceptedTokens.count
+            guard acceptedCount < hidden.dim(1) else {
+                throw MTPPackedDrafterError.invalidAcceptedCount(
+                    row: index, acceptedCount: acceptedCount, inputCount: hidden.dim(1))
+            }
+            let state = row.state
+            guard state.cache.count == layerCount,
+                  state.cache.allSatisfy({ $0 is KVCacheSimple }),
+                  state.proposalAppended >= 0
+            else { throw MTPPackedDrafterError.incompatibleState(row: index) }
+            let keepAppended = Swift.min(acceptedCount, state.proposalAppended)
+            let trim = state.proposalAppended - keepAppended
+            // Per-row commit positions RoPE by `nextPosition`; the packed
+            // forward positions by each cache's offset, so they must agree.
+            let cacheOffset = state.cache[0].offset
+            guard state.cache.allSatisfy({ $0.offset == cacheOffset }),
+                  cacheOffset == state.nextPosition,
+                  trim <= cacheOffset
+            else {
+                throw MTPPackedDrafterError.positionMismatch(
+                    row: index, nextPosition: state.nextPosition, cacheOffset: cacheOffset)
+            }
+            let live = cacheOffset - trim
+            rowStates.append(state.cache.map { cache in
+                let kv = cache.state
+                guard live > 0, kv.count == 2 else { return [] }
+                return kv[0].dim(2) == live
+                    ? kv : kv.map { $0[.ellipsis, ..<live, 0...] }
+            })
+            nextPositions.append(live)
+            columnTokens.append(
+                row.acceptedTokens[keepAppended...].map(Int32.init) + [Int32(row.finalToken)])
+            columnHidden.append(hidden[0..., keepAppended ..< (acceptedCount + 1), 0...])
+        }
+
+        let inputCounts = columnTokens.map(\.count)
+        let width = inputCounts.max() ?? 1
+        let hiddenSize = columnHidden[0].dim(2)
+        let tokens = MLXArray(
+            columnTokens.flatMap { $0 + Array(repeating: Int32(0), count: width - $0.count) },
+            [rows.count, width])
+        let paddedHidden = columnHidden.map { hidden -> MLXArray in
+            let pad = width - hidden.dim(1)
+            return pad == 0
+                ? hidden
+                : concatenated(
+                    [hidden, MLXArray.zeros([1, pad, hiddenSize], dtype: hidden.dtype)], axis: 1)
+        }
+        let packedCaches = (0 ..< layerCount).map { layer in
+            MTPPackedDrafterLayerCache(
+                rowStates: rowStates.map { $0[layer] }, inputCounts: inputCounts)
+        }
+
+        let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
+        let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
+        let mtpHidden = mtp(
+            inputsEmbeds: inputEmbedding(tokens),
+            hiddenStates: rows.count == 1 ? paddedHidden[0] : concatenated(paddedHidden, axis: 0),
+            cache: packedCaches,
+            positionOffset: nil)
+
+        let seedHidden = inputCounts.enumerated().map { row, count in
+            mtpHidden[row ..< row + 1, (count - 1) ..< count, 0...]
+        }
+        let packedSeedHidden = rows.count == 1 ? seedHidden[0] : concatenated(seedHidden, axis: 0)
+        let logits = lmHead.map { $0(packedSeedHidden) }
+            ?? targetEmbedTokens.asLinear(packedSeedHidden)
+        let proposals = sampler.sample(logits: logits[0..., -1, 0...])
+            .reshaped([rows.count, 1])
+
+        var advancedCaches = rows.map { _ in [KVCache]() }
+        for packed in packedCaches {
+            guard let states = packed.rowStates() else {
+                throw MTPPackedDrafterError.incompatibleState(row: 0)
+            }
+            for row in rows.indices {
+                let cache = KVCacheSimple()
+                cache.state = states[row]
+                advancedCaches[row].append(cache)
+            }
+        }
+        let states = rows.indices.map { row in
+            MTPDrafterState(
+                cache: advancedCaches[row],
+                nextPosition: nextPositions[row] + inputCounts[row],
+                seedToken: proposals[row ..< row + 1, 0...],
+                seedHidden: seedHidden[row],
+                proposalAppended: 0)
+        }
+        return MTPPackedDrafterAdvanceResult(states: states, proposals: proposals)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
