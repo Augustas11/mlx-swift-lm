@@ -56,7 +56,9 @@ public enum Qwen35FusedMoE {
         {
             return min(value, 32)
         }
-        return 16
+        // M3 Ultra, A3B: fused wins at T <= 4 and loses from T = 8 (gate/up
+        // bandwidth), so larger calls stay on the stock graph.
+        return 4
     }()
 
     /// Rows per simdgroup in the gate/up kernel (4 simdgroups per threadgroup).
@@ -72,7 +74,7 @@ public enum Qwen35FusedMoE {
     /// v2 router rows per simdgroup (8 simdgroups per threadgroup).
     nonisolated(unsafe) public static var routerRows: Int = 1
     /// v2 gate/up tokens per weight pass.
-    nonisolated(unsafe) public static var gateUpTokens: Int = 4
+    nonisolated(unsafe) public static var gateUpTokens: Int = 2
     /// v2 down tokens per threadgroup (0 = all tokens in one block).
     nonisolated(unsafe) public static var downTokensPerBlock: Int = 1
     /// Lab attribution: 1 = stop after the router, 2 = stop after gate/up (the
