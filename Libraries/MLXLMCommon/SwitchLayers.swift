@@ -95,6 +95,11 @@ public class SwitchGLU: Module {
         super.init()
     }
 
+    /// Read-only projections for fused-kernel callers (e.g. Qwen35FusedMoE).
+    public var gateProjection: SwitchLinear { gateProj }
+    public var upProjection: SwitchLinear { upProj }
+    public var downProjection: SwitchLinear { downProj }
+
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
@@ -306,6 +311,11 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
             weight: quantizedWeight, bias: other.bias)
 
         self.freeze()
+    }
+
+    /// Packed weight, scales, biases and expert bias for fused-kernel callers.
+    public var quantizedParts: (weight: MLXArray, scales: MLXArray, biases: MLXArray?, bias: MLXArray?) {
+        (weight, scales, biases, bias)
     }
 
     override public func callAsFunction(
