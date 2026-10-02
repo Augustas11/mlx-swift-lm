@@ -438,6 +438,8 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     @ModuleInfo(key: "shared_expert") var sharedExpert: Qwen3NextMLP
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
+    let fusedCache = Qwen35FusedMoE.Cache()
+
     init(_ args: Qwen35TextConfiguration) {
         self.normTopkProb = args.normTopkProb
         self.numExperts = args.numExperts
@@ -458,6 +460,10 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        Qwen35FusedMoE.inputTap?(x)
+        if Qwen35FusedMoE.mode != .off, let fused = Qwen35FusedMoE.forward(self, x) {
+            return fused
+        }
         var gates = gate(x)
         gates = MLX.softmax(gates, axis: -1, precise: true)
 
