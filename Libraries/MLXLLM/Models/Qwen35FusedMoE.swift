@@ -61,9 +61,10 @@ public enum Qwen35FusedMoE {
         {
             return min(value, 32)
         }
-        // M3 Ultra, A3B: fused wins at T <= 4 and loses from T = 8 (gate/up
-        // bandwidth), so larger calls stay on the stock graph.
-        return 4
+        // M3 Ultra, A3B (v3 kernels): fused wins per layer at T = 1..7 and loses
+        // from T = 8, where stock switches to its sorted gather path, so larger
+        // calls stay on the stock graph.
+        return 7
     }()
 
     /// Rows per simdgroup in the gate/up kernel (4 simdgroups per threadgroup).
