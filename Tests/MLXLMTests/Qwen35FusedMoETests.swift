@@ -10,21 +10,6 @@ import XCTest
 /// one stream or across streams must match the same calls evaluated alone, and
 /// a token's output must not depend on the tokens batched with it.
 final class Qwen35FusedMoETests: XCTestCase {
-    private var savedMode = Qwen35FusedMoE.Mode.off
-    private var savedMaxTokens = 4
-
-    override func setUp() {
-        super.setUp()
-        savedMode = Qwen35FusedMoE.mode
-        savedMaxTokens = Qwen35FusedMoE.maxTokens
-    }
-
-    override func tearDown() {
-        Qwen35FusedMoE.mode = savedMode
-        Qwen35FusedMoE.maxTokens = savedMaxTokens
-        super.tearDown()
-    }
-
     /// A256-expert, top-8 block with the A3B quantization layout (router and
     /// shared-expert gate 8-bit, experts 4-bit, group 64, bf16 scales), small
     /// expert width to keep the test light.
@@ -48,7 +33,7 @@ final class Qwen35FusedMoETests: XCTestCase {
             path == "gate" || path == "shared_expert_gate" ? (64, 8) : (64, 4)
         }
         eval(block)
-        XCTAssertTrue(Qwen35FusedMoE.labIsFusable(block))
+        XCTAssertTrue(Qwen35FusedMoE.isFusable(block))
         return block
     }
 
@@ -70,11 +55,35 @@ final class Qwen35FusedMoETests: XCTestCase {
         }
     }
 
+    private func fused(_ block: Qwen35SparseMoeBlock, _ x: MLXArray) throws -> MLXArray {
+        try XCTUnwrap(Qwen35FusedMoE.forward(block, x), "expected production fused path")
+    }
+
+    func testProductionGateRejectsCallsAboveMeasuredTokenBound() throws {
+        let block = try makeBlock(seed: 4)
+        let x = input(8, seed: 48)
+        XCTAssertNil(Qwen35FusedMoE.forward(block, x))
+        let automatic = block(x)
+        let stock = block.stockForward(x)
+        eval(automatic, stock)
+        assertBitEqual([automatic], [stock], "T=8 automatic stock fallback")
+    }
+
+    func testEligibleBlockUsesFusedPathByDefault() throws {
+        let disabled = ["0", "false", "FALSE", "no", "NO", "off", "OFF"].contains(
+            ProcessInfo.processInfo.environment["MLX_LM_QWEN35_FUSED_MOE"] ?? "")
+        try XCTSkipIf(disabled, "fused MoE kill switch is set")
+        let block = try makeBlock(seed: 5)
+        let x = input(1, seed: 51)
+        let automatic = block(x)
+        let fused = try fused(block, x)
+        eval(automatic, fused)
+        assertBitEqual([automatic], [fused], "T=1 automatic fused path")
+    }
+
     func testOverlappingCallsMatchSerialEvaluation() throws {
         let blocks = [try makeBlock(seed: 1), try makeBlock(seed: 2)]
-        Qwen35FusedMoE.mode = .full
-        Qwen35FusedMoE.maxTokens = 16
-        for tokens in [1, 2, 4, 8, 16] {
+        for tokens in [1, 2, 4, 7] {
             // The same block on two inputs, and a second block.
             var calls: [(Qwen35SparseMoeBlock, MLXArray)] = []
             for (b, block) in blocks.enumerated() {
@@ -82,25 +91,27 @@ final class Qwen35FusedMoETests: XCTestCase {
                     calls.append((block, input(tokens, seed: UInt64(100 * tokens + 10 * b + v))))
                 }
             }
-            let before = Qwen35FusedMoE.fusedCalls
             var serial: [MLXArray] = []
             for (block, x) in calls {
-                let y = block(x)
+                let y = try fused(block, x)
                 eval(y)
                 serial.append(y)
             }
-            XCTAssertEqual(Qwen35FusedMoE.fusedCalls - before, calls.count, "fused path taken")
 
             for _ in 0 ..< 3 {
                 // One stream, no eval between the calls.
-                let together = calls.map { $0.0($0.1) }
+                let together = try calls.map { try fused($0.0, $0.1) }
                 eval(together)
                 assertBitEqual(together, serial, "T=\(tokens) one stream")
 
                 // Two streams, no eval between the calls.
                 let half = calls.count / 2
-                let a = Stream.withNewDefaultStream { calls[..<half].map { $0.0($0.1) } }
-                let b = Stream.withNewDefaultStream { calls[half...].map { $0.0($0.1) } }
+                let a = try Stream.withNewDefaultStream {
+                    try calls[..<half].map { try fused($0.0, $0.1) }
+                }
+                let b = try Stream.withNewDefaultStream {
+                    try calls[half...].map { try fused($0.0, $0.1) }
+                }
                 eval(a + b)
                 assertBitEqual(a + b, serial, "T=\(tokens) two streams")
             }
@@ -109,15 +120,13 @@ final class Qwen35FusedMoETests: XCTestCase {
 
     func testBatchInvarianceAndAgreementWithStock() throws {
         let block = try makeBlock(seed: 3)
-        Qwen35FusedMoE.maxTokens = 16
-        for tokens in [2, 4, 8, 16] {
+        for tokens in [2, 4, 7] {
             let x = input(tokens, seed: UInt64(7 + tokens))
-            Qwen35FusedMoE.mode = .full
-            let fused = block(x)
+            let fused = try fused(block, x)
             let singles = concatenated(
-                (0 ..< tokens).map { block(x[0..., $0 ..< ($0 + 1)]) }, axis: 1)
-            Qwen35FusedMoE.mode = .off
-            let stock = block(x)
+                try (0 ..< tokens).map { try self.fused(block, x[0..., $0 ..< ($0 + 1)]) },
+                axis: 1)
+            let stock = block.stockForward(x)
             eval(fused, singles, stock)
             assertBitEqual([fused], [singles], "T=\(tokens) batch invariance")
             let f = fused.asType(.float32)

@@ -460,10 +460,14 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        Qwen35FusedMoE.inputTap?(x)
-        if Qwen35FusedMoE.mode != .off, let fused = Qwen35FusedMoE.forward(self, x) {
+        if Qwen35FusedMoE.enabled, let fused = Qwen35FusedMoE.forward(self, x) {
             return fused
         }
+        return stockForward(x)
+    }
+
+    /// Reference path retained for production fallback and fused-kernel tests.
+    func stockForward(_ x: MLXArray) -> MLXArray {
         var gates = gate(x)
         gates = MLX.softmax(gates, axis: -1, precise: true)
 
