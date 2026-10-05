@@ -59,14 +59,44 @@ final class Qwen35FusedMoETests: XCTestCase {
         try XCTUnwrap(Qwen35FusedMoE.forward(block, x), "expected production fused path")
     }
 
-    func testProductionGateRejectsCallsAboveMeasuredTokenBound() throws {
+    func testProductionGateRejectsRowsAboveMeasuredTokenBound() throws {
         let block = try makeBlock(seed: 4)
         let x = input(8, seed: 48)
         XCTAssertNil(Qwen35FusedMoE.forward(block, x))
         let automatic = block(x)
         let stock = block.stockForward(x)
         eval(automatic, stock)
-        assertBitEqual([automatic], [stock], "T=8 automatic stock fallback")
+        assertBitEqual([automatic], [stock], "8-token row automatic stock fallback")
+    }
+
+    /// Decode (1 token per row) and verify (2 tokens per row) batches above the
+    /// single-call bound stay on the fused path, and every token matches the
+    /// same token evaluated alone, so crossing 7 flattened tokens never changes
+    /// a row's output.
+    func testDecodeBatchesAboveSingleCallBoundAreChunkedAndBatchInvariant() throws {
+        let disabled = ["0", "false", "FALSE", "no", "NO", "off", "OFF"].contains(
+            ProcessInfo.processInfo.environment["MLX_LM_QWEN35_FUSED_MOE"] ?? "")
+        try XCTSkipIf(disabled, "fused MoE kill switch is set")
+        let block = try makeBlock(seed: 6)
+        for (rows, rowTokens) in [(8, 1), (9, 1), (16, 1), (4, 2), (5, 2), (8, 2)] {
+            MLXRandom.seed(UInt64(1000 + 10 * rows + rowTokens))
+            let x = MLXRandom.normal([rows, rowTokens, 2048]).asType(.bfloat16)
+            eval(x)
+            let batched = try fused(block, x)
+            let automatic = block(x)
+            var singles: [MLXArray] = []
+            for r in 0 ..< rows {
+                for t in 0 ..< rowTokens {
+                    singles.append(try fused(block, x[r ..< (r + 1), t ..< (t + 1)]))
+                }
+            }
+            let expected = concatenated(singles, axis: 0).reshaped(x.shape)
+            eval(batched, automatic, expected)
+            let label = "rows=\(rows) rowTokens=\(rowTokens)"
+            XCTAssertEqual(batched.shape, x.shape, label)
+            assertBitEqual([batched], [expected], "\(label) batch invariance")
+            assertBitEqual([automatic], [batched], "\(label) automatic fused path")
+        }
     }
 
     func testEligibleBlockUsesFusedPathByDefault() throws {

@@ -47,8 +47,9 @@ enum Qwen35FusedMoE {
         }
     }()
 
-    // M3 Ultra, A3B (v3 kernels): fused wins per layer at T = 1...7 and loses
-    // from T = 8, where stock switches to its sorted gather path.
+    // M3 Ultra, A3B (v3 kernels): one fused call wins per layer at T = 1...7
+    // and loses from T = 8, where stock switches to its sorted gather path.
+    // This is the chunk size; larger decode batches run as several chunks.
     private static let maximumFusedTokens = 7
     private static let gateUpRows = 1
     private static let gateUpSimdgroups = 4
@@ -624,15 +625,37 @@ enum Qwen35FusedMoE {
         return (out[0], out[1])
     }
 
+    /// Decode- and verify-shaped calls (at most `maximumFusedTokens` tokens per
+    /// row) take the fused path at any batch size; longer rows (prefill) return
+    /// nil for the stock path. Calls above `maximumFusedTokens` flattened tokens
+    /// run as consecutive chunks of at most that many tokens. The kernels are
+    /// batch invariant, so a token's output is bit-identical however many rows
+    /// share the call; switching to stock at a flattened-token bound instead
+    /// made a row's greedy output depend on how many of its steps fell on
+    /// either side of the bound (macprovider #1770 s8 parity mismatch).
     static func forward(_ block: Qwen35SparseMoeBlock, _ x: MLXArray) -> MLXArray? {
         guard x.dtype == .bfloat16, x.ndim >= 2 else { return nil }
         let tokens = x.size / x.dim(-1)
-        guard tokens >= 1, tokens <= maximumFusedTokens, let w = resolve(block), x.dim(-1) == w.hidden
+        let rowTokens = x.dim(-2)
+        guard tokens >= 1, rowTokens >= 1, rowTokens <= maximumFusedTokens,
+            let w = resolve(block), x.dim(-1) == w.hidden,
+            w.inter % (gateUpRows * gateUpSimdgroups) == 0
         else { return nil }
+        let flat = x.reshaped([tokens, w.hidden])
+        guard tokens > maximumFusedTokens else {
+            return forwardChunk(w, flat, tokens: tokens).reshaped(x.shape)
+        }
+        let chunks = stride(from: 0, to: tokens, by: maximumFusedTokens).map { start in
+            let count = min(maximumFusedTokens, tokens - start)
+            return forwardChunk(w, flat[start ..< (start + count)], tokens: count)
+        }
+        return concatenated(chunks, axis: 0).reshaped(x.shape)
+    }
+
+    /// One fused call over `tokens` (1...maximumFusedTokens) flattened rows.
+    private static func forwardChunk(_ w: Weights, _ flat: MLXArray, tokens: Int) -> MLXArray {
         let (guR, guSG) = (gateUpRows, gateUpSimdgroups)
         let guTT = min(gateUpTokensPerPass, tokens)
-        guard w.inter % (guR * guSG) == 0 else { return nil }
-        let flat = x.reshaped([tokens, w.hidden])
         let (inds, wts) = routerSplit(w, flat, tokens: tokens)
         let slots = tokens * 8 + 1
         let sharedColumns = (tokens + guTT - 1) / guTT
@@ -657,12 +680,11 @@ enum Qwen35FusedMoE {
             KernelKey(
                 kind: 3, tokens: tokens, hidden: w.hidden, inter: w.inter,
                 rows: downRows, sgs: downSimdgroups, tpb: tpb))
-        let y = dk(
+        return dk(
             [h, inds, wts, w.dnW, w.dnS, w.dnB, w.shDnW, w.shDnS, w.shDnB],
             grid: ((w.hidden / (downSimdgroups * downRows)) * tg, blocks, 1),
             threadGroup: (tg, 1, 1),
             outputShapes: [[tokens, w.hidden]],
             outputDTypes: [.bfloat16])[0]
-        return y.reshaped(x.shape)
     }
 }
