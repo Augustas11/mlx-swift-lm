@@ -13,7 +13,9 @@ final class Qwen35FusedMoETests: XCTestCase {
     /// A256-expert, top-8 block with the A3B quantization layout (router and
     /// shared-expert gate 8-bit, experts 4-bit, group 64, bf16 scales), small
     /// expert width to keep the test light.
-    private func makeBlock(seed: UInt64) throws -> Qwen35SparseMoeBlock {
+    private func makeBlock(seed: UInt64, expectFusable: Bool = true) throws
+        -> Qwen35SparseMoeBlock
+    {
         let json = """
             {"hidden_size": 2048, "num_experts": 256, "num_experts_per_tok": 8,
              "moe_intermediate_size": 256, "shared_expert_intermediate_size": 256,
@@ -33,7 +35,7 @@ final class Qwen35FusedMoETests: XCTestCase {
             path == "gate" || path == "shared_expert_gate" ? (64, 8) : (64, 4)
         }
         eval(block)
-        XCTAssertTrue(Qwen35FusedMoE.isFusable(block))
+        if expectFusable { XCTAssertTrue(Qwen35FusedMoE.isFusable(block)) }
         return block
     }
 
@@ -96,6 +98,23 @@ final class Qwen35FusedMoETests: XCTestCase {
             XCTAssertEqual(batched.shape, x.shape, label)
             assertBitEqual([batched], [expected], "\(label) batch invariance")
             assertBitEqual([automatic], [batched], "\(label) automatic fused path")
+        }
+    }
+
+    /// The kernels index every scale and bias from the weight dimensions, so a
+    /// block whose companion tensors do not have the exact layout must not
+    /// take the fused path.
+    func testMismatchedQuantizedLayoutIsNotFusable() throws {
+        for key in ["shared_expert.down_proj.scales", "switch_mlp.gate_proj.biases"] {
+            // Not resolved yet: resolution is cached per block.
+            let block = try makeBlock(seed: 8, expectFusable: false)
+            let params = Dictionary(uniqueKeysWithValues: block.parameters().flattened())
+            let original = try XCTUnwrap(params[key], key)
+            let truncated = original[.ellipsis, 0 ..< (original.dim(-1) - 1)]
+            _ = block.update(parameters: ModuleParameters.unflattened([(key, truncated)]))
+            eval(block)
+            XCTAssertFalse(Qwen35FusedMoE.isFusable(block), key)
+            XCTAssertNil(Qwen35FusedMoE.forward(block, input(1, seed: 81)), key)
         }
     }
 

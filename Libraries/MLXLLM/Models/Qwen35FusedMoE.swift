@@ -118,6 +118,15 @@ enum Qwen35FusedMoE {
         return (parts.weight, parts.scales, b)
     }
 
+    /// Packed uint32 weight and bf16 scales/biases with exact shapes.
+    private static func hasLayout(
+        _ t: (MLXArray, MLXArray, MLXArray), weight: [Int], groups: [Int]
+    ) -> Bool {
+        t.0.dtype == .uint32 && t.0.shape == weight
+            && t.1.dtype == .bfloat16 && t.1.shape == groups
+            && t.2.dtype == .bfloat16 && t.2.shape == groups
+    }
+
     private static let resolveLock = NSLock()
 
     static func resolve(_ block: Qwen35SparseMoeBlock) -> Weights? {
@@ -135,12 +144,25 @@ enum Qwen35FusedMoE {
             let shDn = q(block.sharedExpert.downProj, bits: 4)
         else { return nil }
         // up/gate packed [E, I, H/8]; down packed [E, H, I/8].
+        guard up.0.ndim == 3 else { return nil }
         let inter = up.0.dim(-2)
         let hidden = up.0.dim(-1) * 8
         guard hidden % 2048 == 0, [256, 512, 1024, 2048].contains(inter),
-            inter % (4 * gateUpRows) == 0, hidden % (downRows * downSimdgroups) == 0,
-            gate.0.dim(-1) * 4 == hidden, dn.0.dim(-2) == hidden,
-            shUp.0.dim(0) == inter, shDn.0.dim(0) == hidden, sgate.0.dim(0) == 1
+            inter % (4 * gateUpRows) == 0, hidden % (downRows * downSimdgroups) == 0
+        else { return nil }
+        // The kernels index every packed weight, scale, and bias from these
+        // dimensions, so each tensor must have exactly the layout they assume.
+        let experts = block.numExperts
+        let (hG, iG) = (hidden / 64, inter / 64)
+        guard
+            hasLayout(gate, weight: [experts, hidden / 4], groups: [experts, hG]),
+            hasLayout(sgate, weight: [1, hidden / 4], groups: [1, hG]),
+            hasLayout(up, weight: [experts, inter, hidden / 8], groups: [experts, inter, hG]),
+            hasLayout(gp, weight: [experts, inter, hidden / 8], groups: [experts, inter, hG]),
+            hasLayout(dn, weight: [experts, hidden, inter / 8], groups: [experts, hidden, iG]),
+            hasLayout(shUp, weight: [inter, hidden / 8], groups: [inter, hG]),
+            hasLayout(shGp, weight: [inter, hidden / 8], groups: [inter, hG]),
+            hasLayout(shDn, weight: [hidden, inter / 8], groups: [hidden, iG])
         else { return nil }
         cache.weights = Weights(
             gate: gate, sgate: sgate, up: up, gp: gp, dn: dn, shUp: shUp, shGp: shGp,
