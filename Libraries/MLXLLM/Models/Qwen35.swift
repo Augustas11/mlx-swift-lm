@@ -282,39 +282,25 @@ final class Qwen35GatedDeltaNet: Module {
 
         var out: MLXArray
         if let split = checkpointAfter, split > 0, split < S {
-            let prefixMask = mask.map { $0[0..., ..<split] }
-            let suffixMask = mask.map { $0[0..., split...] }
-            let prefix: MLXArray
-            (prefix, state) = gatedDeltaUpdate(
-                q: qNormed[0..., ..<split, 0..., 0...],
-                k: kNormed[0..., ..<split, 0..., 0...],
-                v: v[0..., ..<split, 0..., 0...],
-                a: a[0..., ..<split, 0...],
-                b: b[0..., ..<split, 0...],
+            let checkpointState: MLXArray
+            (out, checkpointState, state) = gatedDeltaUpdateCheckpointed(
+                q: qNormed,
+                k: kNormed,
+                v: v,
+                a: a,
+                b: b,
                 aLog: aLog,
                 dtBias: dtBias,
                 state: state,
-                mask: prefixMask)
+                mask: mask,
+                checkpointAfter: split)
 
             let checkpointConv = contiguous(
                 convInput[0..., split ..< (split + convKernelSize - 1), 0...])
             cache?.saveSpeculativeCheckpoint(
                 convState: checkpointConv,
-                recurrentState: state!,
+                recurrentState: checkpointState,
                 advancedBy: split)
-
-            let suffix: MLXArray
-            (suffix, state) = gatedDeltaUpdate(
-                q: qNormed[0..., split..., 0..., 0...],
-                k: kNormed[0..., split..., 0..., 0...],
-                v: v[0..., split..., 0..., 0...],
-                a: a[0..., split..., 0...],
-                b: b[0..., split..., 0...],
-                aLog: aLog,
-                dtBias: dtBias,
-                state: state,
-                mask: suffixMask)
-            out = concatenated([prefix, suffix], axis: 1)
         } else {
             (out, state) = gatedDeltaUpdate(
                 q: qNormed,

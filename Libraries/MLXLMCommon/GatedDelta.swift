@@ -18,8 +18,19 @@ func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> 
 
 // MARK: - Metal Kernel
 
-private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
+private func makeGatedDeltaKernel(hasMask: Bool, checkpoint: Bool = false) -> MLXFast.MLXFastKernel? {
     let maskSource = hasMask ? "mask[b_idx * T + t]" : "true"
+    // With `checkpoint`, also write the recurrent state after the first
+    // `ckpt` steps to `state_ckpt`: the exact value a separate kernel call over
+    // `[0, ckpt)` would have produced as its `state_out`.
+    let checkpointSource = checkpoint ? """
+              if (t + 1 == ckpt) {
+                auto c_state = state_ckpt + (n * Dv + dv_idx) * Dk;
+                for (int i = 0; i < n_per_t; ++i) {
+                  c_state[n_per_t * dk_idx + i] = static_cast<StT>(state[i]);
+                }
+              }
+    """ : ""
 
     let source = """
             auto n = thread_position_in_grid.z;
@@ -78,6 +89,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
               } else {
                 y[dv_idx] = static_cast<InT>(0);
               }
+        \(checkpointSource)
               // Increment data pointers to next time step
               q_ += Hk * Dk;
               k_ += Hk * Dk;
@@ -96,13 +108,16 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
     if hasMask {
         inputNames.append("mask")
     }
+    if checkpoint {
+        inputNames.append("ckpt")
+    }
 
-    let suffix = hasMask ? "_mask" : ""
+    let suffix = (hasMask ? "_mask" : "") + (checkpoint ? "_ckpt" : "")
 
     return MLXFast.metalKernel(
         name: "gated_delta_step\(suffix)",
         inputNames: inputNames,
-        outputNames: ["y", "state_out"],
+        outputNames: checkpoint ? ["y", "state_out", "state_ckpt"] : ["y", "state_out"],
         source: source
     )
 }
@@ -112,10 +127,14 @@ private final class GatedDeltaKernelManager: Sendable {
 
     let kernel: MLXFast.MLXFastKernel?
     let kernelMasked: MLXFast.MLXFastKernel?
+    let kernelCheckpoint: MLXFast.MLXFastKernel?
+    let kernelMaskedCheckpoint: MLXFast.MLXFastKernel?
 
     private init() {
         kernel = makeGatedDeltaKernel(hasMask: false)
         kernelMasked = makeGatedDeltaKernel(hasMask: true)
+        kernelCheckpoint = makeGatedDeltaKernel(hasMask: false, checkpoint: true)
+        kernelMaskedCheckpoint = makeGatedDeltaKernel(hasMask: true, checkpoint: true)
     }
 }
 
@@ -303,4 +322,81 @@ public func gatedDeltaUpdate(
     }
 
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+}
+
+// MARK: - Checkpointed update
+
+/// One recurrent pass over all `T` steps that also returns the state after
+/// the first `checkpointAfter` steps. Equivalent to two `gatedDeltaUpdate`
+/// calls split at `checkpointAfter` (same per-step arithmetic, fp32 state in
+/// registers), without the extra launches, input slices and output concat.
+/// Returns `(y, checkpointState, finalState)`.
+public func gatedDeltaUpdateCheckpointed(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    a: MLXArray,
+    b: MLXArray,
+    aLog: MLXArray,
+    dtBias: MLXArray,
+    state: MLXArray? = nil,
+    mask: MLXArray? = nil,
+    checkpointAfter: Int
+) -> (MLXArray, MLXArray, MLXArray) {
+    let beta = sigmoid(b).asType(.float32)
+    let g = computeGatedDeltaG(aLog, a, dtBias)
+
+    let B = q.dim(0)
+    let T = q.dim(1)
+    let Dk = q.dim(3)
+    let Hk = q.dim(2)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if state.dtype != .float32 {
+        state = state.asType(.float32)
+    }
+
+    precondition(
+        checkpointAfter > 0 && checkpointAfter < T,
+        "checkpointAfter \(checkpointAfter) must split T=\(T)")
+
+    let selected = mask == nil
+        ? GatedDeltaKernelManager.shared.kernelCheckpoint
+        : GatedDeltaKernelManager.shared.kernelMaskedCheckpoint
+    guard let kernel = selected else {
+        let split = checkpointAfter
+        let (prefix, mid) = gatedDeltaOps(
+            q: q[0..., ..<split], k: k[0..., ..<split], v: v[0..., ..<split],
+            g: g[0..., ..<split], beta: beta[0..., ..<split], state: state,
+            mask: mask.map { $0[0..., ..<split] })
+        let (suffix, final) = gatedDeltaOps(
+            q: q[0..., split...], k: k[0..., split...], v: v[0..., split...],
+            g: g[0..., split...], beta: beta[0..., split...], state: mid,
+            mask: mask.map { $0[0..., split...] })
+        return (concatenated([prefix, suffix], axis: 1), mid, final)
+    }
+
+    var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
+    if let mask {
+        inputs.append(mask)
+    }
+    inputs.append(MLXArray(Int32(checkpointAfter)))
+    let outputs = kernel(
+        inputs,
+        template: [
+            ("InT", q.dtype),
+            ("StT", state.dtype),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+        ],
+        grid: (32, Dv, B * Hv),
+        threadGroup: (32, 4, 1),
+        outputShapes: [[B, T, Hv, Dv], state.shape, state.shape],
+        outputDTypes: [q.dtype, state.dtype, state.dtype]
+    )
+    return (outputs[0], outputs[2], outputs[1])
 }

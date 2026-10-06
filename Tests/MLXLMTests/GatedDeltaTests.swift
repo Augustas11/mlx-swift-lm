@@ -78,4 +78,42 @@ public class GatedDeltaTests: XCTestCase {
         )
     }
 
+    /// The single-pass checkpointed update must be bit-identical to two
+    /// `gatedDeltaUpdate` calls split at the checkpoint: same outputs, the
+    /// prefix call's state as the checkpoint, the suffix call's as the final.
+    func testCheckpointedUpdateMatchesSplitUpdate() throws {
+        let T = 6
+        let B = 2
+        let inputs = makeInputs(B: B, T: T)
+        let initial = MLXRandom.normal([B, 4, 16, 32]).asType(.float32)
+        let rowMask = MLXArray([true, true, true, true, true, true,
+                                true, true, true, true, false, false], [B, T])
+        for mask in [nil, rowMask] as [MLXArray?] {
+            for split in 1 ..< T {
+                let (y, checkpoint, final) = gatedDeltaUpdateCheckpointed(
+                    q: inputs.q, k: inputs.k, v: inputs.v,
+                    a: inputs.a, b: inputs.b,
+                    aLog: inputs.aLog, dtBias: inputs.dtBias,
+                    state: initial, mask: mask, checkpointAfter: split)
+                let (y1, s1) = gatedDeltaUpdate(
+                    q: inputs.q[0..., ..<split], k: inputs.k[0..., ..<split],
+                    v: inputs.v[0..., ..<split],
+                    a: inputs.a[0..., ..<split], b: inputs.b[0..., ..<split],
+                    aLog: inputs.aLog, dtBias: inputs.dtBias,
+                    state: initial, mask: mask.map { $0[0..., ..<split] })
+                let (y2, s2) = gatedDeltaUpdate(
+                    q: inputs.q[0..., split...], k: inputs.k[0..., split...],
+                    v: inputs.v[0..., split...],
+                    a: inputs.a[0..., split...], b: inputs.b[0..., split...],
+                    aLog: inputs.aLog, dtBias: inputs.dtBias,
+                    state: s1, mask: mask.map { $0[0..., split...] })
+                let label = "split=\(split) masked=\(mask != nil)"
+                XCTAssertTrue(
+                    arrayEqual(y, concatenated([y1, y2], axis: 1)).item(Bool.self), label)
+                XCTAssertTrue(arrayEqual(checkpoint, s1).item(Bool.self), label)
+                XCTAssertTrue(arrayEqual(final, s2).item(Bool.self), label)
+            }
+        }
+    }
+
 }
