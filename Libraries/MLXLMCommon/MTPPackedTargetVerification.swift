@@ -528,7 +528,13 @@ public func verifyMTPPackedTargets(
         }
         targetState[mtpCacheCheckpointIndexKey] = checkpointIndex
     }
+    // Recurrent layers mask padded columns through prepared lengths. When no
+    // row is right-padded every column is valid: an all-true mask is the
+    // identity for the masked kernel and the `where` in each linear layer, so
+    // leave lengths unset and run the unmasked recurrent path.
+    let anyPaddedRow = rowMaps.contains { $0.inputCount < paddedWidth }
     for entry in cache {
+        if !anyPaddedRow, entry is MambaCache { continue }
         entry.prepare(lengths: rowMaps.map(\.inputCount))
     }
 
