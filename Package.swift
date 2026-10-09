@@ -63,8 +63,9 @@ let package = Package(
     dependencies: [
         // macprovider: mlx-swift 0.32.3 with MLX core whose small-M quantized
         // matmuls are batch-invariant (no qmv_wide / qmm_splitk), so a
-        // continuously batched row matches its serial result exactly.
-        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "d073a644c559318d93e267ed2a53baf434787a41"),
+        // continuously batched row matches its serial result exactly, and
+        // which erases a freed compiled function from every thread's cache.
+        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "ca2f61d22c5e8afe87170525ebc1769f72da5b41"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
