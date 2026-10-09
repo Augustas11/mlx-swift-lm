@@ -104,9 +104,22 @@ enum Qwen35FusedMoE {
 
     /// Per-block cache. A plain class (not a Module) so module reflection
     /// ignores it.
+    ///
+    /// It holds the block's own parameter objects, so a trace that declares
+    /// the block (or its layer) as compile state also declares every array
+    /// the fused kernels read. A module replacement would leave it holding
+    /// arrays no trace declares, which a trace would read as tape constants,
+    /// so the block drops it then (`Qwen35SparseMoeBlock.update`).
     final class Cache {
         var resolved = false
         var weights: Weights?
+
+        func invalidate() {
+            Qwen35FusedMoE.resolveLock.withLock {
+                resolved = false
+                weights = nil
+            }
+        }
     }
 
     private static func q(_ layer: Linear, bits: Int) -> (MLXArray, MLXArray, MLXArray)? {
@@ -136,7 +149,7 @@ enum Qwen35FusedMoE {
             && t.2.dtype == .bfloat16 && t.2.shape == groups
     }
 
-    private static let resolveLock = NSLock()
+    fileprivate static let resolveLock = NSLock()
 
     static func resolve(_ block: Qwen35SparseMoeBlock) -> Weights? {
         resolveLock.lock()

@@ -637,6 +637,36 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         _sharedExpertGate.wrappedValue = Linear(args.hiddenSize, 1, bias: false)
     }
 
+    // The fused cache holds this block's parameter objects (see
+    // `Qwen35FusedMoE.Cache`). A module replacement anywhere in the block, or
+    // a parameter update that installs a new array, drops it so the next
+    // forward resolves the current objects. Invalidate on failure too: an
+    // update can throw after replacing an earlier module.
+    @discardableResult
+    override func update(
+        modules: ModuleChildren, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        defer { fusedCache.invalidate() }
+        return try super.update(
+            modules: modules, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        defer { fusedCache.invalidate() }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+
+    override func updateModule(key: String, _ value: Any) throws {
+        defer { fusedCache.invalidate() }
+        try super.updateModule(key: key, value)
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         // Decode (S == 1) runs through a compiled trace: fusion merges the
         // elementwise chains into fewer kernels, bit-identically. Prefill
@@ -935,7 +965,10 @@ public class Qwen35TextModelInner: Module {
         self.verifySegments = CompiledVerifySegmentCaches(
             count: segments.count,
             state: { model, index in
-                var modules: [Module] = segments[index].layerIndices.map { model.layers[$0] }
+                // The same state as the decode segment: a GDN layer's fused
+                // projection is read by the body, so it is declared, never a
+                // tape constant.
+                var modules = model.traceState(forLayers: segments[index].layerIndices)
                 if index == 0 {
                     modules.append(model.embedTokens)
                 }
