@@ -606,6 +606,10 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     @ModuleInfo(key: "shared_expert") var sharedExpert: Qwen3NextMLP
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
 
+    /// Resolved fused-MoE weights (see `Qwen35FusedMoE`). A plain class, not a
+    /// Module, so module reflection ignores it.
+    let fusedCache = Qwen35FusedMoE.Cache()
+
     init(_ args: Qwen35TextConfiguration) {
         self.normTopkProb = args.normTopkProb
         self.numExperts = args.numExperts
@@ -643,7 +647,19 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 
     /// The uncompiled body; an enclosing layer trace inlines it rather than
     /// nesting this block's own compiled wrapper.
+    ///
+    /// The fused small-T kernels replace the whole block (router, top-k,
+    /// routed experts, shared expert) when they accept the call; otherwise
+    /// the upstream body below runs unchanged.
     func forward(_ x: MLXArray) -> MLXArray {
+        if Qwen35FusedMoE.enabled, let fused = Qwen35FusedMoE.forward(self, x) {
+            return fused
+        }
+        return stockForward(x)
+    }
+
+    /// Upstream MoE body, kept for the fused path's fallback and its tests.
+    func stockForward(_ x: MLXArray) -> MLXArray {
         var gates = gate(x)
         gates = MLX.softmax(gates, axis: -1, precise: true)
 
