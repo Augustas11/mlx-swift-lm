@@ -838,6 +838,21 @@ final class Qwen35DecoderLayer: Module {
         return (h + mlpForward(postAttentionLayerNorm(h)), newConvState, newRecState)
     }
 
+    /// `linearLayerBody` for an MTP verification step, also returning the
+    /// recurrent checkpoint after `checkpointAfter` (0 < it < T) columns. Same
+    /// ops as the general layer path, with state passed explicitly.
+    func linearLayerVerifyBody(
+        x: MLXArray, convState: MLXArray, recState: MLXArray, checkpointAfter: Int
+    ) -> (MLXArray, MLXArray, MLXArray, (conv: MLXArray, recurrent: MLXArray)) {
+        let (r, newConvState, newRecState, checkpoint) = linearAttn!.forward(
+            inputLayerNorm(x), convState: convState, recState: recState, mask: nil,
+            checkpointAfter: checkpointAfter)
+        let h = x + r
+        return (
+            h + mlpForward(postAttentionLayerNorm(h)), newConvState, newRecState, checkpoint!
+        )
+    }
+
     func attentionPreBody(x: MLXArray) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
         selfAttn!.projectPreRope(inputLayerNorm(x))
     }
@@ -906,6 +921,21 @@ public class Qwen35TextModelInner: Module {
             body: { model, index, arguments in
                 model.segmentBody(at: index, arguments)
             })
+        self.verifySegments = CompiledVerifySegmentCaches(
+            count: segments.count,
+            state: { model, index in
+                var modules: [Module] = segments[index].layerIndices.map { model.layers[$0] }
+                if index == 0 {
+                    modules.append(model.embedTokens)
+                }
+                if index == segments.count - 1 {
+                    modules.append(model.norm)
+                }
+                return modules
+            },
+            body: { model, index, checkpointAfter, arguments in
+                model.verifySegmentBody(at: index, checkpointAfter: checkpointAfter, arguments)
+            })
 
         super.init()
     }
@@ -927,6 +957,11 @@ public class Qwen35TextModelInner: Module {
     ) -> MLXArray {
         if applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
             let step = decodeStep(inputs, caches)
+        {
+            return step
+        }
+        if applyFinalNorm, let caches = cache,
+            let step = verifyStep(inputs, caches, checkpointAfter: checkpointAfter)
         {
             return step
         }
@@ -1064,6 +1099,181 @@ public class Qwen35TextModelInner: Module {
 
         return carry
     }
+
+    // MARK: - Short multi-token step (MTP verification)
+
+    /// Widest step `verifyStep` compiles. MTP verification runs
+    /// `1 + proposal depth` columns; anything wider keeps the general path
+    /// rather than paying a trace per shape.
+    static let maxCompiledVerifyWidth = 8
+
+    /// Kill switch for `verifyStep`: `MLX_LM_QWEN35_COMPILED_VERIFY=0` sends
+    /// every multi-token step through the general path.
+    static let compiledVerifyEnabled: Bool =
+        ProcessInfo.processInfo.environment["MLX_LM_QWEN35_COMPILED_VERIFY"] != "0"
+
+    private let verifySegments: CompiledVerifySegmentCaches<Qwen35TextModelInner>
+
+    var compiledVerifySegmentCount: Int { verifySegments.compiledCount }
+
+    /// `segmentBody` for a `[B, T]` verification step. Each GDN layer emits
+    /// `[newConvState, newRecState, checkpointConv, checkpointRec]`, the
+    /// checkpoint being the state after the first `checkpointAfter` columns.
+    private func verifySegmentBody(
+        at index: Int, checkpointAfter: Int, _ args: [MLXArray]
+    ) -> [MLXArray] {
+        let segment = decodeSegments[index]
+        var hiddenStates = index == 0 ? embedTokens(args[0]) : args[0]
+
+        if let post = segment.attentionPostLayer {
+            hiddenStates = layers[post].attentionPostBody(
+                x: hiddenStates, attention: args[1], gate: args[2])
+        }
+
+        var states: [MLXArray] = []
+        for (i, layerIndex) in segment.linearLayers.enumerated() {
+            let slot = segment.stateInputOffset + 2 * i
+            let (out, newConvState, newRecState, checkpoint) = layers[layerIndex]
+                .linearLayerVerifyBody(
+                    x: hiddenStates, convState: args[slot], recState: args[slot + 1],
+                    checkpointAfter: checkpointAfter)
+            hiddenStates = out
+            states += [newConvState, newRecState, checkpoint.conv, checkpoint.recurrent]
+        }
+
+        if let pre = segment.attentionPreLayer {
+            let (queries, gate, keys, values) = layers[pre].attentionPreBody(x: hiddenStates)
+            return [hiddenStates] + states + [queries, gate, keys, values]
+        }
+
+        if index == decodeSegments.count - 1 {
+            hiddenStates = norm(hiddenStates)
+        }
+        return [hiddenStates] + states
+    }
+
+    /// A short multi-token step through compiled segments, or nil when the
+    /// general path must run it. This is the MTP verification shape:
+    /// `[lastCommitted, proposals...]` per row, no padded rows, every GDN
+    /// layer already holding state. It obeys the same cache constraints as
+    /// `decodeStep`: KV writes and SDPA run between segments, GDN state
+    /// crosses each segment explicitly, and the recurrent checkpoint the
+    /// general path would save is saved from the segment's outputs.
+    private func verifyStep(
+        _ inputs: MLXArray, _ cache: [KVCache?], checkpointAfter: Int?
+    ) -> MLXArray? {
+        guard Self.compiledVerifyEnabled, inputs.ndim == 2, cache.count == layers.count
+        else { return nil }
+        let width = inputs.dim(1)
+        // Only MTP verification asks for a recurrent checkpoint; other short
+        // steps (a prompt tail, a short follow-up turn) keep the general path.
+        guard width > 1, width <= Self.maxCompiledVerifyWidth,
+            let split = checkpointAfter, split > 0, split < width
+        else { return nil }
+        // Padded rows need the SSM mask: general path.
+        if createSSMMask(h: inputs, cache: cache[ssmIdx] as? MambaCache) != nil { return nil }
+        guard let faCache = cache[faIdx] else { return nil }
+
+        var mambaCaches = [MambaCache?](repeating: nil, count: layers.count)
+        for (i, layer) in layers.enumerated() {
+            if layer.isLinear {
+                guard let mambaCache = cache[i] as? MambaCache, mambaCache[0] != nil,
+                    mambaCache[1] != nil
+                else { return nil }
+                mambaCaches[i] = mambaCache
+            } else {
+                guard let kv = cache[i], usesPlainAttentionCacheRoute(kv) else { return nil }
+            }
+        }
+        // The general path builds this mask once from the full-attention
+        // cache and uses it for every attention layer; so does this one.
+        let faMask = createAttentionMask(h: inputs, cache: faCache)
+
+        var carry = inputs
+        var pendingAttention: [MLXArray] = []
+
+        for (segmentIndex, segment) in decodeSegments.enumerated() {
+            var args: [MLXArray] = [carry] + pendingAttention
+            for layerIndex in segment.linearLayers {
+                let mambaCache = mambaCaches[layerIndex]!
+                args.append(mambaCache[0]!)
+                args.append(mambaCache[1]!)
+            }
+
+            let outputs = verifySegments(self, at: segmentIndex, checkpointAfter: split, args)
+
+            carry = outputs[0]
+            for (i, layerIndex) in segment.linearLayers.enumerated() {
+                let mambaCache = mambaCaches[layerIndex]!
+                let base = 1 + 4 * i
+                mambaCache[0] = outputs[base]
+                mambaCache[1] = outputs[base + 1]
+                mambaCache.saveSpeculativeCheckpoint(
+                    convState: outputs[base + 2],
+                    recurrentState: outputs[base + 3],
+                    advancedBy: split)
+                mambaCache.advance(width)
+            }
+
+            pendingAttention = []
+            if let pre = segment.attentionPreLayer {
+                let head = 1 + 4 * segment.linearLayers.count
+                let attention = layers[pre].attentionCacheStep(
+                    queries: outputs[head], keys: outputs[head + 2],
+                    values: outputs[head + 3], cache: cache[pre]!, mask: faMask)
+                pendingAttention = [attention, outputs[head + 1]]
+            }
+        }
+
+        return carry
+    }
+}
+
+/// Compiled verify segments, one `CompiledDecodeSegmentCache` per checkpoint
+/// column: the column is a constant of the traced body, so each value needs
+/// its own trace. MLX retraces each one per input shape.
+final class CompiledVerifySegmentCaches<Owner: Module>: CompiledTraceInvalidating {
+    typealias Body = @Sendable (Owner, Int, Int, [MLXArray]) -> [MLXArray]
+
+    private let count: Int
+    private let state: CompiledDecodeSegmentCache<Owner>.StateProvider
+    private let body: Body
+    private let lock = NSLock()
+    private var caches: [Int: CompiledDecodeSegmentCache<Owner>] = [:]
+
+    init(
+        count: Int, state: @escaping CompiledDecodeSegmentCache<Owner>.StateProvider,
+        body: @escaping Body
+    ) {
+        self.count = count
+        self.state = state
+        self.body = body
+    }
+
+    var compiledCount: Int {
+        lock.withLock { caches.values.reduce(0) { $0 + $1.compiledCount } }
+    }
+
+    func callAsFunction(
+        _ owner: Owner, at index: Int, checkpointAfter: Int, _ arguments: [MLXArray]
+    ) -> [MLXArray] {
+        let cache = lock.withLock {
+            if let existing = caches[checkpointAfter] { return existing }
+            let body = self.body
+            let created = CompiledDecodeSegmentCache<Owner>(
+                count: count, state: state,
+                body: { owner, index, arguments in
+                    body(owner, index, checkpointAfter, arguments)
+                })
+            caches[checkpointAfter] = created
+            return created
+        }
+        return cache(owner, at: index, arguments)
+    }
+
+    func invalidate() {
+        lock.withLock { caches.values.forEach { $0.invalidate() } }
+    }
 }
 
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
@@ -1102,10 +1312,12 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let emitDrafterState = state?[mtpEmitFlagKey] ?? false
         let hiddenStates: MLXArray
         if emitDrafterState {
-            let hidden = model.forward(
-                input.tokens, cache: cache, applyFinalNorm: false,
+            // The final norm inside `forward` is the same `norm` applied to
+            // the same hidden state; requesting it there lets a short
+            // verification step run through the compiled segments.
+            hiddenStates = model.forward(
+                input.tokens, cache: cache, applyFinalNorm: true,
                 checkpointAfter: state?[mtpCacheCheckpointIndexKey])
-            hiddenStates = model.norm(hidden)
         } else {
             hiddenStates = model(input.tokens, cache: cache)
         }
