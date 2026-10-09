@@ -410,32 +410,21 @@ final class Qwen35GatedDeltaNet: Module {
         let newRecState: MLXArray
         let checkpoint: (conv: MLXArray, recurrent: MLXArray)?
         if let split = checkpointAfter, split > 0, split < S {
-            let prefixMask = mask.map { $0[0..., ..<split] }
-            let suffixMask = mask.map { $0[0..., split...] }
-            let (prefixOut, prefixState) = gatedDeltaUpdate(
-                q: qNormed[0..., ..<split, 0..., 0...],
-                k: kNormed[0..., ..<split, 0..., 0...],
-                v: v[0..., ..<split, 0..., 0...],
-                a: a[0..., ..<split, 0...],
-                b: b[0..., ..<split, 0...],
+            // One recurrent pass that also emits the state after `split`
+            // steps; bit-identical to two calls split at the checkpoint.
+            let prefixState: MLXArray
+            (out, prefixState, newRecState) = gatedDeltaUpdateCheckpointed(
+                q: qNormed,
+                k: kNormed,
+                v: v,
+                a: a,
+                b: b,
                 aLog: aLog,
                 dtBias: dtBias,
                 state: recState,
-                mask: prefixMask,
+                mask: mask,
+                checkpointAfter: split,
                 useKernel: !training)
-            let (suffixOut, suffixState) = gatedDeltaUpdate(
-                q: qNormed[0..., split..., 0..., 0...],
-                k: kNormed[0..., split..., 0..., 0...],
-                v: v[0..., split..., 0..., 0...],
-                a: a[0..., split..., 0...],
-                b: b[0..., split..., 0...],
-                aLog: aLog,
-                dtBias: dtBias,
-                state: prefixState,
-                mask: suffixMask,
-                useKernel: !training)
-            out = concatenated([prefixOut, suffixOut], axis: 1)
-            newRecState = suffixState
 
             let checkpointConv: MLXArray
             if convKernelSize > 1 {
