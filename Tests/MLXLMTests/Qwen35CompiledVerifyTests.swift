@@ -89,55 +89,165 @@ final class Qwen35CompiledVerifyTests: XCTestCase {
                 quantize(model: model, groupSize: 32, bits: 4)
             }
             eval(model)
-            let inner = model.model
+            try verifySteps(
+                model, dtype: dtype, batch: batch, width: width,
+                checkpointAfter: checkpointAfter, label: quantized ? " q4" : "")
+        }
+    }
 
-            let compiled = try model.newCache(parameters: nil)
-            let general = try model.newCache(parameters: nil)
-            let prompt = MLXRandom.randInt(0 ..< 32, [batch, 7]).asType(.int32)
-            for cache in [compiled, general] {
-                eval(inner.forward(prompt, cache: cache, applyFinalNorm: true))
-            }
-            assertCachesBitIdentical(compiled, general, "after prefill")
+    private func verifySteps(
+        _ model: Qwen35TextModel, dtype: DType, batch: Int, width: Int,
+        checkpointAfter: Int?, label variant: String
+    ) throws {
+        let inner = model.model
 
-            for step in 0 ..< 3 {
-                let tokens = MLXRandom.randInt(0 ..< 32, [batch, width]).asType(.int32)
-                let label =
-                    "\(dtype)\(quantized ? " q4" : "") B=\(batch) T=\(width) checkpoint=\(checkpointAfter.map(String.init) ?? "nil") step \(step)"
+        let compiled = try model.newCache(parameters: nil)
+        let general = try model.newCache(parameters: nil)
+        let prompt = MLXRandom.randInt(0 ..< 32, [batch, 7]).asType(.int32)
+        for cache in [compiled, general] {
+            eval(inner.forward(prompt, cache: cache, applyFinalNorm: true))
+        }
+        assertCachesBitIdentical(compiled, general, "after prefill")
 
-                let fast = inner.forward(
-                    tokens, cache: compiled, applyFinalNorm: true,
-                    checkpointAfter: checkpointAfter)
-                let slow = inner.norm(
-                    inner.forward(
-                        tokens, cache: general, applyFinalNorm: false,
-                        checkpointAfter: checkpointAfter))
-                eval(fast, slow)
+        for step in 0 ..< 3 {
+            let tokens = MLXRandom.randInt(0 ..< 32, [batch, width]).asType(.int32)
+            let label =
+                "\(dtype)\(variant) B=\(batch) T=\(width) checkpoint=\(checkpointAfter.map(String.init) ?? "nil") step \(step)"
 
-                assertBitIdentical(fast, slow, "\(label) hidden")
-                assertCachesBitIdentical(compiled, general, label)
+            let fast = inner.forward(
+                tokens, cache: compiled, applyFinalNorm: true,
+                checkpointAfter: checkpointAfter)
+            let slow = inner.norm(
+                inner.forward(
+                    tokens, cache: general, applyFinalNorm: false,
+                    checkpointAfter: checkpointAfter))
+            eval(fast, slow)
 
-                if let split = checkpointAfter, split > 0, split < width {
-                    if step % 2 == 1 {
-                        // Reject the proposals: restore each GDN layer's
-                        // checkpoint and trim the attention KV to match, so
-                        // the next step continues from the restored state.
-                        for cache in compiled + general {
-                            if let mamba = cache as? MambaCache {
-                                XCTAssertTrue(mamba.restoreSpeculativeCheckpoint(), "\(label) checkpoint")
-                            } else {
-                                XCTAssertEqual(cache.trim(width - split), width - split)
-                            }
+            assertBitIdentical(fast, slow, "\(label) hidden")
+            assertCachesBitIdentical(compiled, general, label)
+
+            if let split = checkpointAfter, split > 0, split < width {
+                if step % 2 == 1 {
+                    // Reject the proposals: restore each GDN layer's
+                    // checkpoint and trim the attention KV to match, so
+                    // the next step continues from the restored state.
+                    for cache in compiled + general {
+                        if let mamba = cache as? MambaCache {
+                            XCTAssertTrue(mamba.restoreSpeculativeCheckpoint(), "\(label) checkpoint")
+                        } else {
+                            XCTAssertEqual(cache.trim(width - split), width - split)
                         }
-                        assertCachesBitIdentical(compiled, general, "\(label) restored checkpoint")
-                    } else {
-                        for cache in compiled + general {
-                            (cache as? MambaCache)?.discardSpeculativeCheckpoint()
-                        }
+                    }
+                    assertCachesBitIdentical(compiled, general, "\(label) restored checkpoint")
+                } else {
+                    for cache in compiled + general {
+                        (cache as? MambaCache)?.discardSpeculativeCheckpoint()
                     }
                 }
             }
-            XCTAssertGreaterThan(
-                inner.compiledVerifySegmentCount, 0, "the compiled verify step never ran")
+        }
+        XCTAssertGreaterThan(
+            inner.compiledVerifySegmentCount, 0, "the compiled verify step never ran")
+    }
+
+    /// A served bf16 q4 model after `prepare()`: every GDN layer reads its
+    /// input projections through the fused projection, which is not a
+    /// registered child, so the trace sees it only as declared compile state.
+    private func preparedModel(seed: UInt64) throws -> Qwen35TextModel {
+        try XCTSkipUnless(qwen35FourGDNEnabled, "fused GDN projection kill switch is set")
+        let model = try withRandomState(MLXRandom.RandomState(seed: seed)) {
+            let model = Qwen35TextModel(try tinyConfiguration())
+            model.update(parameters: model.parameters().mapValues { $0.asType(.bfloat16) })
+            quantize(model: model, groupSize: 32, bits: 4)
+            eval(model)
+            return model
+        }
+        try model.prepare()
+        try assertFusedProjectionsPrepared(model)
+        return model
+    }
+
+    private func assertFusedProjectionsPrepared(
+        _ model: Qwen35TextModel, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let gdn = model.model.layers.compactMap(\.linearAttn)
+        XCTAssertEqual(gdn.count, 2, "expected two GDN layers", file: file, line: line)
+        for (index, layer) in gdn.enumerated() {
+            XCTAssertTrue(
+                layer.hasFusedInputProjection, "GDN \(index) fused projection not prepared",
+                file: file, line: line)
+            XCTAssertEqual(
+                layer.fusedProjectionTraceState.count, 1,
+                "GDN \(index) fused projection not declared as trace state",
+                file: file, line: line)
+        }
+    }
+
+    /// The prepared (served) model: the compiled step reads the fused GDN
+    /// projection and stays bit-identical to the general path.
+    func testCompiledVerifyWithPreparedFusedProjectionMatchesGeneralPath() throws {
+        let model = try preparedModel(seed: 31)
+        try withRandomState(MLXRandom.RandomState(seed: 32)) {
+            try verifySteps(
+                model, dtype: .bfloat16, batch: 1, width: 2, checkpointAfter: 1,
+                label: " q4 prepared")
+            try verifySteps(
+                model, dtype: .bfloat16, batch: 2, width: 3, checkpointAfter: 2,
+                label: " q4 prepared")
+        }
+    }
+
+    /// Lifetime and reload. The trace snapshots its declared state's array
+    /// objects, and a parameter update writes through those same objects, so
+    /// new weights loaded into the fused projection must reach the next
+    /// replay. A trace that captured the fused projection as a tape constant
+    /// would keep replaying the weights it was traced with and disagree with
+    /// the general path. Then models are freed and rebuilt with different
+    /// weights: a replay of a freed model's trace would do the same.
+    func testCompiledVerifyFollowsReloadedFusedProjection() throws {
+        let model = try preparedModel(seed: 41)
+        try withRandomState(MLXRandom.RandomState(seed: 42)) {
+            try verifySteps(
+                model, dtype: .bfloat16, batch: 1, width: 2, checkpointAfter: 1,
+                label: " q4 before reload")
+        }
+        let traced = model.model.compiledVerifySegmentCount
+        XCTAssertGreaterThan(traced, 0)
+
+        // Load different weights into each traced fused projection in place.
+        let donor = try preparedModel(seed: 43)
+        let targets = model.model.layers.compactMap(\.linearAttn)
+        let sources = donor.model.layers.compactMap(\.linearAttn)
+        XCTAssertEqual(targets.count, sources.count)
+        for (target, source) in zip(targets, sources) {
+            let fused = try XCTUnwrap(target.fusedProjectionTraceState.first)
+            let replacement = try XCTUnwrap(source.fusedProjectionTraceState.first)
+            let before = fused.parameters().flattened().map { $0.1 }
+            try fused.update(parameters: replacement.parameters(), verify: .all)
+            eval(fused)
+            // Written through the same array objects the trace snapshot holds.
+            for (old, new) in zip(before, fused.parameters().flattened().map { $0.1 }) {
+                XCTAssertTrue(old === new, "parameter update replaced an array object")
+            }
+        }
+        try withRandomState(MLXRandom.RandomState(seed: 44)) {
+            try verifySteps(
+                model, dtype: .bfloat16, batch: 1, width: 2, checkpointAfter: 1,
+                label: " q4 after in-place reload")
+        }
+        XCTAssertEqual(
+            model.model.compiledVerifySegmentCount, traced,
+            "the reload must replay the existing trace, not retrace")
+
+        // Free and rebuild: each model runs its compiled step and is
+        // released before the next one, with different weights, is built.
+        for seed in UInt64(51) ... 53 {
+            let fresh = try preparedModel(seed: seed)
+            try withRandomState(MLXRandom.RandomState(seed: seed + 100)) {
+                try verifySteps(
+                    fresh, dtype: .bfloat16, batch: 1, width: 2, checkpointAfter: 1,
+                    label: " q4 rebuilt seed \(seed)")
+            }
         }
     }
 
