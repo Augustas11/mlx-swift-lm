@@ -122,15 +122,22 @@ enum Qwen35FusedMoE {
         }
     }
 
+    // Exact stock classes only. The kernels reproduce the stock forward from
+    // the tensors alone, so a subclass that changes the forward while keeping
+    // an eligible layout (a ParoQuant rotation, a LoRA/DoRA adapter, a sharded
+    // linear) would silently lose its extra computation. Anything else takes
+    // the stock path.
     private static func q(_ layer: Linear, bits: Int) -> (MLXArray, MLXArray, MLXArray)? {
-        guard let ql = layer as? QuantizedLinear, ql.bits == bits, ql.groupSize == 64,
+        guard type(of: layer) == QuantizedLinear.self, let ql = layer as? QuantizedLinear,
+            ql.bits == bits, ql.groupSize == 64,
             ql.mode == .affine, let b = ql.biases, ql.bias == nil, ql.scales.dtype == .bfloat16
         else { return nil }
         return (ql.weight, ql.scales, b)
     }
 
     private static func q(_ layer: SwitchLinear) -> (MLXArray, MLXArray, MLXArray)? {
-        guard let ql = layer as? QuantizedSwitchLinear, ql.bits == 4, ql.groupSize == 64,
+        guard type(of: layer) == QuantizedSwitchLinear.self,
+            let ql = layer as? QuantizedSwitchLinear, ql.bits == 4, ql.groupSize == 64,
             ql.mode == .affine
         else { return nil }
         let parts = ql.quantizedParts
@@ -158,6 +165,7 @@ enum Qwen35FusedMoE {
         if cache.resolved { return cache.weights }
         cache.resolved = true
         guard block.numExperts == 256, block.topK == 8, block.normTopkProb,
+            type(of: block.switchMLP) == SwitchGLU.self,
             let gate = q(block.gate, bits: 8), let sgate = q(block.sharedExpertGate, bits: 8),
             let up = q(block.switchMLP.upProjection), let gp = q(block.switchMLP.gateProjection),
             let dn = q(block.switchMLP.downProjection),

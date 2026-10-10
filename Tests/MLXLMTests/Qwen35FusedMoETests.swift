@@ -13,9 +13,10 @@ final class Qwen35FusedMoETests: XCTestCase {
     /// A256-expert, top-8 block with the A3B quantization layout (router and
     /// shared-expert gate 8-bit, experts 4-bit, group 64, bf16 scales), small
     /// expert width to keep the test light.
-    private func makeBlock(seed: UInt64, expectFusable: Bool = true) throws
-        -> Qwen35SparseMoeBlock
-    {
+    private func makeBlock(
+        seed: UInt64, expectFusable: Bool = true,
+        replaceModules: ((Qwen35SparseMoeBlock) throws -> Void)? = nil
+    ) throws -> Qwen35SparseMoeBlock {
         let json = """
             {"hidden_size": 2048, "num_experts": 256, "num_experts_per_tok": 8,
              "moe_intermediate_size": 256, "shared_expert_intermediate_size": 256,
@@ -25,10 +26,11 @@ final class Qwen35FusedMoETests: XCTestCase {
             Qwen35TextConfiguration.self, from: Data(json.utf8))
         MLXRandom.seed(seed)
         let block = Qwen35SparseMoeBlock(config)
+        try replaceModules?(block)
         // Sharper router logits so the top-8 is not a near-tie everywhere.
         let params = block.parameters().flattened().map { key, value -> (String, MLXArray) in
             let scaled = key == "gate.weight" ? value * 16 : value
-            return (key, scaled.asType(.bfloat16))
+            return (key, value.dtype == .float32 ? scaled.asType(.bfloat16) : scaled)
         }
         block.update(parameters: ModuleParameters.unflattened(params))
         quantize(model: block) { path, _ in
@@ -116,6 +118,45 @@ final class Qwen35FusedMoETests: XCTestCase {
             XCTAssertFalse(Qwen35FusedMoE.isFusable(block), key)
             XCTAssertNil(Qwen35FusedMoE.forward(block, input(1, seed: 81)), key)
         }
+    }
+
+    /// A ParoQuant `RotateSwitchGLU` keeps the stock quantized expert layout
+    /// but rotates the expert input and hidden state, which the fused kernels
+    /// would skip. Only the exact stock `SwitchGLU` is fusable.
+    func testRotatedSwitchGLUIsNotFusable() throws {
+        let block = try makeBlock(seed: 9, expectFusable: false) { block in
+            let rotated = RotateSwitchGLU(
+                inputDims: 2048, hiddenDims: 256, numExperts: 256, groupSize: 128, krot: 1)
+            _ = try block.update(
+                modules: ModuleChildren.unflattened([("switch_mlp", rotated)]), verify: .none)
+        }
+        XCTAssertTrue(block.switchMLP is RotateSwitchGLU)
+        // The expert projections still have the eligible quantized layout.
+        let up = try XCTUnwrap(block.switchMLP.upProjection as? QuantizedSwitchLinear)
+        XCTAssertEqual(up.bits, 4)
+        XCTAssertEqual(up.quantizedParts.scales.dtype, .bfloat16)
+        XCTAssertFalse(Qwen35FusedMoE.isFusable(block))
+        XCTAssertNil(Qwen35FusedMoE.forward(block, input(1, seed: 91)))
+    }
+
+    /// A LoRA adapter subclasses `QuantizedLinear` and keeps its tensors, but
+    /// adds a low-rank term the fused kernels would omit. Only the exact stock
+    /// `QuantizedLinear` is fusable, for the shared expert and the router.
+    func testAdapterBackedProjectionIsNotFusable() throws {
+        for path in ["shared_expert.up_proj", "shared_expert.down_proj", "gate"] {
+            let block = try makeBlock(seed: 10, expectFusable: false)
+            let modules = Dictionary(uniqueKeysWithValues: block.leafModules().flattened())
+            let stock = try XCTUnwrap(modules[path] as? QuantizedLinear, path)
+            XCTAssertTrue(type(of: stock) == QuantizedLinear.self, path)
+            let adapter = try XCTUnwrap(QLoRALinear.from(linear: stock, rank: 4) as? Module, path)
+            _ = try block.update(
+                modules: ModuleChildren.unflattened([(path, adapter)]), verify: .none)
+            eval(block)
+            XCTAssertFalse(Qwen35FusedMoE.isFusable(block), path)
+            XCTAssertNil(Qwen35FusedMoE.forward(block, input(1, seed: 92)), path)
+        }
+        // Control: the same block without an adapter is fusable.
+        XCTAssertTrue(Qwen35FusedMoE.isFusable(try makeBlock(seed: 10)))
     }
 
     func testEligibleBlockUsesFusedPathByDefault() throws {
