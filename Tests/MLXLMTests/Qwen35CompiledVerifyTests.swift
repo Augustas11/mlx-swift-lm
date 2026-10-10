@@ -167,10 +167,15 @@ final class Qwen35CompiledVerifyTests: XCTestCase {
         return model
     }
 
+    /// GDN layers, ordered by module path so two models pair layer by layer.
+    private func gdnLayers(_ model: Qwen35TextModel) -> [Qwen35GatedDeltaNet] {
+        model.namedModules().sorted { $0.0 < $1.0 }.compactMap { $0.1 as? Qwen35GatedDeltaNet }
+    }
+
     private func assertFusedProjectionsPrepared(
         _ model: Qwen35TextModel, file: StaticString = #filePath, line: UInt = #line
     ) throws {
-        let gdn = model.model.layers.compactMap(\.linearAttn)
+        let gdn = gdnLayers(model)
         XCTAssertEqual(gdn.count, 2, "expected two GDN layers", file: file, line: line)
         for (index, layer) in gdn.enumerated() {
             XCTAssertTrue(
@@ -216,8 +221,8 @@ final class Qwen35CompiledVerifyTests: XCTestCase {
 
         // Load different weights into each traced fused projection in place.
         let donor = try preparedModel(seed: 43)
-        let targets = model.model.layers.compactMap(\.linearAttn)
-        let sources = donor.model.layers.compactMap(\.linearAttn)
+        let targets = gdnLayers(model)
+        let sources = gdnLayers(donor)
         XCTAssertEqual(targets.count, sources.count)
         for (target, source) in zip(targets, sources) {
             let fused = try XCTUnwrap(target.fusedProjectionTraceState.first)
