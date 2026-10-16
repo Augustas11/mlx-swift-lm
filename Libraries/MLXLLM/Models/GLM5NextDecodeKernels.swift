@@ -41,9 +41,9 @@ private let glm5NextKernelHeader = """
     }
     """
 
-/// One threadgroup (1024 threads) per head. Steps: short conv + SiLU, q/k
-/// l2norm, forget-gate decay and beta, the per-channel gated delta rule (as
-/// `gated_delta_step_vec`), and the gated RMSNorm.
+/// One threadgroup (1024 threads) per (head, row). Steps: short conv + SiLU,
+/// q/k l2norm, forget-gate decay and beta, the per-channel gated delta rule
+/// (as `gated_delta_step_vec`), and the gated RMSNorm. Rows are independent.
 private let glm5NextKDASource = """
       constexpr int CK = 4;
       constexpr int NROW = CK - 1 + TOK;
@@ -53,6 +53,24 @@ private let glm5NextKDASource = """
       const uint lane = thread_index_in_simdgroup;
       const uint sg = simdgroup_index_in_threadgroup;
       const int h = int(threadgroup_position_in_grid.x);
+      const int brow = int(threadgroup_position_in_grid.y);
+      // This row's slices of the per-row inputs and outputs.
+      const auto q_r = q_in + size_t(brow) * TOK * QKV;
+      const auto k_r = k_in + size_t(brow) * TOK * QKV;
+      const auto v_r = v_in + size_t(brow) * TOK * QKV;
+      const auto b_r = b_in + size_t(brow) * TOK * H;
+      const auto cs_r = conv_state + size_t(brow) * (CK - 1) * NP;
+      device T* cs_out_r = conv_state_out + size_t(brow) * (CK - 1) * NP;
+      const auto st_r = state_in + size_t(brow) * H * DK * DK;
+      device float* st_out_r = state_out + size_t(brow) * H * DK * DK;
+      device T* y_r = y + size_t(brow) * TOK * QKV;
+    #if GATE_ROWS
+      const auto fa_r = fa_in + size_t(brow) * TOK * DK;
+      const auto ga_r = ga_in + size_t(brow) * TOK * DK;
+    #else
+      const auto a_pre_r = a_pre + size_t(brow) * TOK * QKV;
+      const auto gate_pre_r = gate_pre + size_t(brow) * TOK * QKV;
+    #endif
       const float q_scale = consts[0];
       const float l2_eps = consts[1];
       const float norm_eps = consts[2];
@@ -71,8 +89,8 @@ private let glm5NextKDASource = """
     #define A_PRE(t, i) as_[t][i]
     #define GATE_PRE(t, c) gates[t][c]
     #else
-    #define A_PRE(t, i) a_pre[(t) * QKV + h * DK + (i)]
-    #define GATE_PRE(t, c) gate_pre[(t) * QKV + h * DK + (c)]
+    #define A_PRE(t, i) a_pre_r[(t) * QKV + h * DK + (i)]
+    #define GATE_PRE(t, c) gate_pre_r[(t) * QKV + h * DK + (c)]
     #endif
 
       // 1. Short conv over [conv_state; q|k|v] and SiLU.
@@ -80,10 +98,10 @@ private let glm5NextKDASource = """
         const int part = int(tid) / DK;
         const int i = int(tid) % DK;
         const int gc = part * QKV + h * DK + i;
-        const device T* src = part == 0 ? q_in : (part == 1 ? k_in : v_in);
+        const auto src = part == 0 ? q_r : (part == 1 ? k_r : v_r);
         T win[NROW];
         for (int r = 0; r < CK - 1; r++) {
-          win[r] = conv_state[r * NP + gc];
+          win[r] = cs_r[r * NP + gc];
         }
         for (int t = 0; t < TOK; t++) {
           win[CK - 1 + t] = src[t * QKV + h * DK + i];
@@ -106,7 +124,7 @@ private let glm5NextKDASource = """
           }
         }
         for (int r = 0; r < CK - 1; r++) {
-          conv_state_out[r * NP + gc] = win[TOK + r];
+          cs_out_r[r * NP + gc] = win[TOK + r];
         }
       }
 
@@ -124,7 +142,7 @@ private let glm5NextKDASource = """
           const int row = h * DK + i;
           float result = 0;
           if (lane < 16u) {
-            const device T* xin = (which == 0 ? fa_in : ga_in) + int(lane) * 8;
+            const auto xin = (which == 0 ? fa_r : ga_r) + int(lane) * 8;
             float x_thread[8];
             float sum = glm_load_vector<T, 8, 5>(xin, x_thread);
             const device uint8_t* wl = (const device uint8_t*)(which == 0 ? fb_w : gb_w)
@@ -163,7 +181,7 @@ private let glm5NextKDASource = """
         const float s = sl[0];
         const float b = bl[0];
         for (int t = 0; t < TOK; t++) {
-          const device T* xin = (which == 0 ? fa_in : ga_in) + t * DK + ql * VPT;
+          const auto xin = (which == 0 ? fa_r : ga_r) + t * DK + ql * VPT;
           float x_thread[VPT];
           float sum = glm_load_vector<T, VPT, BITS>(xin, x_thread);
           float result = 0;
@@ -194,7 +212,7 @@ private let glm5NextKDASource = """
         gs[t][i] = metal::precise::exp(s4);
       }
       if (tid < uint(TOK)) {
-        betas[tid] = glm_sigmoid<T>(b_in[tid * H + h]);
+        betas[tid] = glm_sigmoid<T>(b_r[tid * H + h]);
       }
 
       // 2. l2norm(q) * q_scale, l2norm(k): x * rsqrt(sum(x * x) + eps) in fp32.
@@ -231,7 +249,7 @@ private let glm5NextKDASource = """
         float state[NPL];
         for (int i = 0; i < NPL; ++i) {
           auto s_idx = NPL * dk_idx + i;
-          state[i] = static_cast<float>(state_in[(size_t(h) * DK + dv_idx) * DK + s_idx]);
+          state[i] = static_cast<float>(st_r[(size_t(h) * DK + dv_idx) * DK + s_idx]);
         }
         for (int t = 0; t < TOK; ++t) {
           float kv_mem = 0.0f;
@@ -257,7 +275,7 @@ private let glm5NextKDASource = """
         }
         for (int i = 0; i < NPL; ++i) {
           auto s_idx = NPL * dk_idx + i;
-          state_out[(size_t(h) * DK + dv_idx) * DK + s_idx] = state[i];
+          st_out_r[(size_t(h) * DK + dv_idx) * DK + s_idx] = state[i];
         }
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -284,7 +302,7 @@ private let glm5NextKDASource = """
           float gf = static_cast<float>(GATE_PRE(t, c));
           float gsg = glm_sigmoid<float>(gf);
           float o = wx * gsg;
-          y[t * QKV + h * DK + c] = static_cast<T>(o);
+          y_r[t * QKV + h * DK + c] = static_cast<T>(o);
         }
       }
     #undef A_PRE
@@ -325,12 +343,13 @@ private final class GLM5NextKDAKernel: Sendable {
     }
 }
 
-/// Fused KDA layer body for one sequence and `T <= 8` tokens.
+/// Fused KDA layer body for `B` rows of `T <= 8` tokens; each row is
+/// computed exactly as a one-row call.
 ///
 /// Inputs are the layer's projections of the normed hidden state, each
-/// `[1, T, H * Dk]` (`bRaw`: `[1, T, H]`) in the activation dtype, the
-/// `[1, 3, 3 * H * Dk]` conv state and the `[1, H, Dk, Dk]` float32 recurrent
-/// state. Returns the gated-normed attention output `[1, T, H * Dk]` (before
+/// `[B, T, H * Dk]` (`bRaw`: `[B, T, H]`) in the activation dtype, the
+/// `[B, 3, 3 * H * Dk]` conv state and the `[B, H, Dk, Dk]` float32 recurrent
+/// state. Returns the gated-normed attention output `[B, T, H * Dk]` (before
 /// `o_proj`) and both new states, or `nil` when the shapes are not covered
 /// (the caller keeps the op path).
 func glm5NextKDADecodeStep(
@@ -342,20 +361,20 @@ func glm5NextKDADecodeStep(
 ) -> (y: MLXArray, convState: MLXArray, state: MLXArray)? {
     let dtype = q.dtype
     guard dtype == .bfloat16 || dtype == .float16, headDim == 128, heads >= 1,
-        q.ndim == 3, q.dim(0) == 1, (1 ... 8).contains(q.dim(1))
+        q.ndim == 3, q.dim(0) >= 1, (1 ... 8).contains(q.dim(1))
     else { return nil }
-    let T = q.dim(1)
+    let (B, T) = (q.dim(0), q.dim(1))
     let qkv = heads * headDim
-    for part in [q, k, v, aPre, gatePre] where part.shape != [1, T, qkv] || part.dtype != dtype {
+    for part in [q, k, v, aPre, gatePre] where part.shape != [B, T, qkv] || part.dtype != dtype {
         return nil
     }
-    guard bRaw.shape == [1, T, heads], bRaw.dtype == dtype,
-        convState.shape == [1, 3, 3 * qkv], convState.dtype == dtype,
+    guard bRaw.shape == [B, T, heads], bRaw.dtype == dtype,
+        convState.shape == [B, 3, 3 * qkv], convState.dtype == dtype,
         convWeight.shape == [3 * qkv, 4, 1], convWeight.dtype == dtype,
         aLog.size == heads, aLog.dtype == .float32,
         dtBias.size == qkv, dtBias.dtype == .float32,
         normWeight.shape == [headDim],
-        state.shape == [1, heads, headDim, headDim], state.dtype == .float32
+        state.shape == [B, heads, headDim, headDim], state.dtype == .float32
     else { return nil }
 
     // Python float scalars, as the reference builds them (double, then float32).
@@ -369,17 +388,17 @@ func glm5NextKDADecodeStep(
             ("T", dtype), ("TOK", T), ("DK", headDim), ("QKV", qkv), ("H", heads),
             ("BITS", 8), ("GS", 64),
         ],
-        grid: (1024 * heads, 1, 1),
+        grid: (1024 * heads, B, 1),
         threadGroup: (1024, 1, 1),
-        outputShapes: [[1, T, qkv], [1, 3, 3 * qkv], [1, heads, headDim, headDim]],
+        outputShapes: [[B, T, qkv], [B, 3, 3 * qkv], [B, heads, headDim, headDim]],
         outputDTypes: [dtype, dtype, .float32])
     return (outputs[0], outputs[1], outputs[2])
 }
 
 /// `glm5NextKDADecodeStep` with the low-rank gate projections' second
 /// halves (`f_b`, `g_b`, K = head_dim = 128) computed in the kernel from
-/// `fa`/`ga` (`[1, T, 128]`): MLX's qmv_quad rows for 4/8 bits, its qmv rows
-/// for 5 bits and one token. `nil` when not covered.
+/// `fa`/`ga` (`[B, T, 128]`): MLX's qmv_quad rows for 4/8 bits, its qmv rows
+/// for 5 bits and one token per row. `nil` when not covered.
 func glm5NextKDADecodeStep(
     q: MLXArray, k: MLXArray, v: MLXArray, fa: MLXArray, ga: MLXArray,
     fb: GLM5NextAffine, gb: GLM5NextAffine, bRaw: MLXArray,
@@ -389,14 +408,14 @@ func glm5NextKDADecodeStep(
 ) -> (y: MLXArray, convState: MLXArray, state: MLXArray)? {
     let dtype = q.dtype
     guard dtype == .bfloat16 || dtype == .float16, headDim == 128, heads >= 1,
-        q.ndim == 3, q.dim(0) == 1, (1 ... 8).contains(q.dim(1))
+        q.ndim == 3, q.dim(0) >= 1, (1 ... 8).contains(q.dim(1))
     else { return nil }
-    let T = q.dim(1)
+    let (B, T) = (q.dim(0), q.dim(1))
     let qkv = heads * headDim
-    for part in [q, k, v] where part.shape != [1, T, qkv] || part.dtype != dtype {
+    for part in [q, k, v] where part.shape != [B, T, qkv] || part.dtype != dtype {
         return nil
     }
-    for part in [fa, ga] where part.shape != [1, T, headDim] || part.dtype != dtype {
+    for part in [fa, ga] where part.shape != [B, T, headDim] || part.dtype != dtype {
         return nil
     }
     guard (fb.bits, fb.groupSize) == (gb.bits, gb.groupSize), [32, 64, 128].contains(fb.groupSize),
@@ -404,13 +423,13 @@ func glm5NextKDADecodeStep(
         fb.weight.shape == [qkv, 128 * fb.bits / 32], gb.weight.shape == fb.weight.shape,
         fb.scales.dtype == dtype, gb.scales.dtype == dtype,
         fb.biases.dtype == dtype, gb.biases.dtype == dtype,
-        bRaw.shape == [1, T, heads], bRaw.dtype == dtype,
-        convState.shape == [1, 3, 3 * qkv], convState.dtype == dtype,
+        bRaw.shape == [B, T, heads], bRaw.dtype == dtype,
+        convState.shape == [B, 3, 3 * qkv], convState.dtype == dtype,
         convWeight.shape == [3 * qkv, 4, 1], convWeight.dtype == dtype,
         aLog.size == heads, aLog.dtype == .float32,
         dtBias.size == qkv, dtBias.dtype == .float32,
         normWeight.shape == [headDim],
-        state.shape == [1, heads, headDim, headDim], state.dtype == .float32
+        state.shape == [B, heads, headDim, headDim], state.dtype == .float32
     else { return nil }
     let consts = MLXArray(
         [Float(pow(Double(headDim), -0.5)), l2Eps, normEps, lowerBound,
@@ -425,9 +444,9 @@ func glm5NextKDADecodeStep(
             ("T", dtype), ("TOK", T), ("DK", headDim), ("QKV", qkv), ("H", heads),
             ("BITS", fb.bits), ("GS", fb.groupSize),
         ],
-        grid: (1024 * heads, 1, 1),
+        grid: (1024 * heads, B, 1),
         threadGroup: (1024, 1, 1),
-        outputShapes: [[1, T, qkv], [1, 3, 3 * qkv], [1, heads, headDim, headDim]],
+        outputShapes: [[B, T, qkv], [B, 3, 3 * qkv], [B, heads, headDim, headDim]],
         outputDTypes: [dtype, dtype, .float32])
     return (outputs[0], outputs[1], outputs[2])
 }
@@ -435,12 +454,14 @@ func glm5NextKDADecodeStep(
 // MARK: - Multi-projection qmv (one token)
 
 /// `[linear(x) for linear in parts]` for up to six affine projections with
-/// the same bits and group size, one dispatch: each output row with MLX's
-/// qmv_fast arithmetic (oMLX `multi_qmv`, extended to six parts).
+/// the same bits and group size and `NV` input vectors (grid y), one
+/// dispatch: each output row of each vector with MLX's qmv_fast arithmetic
+/// (oMLX `multi_qmv`, extended to six parts and several vectors).
 private let glm5NextMultiQMVSource = """
       const uint lane = thread_index_in_simdgroup;
       const int sg = int(simdgroup_index_in_threadgroup);
       const int row0 = int(threadgroup_position_in_grid.x) * (RPS * NSGQ);
+      const int vec = int(threadgroup_position_in_grid.y);
       constexpr int WB = K * BITS / 8;
       constexpr int G = K / GS;
       const device uint8_t* w = (const device uint8_t*)w0;
@@ -448,28 +469,30 @@ private let glm5NextMultiQMVSource = """
       const device T* bi = b0;
       device T* y = y0;
       int local = row0;
+      int n = N0;
     #if NP > 1
-      if (row0 >= N0) { w = (const device uint8_t*)w1; sc = s1; bi = b1; y = y1; local = row0 - N0; }
+      if (row0 >= N0) { w = (const device uint8_t*)w1; sc = s1; bi = b1; y = y1; local = row0 - N0; n = N1; }
     #endif
     #if NP > 2
-      if (row0 >= N0 + N1) { w = (const device uint8_t*)w2; sc = s2; bi = b2; y = y2; local = row0 - N0 - N1; }
+      if (row0 >= N0 + N1) { w = (const device uint8_t*)w2; sc = s2; bi = b2; y = y2; local = row0 - N0 - N1; n = N2; }
     #endif
     #if NP > 3
-      if (row0 >= N0 + N1 + N2) { w = (const device uint8_t*)w3; sc = s3; bi = b3; y = y3; local = row0 - N0 - N1 - N2; }
+      if (row0 >= N0 + N1 + N2) { w = (const device uint8_t*)w3; sc = s3; bi = b3; y = y3; local = row0 - N0 - N1 - N2; n = N3; }
     #endif
     #if NP > 4
-      if (row0 >= N0 + N1 + N2 + N3) { w = (const device uint8_t*)w4; sc = s4; bi = b4; y = y4; local = row0 - N0 - N1 - N2 - N3; }
+      if (row0 >= N0 + N1 + N2 + N3) { w = (const device uint8_t*)w4; sc = s4; bi = b4; y = y4; local = row0 - N0 - N1 - N2 - N3; n = N4; }
     #endif
     #if NP > 5
-      if (row0 >= N0 + N1 + N2 + N3 + N4) { w = (const device uint8_t*)w5; sc = s5; bi = b5; y = y5; local = row0 - N0 - N1 - N2 - N3 - N4; }
+      if (row0 >= N0 + N1 + N2 + N3 + N4) { w = (const device uint8_t*)w5; sc = s5; bi = b5; y = y5; local = row0 - N0 - N1 - N2 - N3 - N4; n = N5; }
     #endif
+      y += size_t(vec) * n;
       const int r0 = local + sg * RPS;
       float result[RPS];
       for (int r = 0; r < RPS; r++) {
         result[r] = 0.0f;
       }
       glm_qmv_rows<T, K, GS, BITS, RPS>(
-          w + size_t(r0) * WB, sc + r0 * G, bi + r0 * G, x, lane, result);
+          w + size_t(r0) * WB, sc + r0 * G, bi + r0 * G, x + size_t(vec) * K, lane, result);
       for (int r = 0; r < RPS; r++) {
         float v = simd_sum(result[r]);
         if (lane == 0) {
@@ -498,14 +521,14 @@ private final class GLM5NextMultiQMVKernels: @unchecked Sendable {
     }
 }
 
-/// One-token outputs `[1, N_i]` of up to six projections sharing bits and
-/// group size, or `nil` when not covered. Each simdgroup reduces `rps` rows
-/// (every row's arithmetic is independent of the layout); a threadgroup has
-/// `nsg` simdgroups.
+/// Outputs `[V, N_i]` for `V` one-token vectors `x: [V, K]` of up to six
+/// projections sharing bits and group size, or `nil` when not covered. Each
+/// simdgroup reduces `rps` rows (every row's arithmetic is independent of the
+/// layout and of `V`); a threadgroup has `nsg` simdgroups.
 func glm5NextMultiQMV(
     _ x: MLXArray, _ parts: [GLM5NextAffine], rps: Int = 4, nsg: Int = 2
 ) -> [MLXArray]? {
-    guard x.ndim == 2, x.dim(0) == 1, [.bfloat16, .float16].contains(x.dtype),
+    guard x.ndim == 2, x.dim(0) >= 1, [.bfloat16, .float16].contains(x.dtype),
         (1 ... 6).contains(parts.count)
     else { return nil }
     let K = x.dim(1)
@@ -522,15 +545,16 @@ func glm5NextMultiQMV(
     var template: [(String, any KernelTemplateArg)] = [
         ("T", x.dtype), ("K", K), ("BITS", bits), ("GS", groupSize), ("RPS", rps), ("NSGQ", nsg),
     ]
-    for i in 0 ..< 5 {
+    for i in 0 ..< 6 {
         template.append(("N\(i)", i < rows.count ? rows[i] : 0))
     }
+    let V = x.dim(0)
     return GLM5NextMultiQMVKernels.shared.kernel(parts: parts.count)(
         [x] + parts.flatMap { [$0.weight, $0.scales, $0.biases] },
         template: template,
-        grid: (32 * nsg * (rows.reduce(0, +) / (rps * nsg)), 1, 1),
+        grid: (32 * nsg * (rows.reduce(0, +) / (rps * nsg)), V, 1),
         threadGroup: (32 * nsg, 1, 1),
-        outputShapes: rows.map { [1, $0] },
+        outputShapes: rows.map { [V, $0] },
         outputDTypes: Array(repeating: x.dtype, count: rows.count))
 }
 
@@ -975,8 +999,9 @@ func glm5NextMoERouter(
     return (selected[0], selected[1])
 }
 
-// MARK: - Deferred hyper-connection decode (one token)
+// MARK: - Deferred hyper-connection decode (one token per row)
 //
+// Each row's token is one grid-y slice, computed exactly as a one-row call.
 // A half-layer's chain is expand (previous branch) -> hc_mix -> hc_norm ->
 // branch. `glm5NextHCPre` computes the mix GEMV (hc_mix's arithmetic), the
 // pre weights, the FMA collapse and the branch RMSNorm (hc_norm's) in one
@@ -1009,17 +1034,26 @@ private let glm5NextHCPreSource = """
       const uint simd_lid = thread_index_in_simdgroup;
       const uint simd_gid = simdgroup_index_in_threadgroup;
       const int tile = int(threadgroup_position_in_grid.x);
+      const int tok = int(threadgroup_position_in_grid.y);
       constexpr int KSZ = HC * D;
+      constexpr int MIXW = (2 + HC) * HC;
       constexpr int CH = KSZ / 4096;  // rms_looped reads per thread, 4 values each
       constexpr int D4 = D / 4;
       static_assert(KSZ % 4096 == 0 && D4 <= 1024 && D % 4 == 0, "hc_pre_fused shape");
       constexpr float HC_EPS = HC_EPS_INT * 1e-9;
       constexpr float NORM_EPS = NORM_EPS_INT * 1e-9;
       using T4 = vec<T, 4>;
+      device float* mixes_t = mixes + size_t(tok) * MIXW;
+      device T* normalized_t = normalized + size_t(tok) * D;
     #if DEFERRED
-    #define HVAL(e) glm_hc_expand_value<T, D>(y, mm, post, (e))
+      const auto y_t = y + size_t(tok) * D;
+      const auto mm_t = mm + size_t(tok) * KSZ;
+      const auto post_t = post + size_t(tok) * HC;
+      device T* h_out_t = h_out + size_t(tok) * KSZ;
+    #define HVAL(e) glm_hc_expand_value<T, D>(y_t, mm_t, post_t, (e))
     #else
-    #define HVAL(e) x[(e)]
+      const auto x_t = x + size_t(tok) * KSZ;
+    #define HVAL(e) x_t[(e)]
     #endif
 
       // This thread's h values in rms_looped order.
@@ -1033,7 +1067,7 @@ private let glm5NextHCPreSource = """
       if (tile == 0) {
         for (int c = 0; c < CH; c++) {
           for (int i = 0; i < 4; i++) {
-            h_out[c * 4096 + int(lid) * 4 + i] = hv[c][i];
+            h_out_t[c * 4096 + int(lid) * 4 + i] = hv[c][i];
           }
         }
       }
@@ -1104,7 +1138,7 @@ private let glm5NextHCPreSource = """
         for (int s = 1; s < 8; s++) {
           total += partial[slot][s];
         }
-        mixes[row] = total;
+        mixes_t[row] = total;
         row_total[slot] = total;
       }
       if (tile != 0) {
@@ -1170,7 +1204,7 @@ private let glm5NextHCPreSource = """
         const device T4* weights = (const device T4*)norm_weight;
         T4 scaled = T4(float4(rounded) * ninv);
         T4 weight = weights[lid];
-        ((device T4*)normalized)[lid] = T4(
+        ((device T4*)normalized_t)[lid] = T4(
             weight.x * scaled.x,
             weight.y * scaled.y,
             weight.z * scaled.z,
@@ -1231,19 +1265,23 @@ private let glm5NextHCPostHeader = """
 private let glm5NextHCPostSource = """
       const ushort lane = thread_index_in_simdgroup;
       const uint sg = simdgroup_index_in_threadgroup;
+      const int tok = int(threadgroup_position_in_grid.y);
       static_assert(HC == 4, "one float4 comb row per lane");
+      const auto mixes_t = mixes + size_t(tok) * (2 + HC) * HC;
+      const auto residual_t = residual + size_t(tok) * HC * D;
+      device float* mm_t = mm + size_t(tok) * HC * D;
       threadgroup float4 comb_rows[HC];
       threadgroup float a_tile[64];
       threadgroup float b_tiles[SIMDS * 64];
       if (sg == 0) {
         float post_v;
         float4 res;
-        glm_hc_post_comb<HC, ITERS, HC_EPS_INT>(mixes, scale[1], scale[2], base, uint(lane), post_v, res);
+        glm_hc_post_comb<HC, ITERS, HC_EPS_INT>(mixes_t, scale[1], scale[2], base, uint(lane), post_v, res);
         if (lane < HC) {
           comb_rows[lane] = res;
           if (threadgroup_position_in_grid.x == 0) {
-            post_out[lane] = post_v;
-            *(device float4*)(comb_out + lane * HC) = res;
+            post_out[tok * HC + lane] = post_v;
+            *(device float4*)(comb_out + (tok * HC + lane) * HC) = res;
           }
         }
       }
@@ -1262,7 +1300,7 @@ private let glm5NextHCPostSource = """
       threadgroup float* bt = b_tiles + sg * 64;
       for (int e = lane; e < 64; e += 32) {
         const int k = e / 8, c = e % 8;
-        bt[e] = (k < HC && col0 + c < D) ? static_cast<float>(residual[k * D + col0 + c]) : 0.0f;
+        bt[e] = (k < HC && col0 + c < D) ? static_cast<float>(residual_t[k * D + col0 + c]) : 0.0f;
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
       if (col0 < D) {
@@ -1278,7 +1316,7 @@ private let glm5NextHCPostSource = """
         for (int e = lane; e < HC * 8; e += 32) {
           const int r = e / 8, c = e % 8;
           if (col0 + c < D) {
-            mm[r * D + col0 + c] = bt[r * 8 + c];
+            mm_t[r * D + col0 + c] = bt[r * 8 + c];
           }
         }
       }
@@ -1336,9 +1374,9 @@ func glm5NextHCDeferredSupported(
         && base.shape == [24] && normWeight.dtype == dtype && normWeight.shape == [width]
 }
 
-/// One-token branch input from `x: [1, 1, 4, D]` or from the previous
-/// half-layer `(y [1, 1, D], mm [4 * D] fp32, post [1, 1, 4] fp32)`.
-/// Returns `(normalized [1, 1, D], mixes [1, 1, 24], h [1, 1, 4, D])`.
+/// One-token-per-row branch input from `x: [B, 1, 4, D]` or from the previous
+/// half-layer `(y [B, 1, D], mm [B, 4 * D] fp32, post [B, 1, 4] fp32)`.
+/// Returns `(normalized [B, 1, D], mixes [B, 1, 24], h [B, 1, 4, D])`.
 func glm5NextHCPre(
     x: MLXArray?, deferred: (y: MLXArray, mm: MLXArray, post: MLXArray)?,
     fn: MLXArray, scale: MLXArray, base: MLXArray, normWeight: MLXArray,
@@ -1346,6 +1384,7 @@ func glm5NextHCPre(
 ) -> (MLXArray, MLXArray, MLXArray) {
     let kernels = GLM5NextHCDeferredKernels.shared
     let dtype = x?.dtype ?? deferred!.y.dtype
+    let B = x?.dim(0) ?? deferred!.y.dim(0)
     let D = normWeight.dim(0)
     let rest: [MLXArray] = [fn, MLXArray([normEps]), scale, base, normWeight]
     let template: [(String, any KernelTemplateArg)] = [
@@ -1356,23 +1395,25 @@ func glm5NextHCPre(
     if let deferred {
         let out = kernels.preDeferred(
             [deferred.y, deferred.mm, deferred.post] + rest, template: template,
-            grid: (1024 * 6, 1, 1), threadGroup: (1024, 1, 1),
-            outputShapes: [[1, 1, D], [1, 1, 24], [1, 1, 4, D]],
+            grid: (1024 * 6, B, 1), threadGroup: (1024, 1, 1),
+            outputShapes: [[B, 1, D], [B, 1, 24], [B, 1, 4, D]],
             outputDTypes: [dtype, .float32, dtype])
         return (out[0], out[1], out[2])
     }
     let out = kernels.pre(
         [x!] + rest, template: template,
-        grid: (1024 * 6, 1, 1), threadGroup: (1024, 1, 1),
-        outputShapes: [[1, 1, D], [1, 1, 24]], outputDTypes: [dtype, .float32])
+        grid: (1024 * 6, B, 1), threadGroup: (1024, 1, 1),
+        outputShapes: [[B, 1, D], [B, 1, 24]], outputDTypes: [dtype, .float32])
     return (out[0], out[1], x!)
 }
 
-/// `(post [1, 1, 4], comb [1, 1, 4, 4], mm [4 * D])` for one token.
+/// `(post [B, 1, 4], comb [B, 1, 4, 4], mm [B, 4 * D])` for one token per row
+/// (`mixes: [B, 1, 24]`, `residual: [B, 1, 4, D]`).
 func glm5NextHCPost(
     mixes: MLXArray, scale: MLXArray, base: MLXArray, residual: MLXArray,
     sinkhornIterations: Int, hcEps: Float
 ) -> (MLXArray, MLXArray, MLXArray) {
+    let B = residual.dim(0)
     let D = residual.dim(-1)
     let simds = 8
     let groups = (D / 8 + simds - 1) / simds
@@ -1382,8 +1423,8 @@ func glm5NextHCPost(
             ("T", residual.dtype), ("HC", 4), ("D", D), ("ITERS", sinkhornIterations),
             ("HC_EPS_INT", Int((Double(hcEps) / 1e-9).rounded())), ("SIMDS", simds),
         ],
-        grid: (32 * simds * groups, 1, 1), threadGroup: (32 * simds, 1, 1),
-        outputShapes: [[1, 1, 4], [1, 1, 4, 4], [4 * D]],
+        grid: (32 * simds * groups, B, 1), threadGroup: (32 * simds, 1, 1),
+        outputShapes: [[B, 1, 4], [B, 1, 4, 4], [B, 4 * D]],
         outputDTypes: [.float32, .float32, .float32])
     return (out[0], out[1], out[2])
 }
@@ -1816,24 +1857,26 @@ private let glm5NextMoEGateUpSource = """
       float u_res[RPS] = {0};
       if (r < TOPK) {
     #if SELECT
-        // One token: this simdgroup replays the router's selection on the
-        // biased sigmoid scores (no separate select dispatch); slot 0 / tile 0
-        // publishes the routes and routing weights for the down kernel.
+        // This simdgroup replays the router's selection for its token on the
+        // biased sigmoid scores (no separate select dispatch); the token's
+        // slot 0 / tile 0 publishes its routes and routing weights for the
+        // down kernel.
         int picked[TOPK];
-        glm_router_topk<NE, TOPK>(sel_biased, simd_lid, picked);
+        glm_router_topk<NE, TOPK>(sel_biased + size_t(token) * NE, simd_lid, picked);
         const int expert = picked[r];
-        if (z == 0 && tile == 0 && simd_gid == 0 && simd_lid == 0) {
+        if (r == 0 && tile == 0 && simd_gid == 0 && simd_lid == 0) {
+          const auto sig_t = sel_sig + size_t(token) * NE;
           float total = 0.0f;
           float gathered[TOPK];
           for (int q = 0; q < TOPK; q++) {
-            gathered[q] = sel_sig[picked[q]];
+            gathered[q] = sig_t[picked[q]];
             total = gathered[q] + total;
           }
           for (int q = 0; q < TOPK; q++) {
             float qv = SEL_NORM ? gathered[q] / (total + 1e-20f) : gathered[q];
             float sv = qv * sel_scaling[0];
-            sel_indices[q] = uint(picked[q]);
-            sel_scores[q] = sv;
+            sel_indices[token * TOPK + q] = uint(picked[q]);
+            sel_scores[token * TOPK + q] = sv;
           }
         }
     #else
@@ -2011,9 +2054,10 @@ private func glm5NextQMVFastCovered(bits: Int, groupSize: Int, n: Int, k: Int) -
     return groupSize % valuesPerThread == 0 && n % 8 == 0 && k % (valuesPerThread * 32) == 0
 }
 
-/// One token's routed + shared experts: router logits (`glm5NextRouterLogits`
-/// outputs `sig`, `biased`) to the combined output `[1, K]`, or `nil` when
-/// the shapes are not covered.
+/// Routed + shared experts of `T` tokens `x: [T, K]`, each computed exactly as
+/// a one-token call: router logits (`glm5NextRouterLogits` outputs `sig`,
+/// `biased`, `[T, E]`) to the combined output `[T, K]`, or `nil` when the
+/// shapes are not covered.
 func glm5NextMoEExperts(
     _ x: MLXArray, sig: MLXArray, biased: MLXArray, topK: Int, scaling: Float,
     normalize: Bool, limit: Float,
@@ -2021,15 +2065,15 @@ func glm5NextMoEExperts(
     sharedGate: GLM5NextAffine, sharedUp: GLM5NextAffine, sharedDown: GLM5NextAffine,
     rps: Int = 4, nsg: Int = 2
 ) -> MLXArray? {
-    guard x.ndim == 2, x.dim(0) == 1, [.bfloat16, .float16].contains(x.dtype),
-        sig.dtype == .float32, biased.dtype == .float32, sig.ndim == 2, sig.dim(0) == 1,
+    guard x.ndim == 2, x.dim(0) >= 1, [.bfloat16, .float16].contains(x.dtype),
+        sig.dtype == .float32, biased.dtype == .float32, sig.ndim == 2, sig.dim(0) == x.dim(0),
         biased.shape == sig.shape, sig.dim(1) <= 1024, (1 ... 32).contains(topK),
         gate.weight.ndim == 3, gate.weight.shape == up.weight.shape,
         (gate.bits, gate.groupSize) == (up.bits, up.groupSize),
         (sharedGate.bits, sharedGate.groupSize) == (sharedUp.bits, sharedUp.groupSize),
         down.weight.ndim == 3
     else { return nil }
-    let K = x.dim(1)
+    let (T, K) = (x.dim(0), x.dim(1))
     let N = gate.weight.dim(1)
     let experts = sig.dim(1)
     let dtype = x.dtype
@@ -2061,9 +2105,9 @@ func glm5NextMoEExperts(
             ("NE", experts), ("SEL_NORM", normalize && topK > 1),
             ("SBITS", sharedGate.bits), ("SGS", sharedGate.groupSize),
         ],
-        grid: (32, (N / (rps * nsg)) * nsg, slots),
+        grid: (32, (N / (rps * nsg)) * nsg, T * slots),
         threadGroup: (32, nsg, 1),
-        outputShapes: [[1, slots, N], [1, topK], [1, topK]],
+        outputShapes: [[T, slots, N], [T, topK], [T, topK]],
         outputDTypes: [dtype, .uint32, .float32])
     return kernels.down(
         [selected[0], selected[1], selected[2], down.weight, down.scales, down.biases,
@@ -2073,9 +2117,9 @@ func glm5NextMoEExperts(
             ("RGS", down.groupSize), ("RPS", rps), ("NSG", nsg),
             ("SBITS", sharedDown.bits), ("SGS", sharedDown.groupSize),
         ],
-        grid: (32, (K / (rps * nsg)) * nsg, 1),
+        grid: (32, (K / (rps * nsg)) * nsg, T),
         threadGroup: (32, nsg, 1),
-        outputShapes: [[1, K]],
+        outputShapes: [[T, K]],
         outputDTypes: [dtype])[0]
 }
 

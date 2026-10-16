@@ -66,8 +66,9 @@ final class GLM5NextHyperConnection: Module {
     let hcEps: Float
     let sinkhornIterations: Int
 
-    /// One-sequence decode (up to 8 tokens) runs the mix GEMV and the
-    /// Sinkhorn + collapse + branch RMSNorm as two kernels, as the reference.
+    /// Decode (up to 8 tokens per row, any number of rows) runs the mix GEMV
+    /// and the Sinkhorn + collapse + branch RMSNorm as two kernels, as the
+    /// reference; every token is computed on its own.
     var fusedDecode = true
 
     @ParameterInfo(key: "fn") var fn: MLXArray
@@ -127,7 +128,7 @@ final class GLM5NextHyperConnection: Module {
     /// `norm(collapsed)`, `post` and `comb` for a branch: the reference
     /// model's decode kernels for one sequence, the op path otherwise.
     func normalizedBranchInput(_ x: MLXArray, norm: RMSNorm) -> (MLXArray, MLXArray, MLXArray) {
-        if fusedDecode, !training, x.dim(0) == 1, x.dim(1) <= 8, hcMult == 4,
+        if fusedDecode, !training, x.dim(1) <= 8, hcMult == 4,
             let mixes = glm5NextHCMix(x, fn: fn, eps: normEps),
             let fused = glm5NextHCNorm(
                 x, mixes: mixes, scale: scale, base: base, normWeight: norm.weight,
@@ -146,7 +147,7 @@ final class GLM5NextHyperConnection: Module {
                 normWeight: norm.weight)
     }
 
-    /// One-token branch input as `glm5NextHCPre` + `glm5NextHCPost`:
+    /// One-token-per-row branch input as `glm5NextHCPre` + `glm5NextHCPost`:
     /// `(normalized, h, post, comb, mm)`, the values of the expand, mix and
     /// Sinkhorn + collapse + RMSNorm chain.
     func deferredBranchInput(_ state: GLM5NextHCState, norm: RMSNorm) -> (
@@ -193,6 +194,12 @@ func glm5NextAffine(_ module: Module) -> GLM5NextAffine? {
     }
 }
 
+/// Tokens per row of a `[B, L, D]` activation (the rows of a `[T, D]` one
+/// count as one-token rows): the fused decode kernels serve rows of up to 8.
+func glm5NextDecodeRowLength(_ x: MLXArray) -> Int {
+    x.ndim >= 3 ? x.dim(-2) : 1
+}
+
 // MARK: - Feed-forward
 
 final class GLM5NextMLP: Module, UnaryLayer {
@@ -226,7 +233,8 @@ final class GLM5NextMoEGate: Module {
     let scaling: Float
     let normalize: Bool
 
-    /// Up to 8 one-sequence tokens route with `glm5NextMoERouter` (two kernels).
+    /// Rows of up to 8 tokens route with `glm5NextMoERouter` (two kernels),
+    /// each token as a one-token GEMV.
     var fusedDecode = true
 
     init(_ config: GLM5NextConfiguration) {
@@ -274,7 +282,7 @@ final class GLM5NextMoEGate: Module {
 
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
         let rows = x.shape.dropLast().reduce(1, *)
-        if fusedDecode, !training, nGroup <= 1, rows <= 8,
+        if fusedDecode, !training, nGroup <= 1, glm5NextDecodeRowLength(x) <= 8,
             let (indices, scores) = glm5NextMoERouter(
                 x.reshaped(rows, x.dim(-1)), weight: weight, bias: eScoreCorrectionBias,
                 topK: topK, scaling: scaling, normalize: normalize)
@@ -308,8 +316,9 @@ final class GLM5NextMoE: Module, UnaryLayer {
         super.init()
     }
 
-    /// The expert half of a one-token decode as `glm5NextMoEExperts` (two
-    /// kernels after the router logits); the gate's `fusedDecode` controls it.
+    /// The expert half of decode (rows of up to 8 tokens) as
+    /// `glm5NextMoEExperts` (two kernels after the router logits), each token
+    /// as a one-token decode; the gate's `fusedDecode` controls it.
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         if let fused = fusedDecodeStep(x) {
             return fused
@@ -325,10 +334,10 @@ final class GLM5NextMoE: Module, UnaryLayer {
 
     private func fusedDecodeStep(_ x: MLXArray) -> MLXArray? {
         let rows = x.shape.dropLast().reduce(1, *)
-        guard gate.fusedDecode, !gate.training, rows == 1, gate.nGroup <= 1,
-            let limit, let sharedExperts
+        guard gate.fusedDecode, !gate.training, glm5NextDecodeRowLength(x) <= 8,
+            gate.nGroup <= 1, let limit, let sharedExperts
         else { return nil }
-        let x2 = x.reshaped(1, x.dim(-1))
+        let x2 = x.reshaped(rows, x.dim(-1))
         guard glm5NextMoERouterCovered(x2, weight: gate.weight, bias: gate.eScoreCorrectionBias),
             let gateParts = glm5NextAffine(switchMLP.gateProjection),
             let upParts = glm5NextAffine(switchMLP.upProjection),
@@ -462,13 +471,14 @@ final class GLM5NextLinearAttention: Module {
         super.init()
     }
 
-    /// One-sequence decode runs `glm5NextKDADecodeStep` (one dispatch for the
-    /// conv, norms, gates, delta rule and gated norm).
+    /// Decode (up to 8 tokens per row, any number of rows) runs
+    /// `glm5NextKDADecodeStep` (one dispatch for the conv, norms, gates,
+    /// delta rule and gated norm of every row).
     var fusedDecode = true
 
     func callAsFunction(_ x: MLXArray, cache: MambaCache?) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
-        if fusedDecode, !training, let cache, B == 1, L <= 8, let y = fusedDecodeStep(x, cache: cache) {
+        if fusedDecode, !training, let cache, L <= 8, let y = fusedDecodeStep(x, cache: cache) {
             return y
         }
         let mixed = concatenated([qProj(x), kProj(x), vProj(x)], axis: -1)
@@ -506,14 +516,16 @@ final class GLM5NextLinearAttention: Module {
         return oProj(oNorm(out, gate: gate).reshaped(B, L, -1))
     }
 
-    /// One token's q, k, v, f_a, g_a and b projections `[1, 1, N]`, one
-    /// `glm5NextMultiQMV` dispatch per (bits, group size); a group the kernel
-    /// does not cover runs its modules. `nil` unless every module is affine.
+    /// One token per row: the q, k, v, f_a, g_a and b projections `[B, 1, N]`,
+    /// one `glm5NextMultiQMV` dispatch per (bits, group size); a group the
+    /// kernel does not cover runs its modules. `nil` unless every module is
+    /// affine.
     private func inputProjections(_ x: MLXArray) -> [MLXArray]? {
         let modules: [Module] = [qProj, kProj, vProj, forgetGate.fAProj, gAProj, bProj]
         let parts = modules.compactMap(glm5NextAffine)
         guard parts.count == modules.count else { return nil }
-        let x2 = x.reshaped(1, x.dim(-1))
+        let B = x.dim(0)
+        let x2 = x.reshaped(B, x.dim(-1))
         var outputs = [MLXArray?](repeating: nil, count: modules.count)
         var groups: [[Int]] = []
         for i in parts.indices {
@@ -527,7 +539,7 @@ final class GLM5NextLinearAttention: Module {
         }
         for group in groups {
             if let ys = glm5NextMultiQMV(x2, group.map { parts[$0] }) {
-                for (i, y) in zip(group, ys) { outputs[i] = y.reshaped(1, 1, -1) }
+                for (i, y) in zip(group, ys) { outputs[i] = y.reshaped(B, 1, -1) }
             } else {
                 for i in group { outputs[i] = (modules[i] as! UnaryLayer)(x) }
             }
@@ -537,11 +549,11 @@ final class GLM5NextLinearAttention: Module {
 
     private func fusedDecodeStep(_ x: MLXArray, cache: MambaCache) -> MLXArray? {
         guard let lowerBound = forgetGate.lowerBound else { return nil }
-        let L = x.dim(1)
+        let (B, L) = (x.dim(0), x.dim(1))
         let convState =
-            cache[0] ?? MLXArray.zeros([1, convKernelSize - 1, 3 * projectionDim], dtype: x.dtype)
+            cache[0] ?? MLXArray.zeros([B, convKernelSize - 1, 3 * projectionDim], dtype: x.dtype)
         let state =
-            cache[1] ?? MLXArray.zeros([1, numHeads, headDim, headDim], dtype: .float32)
+            cache[1] ?? MLXArray.zeros([B, numHeads, headDim, headDim], dtype: .float32)
         guard convKernelSize == 4 else { return nil }
         let fused: (y: MLXArray, convState: MLXArray, state: MLXArray)?
         if L == 1, let projected = inputProjections(x),
@@ -792,6 +804,11 @@ final class GLM5NextAttention: Module {
     /// own cache with its own context length (dense/sparse choice, fused
     /// selection, SDPA), exactly as a serial decode of that row. Any other
     /// cache is one `GLM5NextLatentCache` for all of `x`.
+    ///
+    /// Batched rows match their serial runs bit for bit while a forward
+    /// carries at most 8 flattened tokens (rows x tokens per row): past the
+    /// MLX core's qmv batch limit (12 on M3 Ultra, 13 on M5 for these
+    /// projection sizes) quantized matmuls switch to qmm.
     func callAsFunction(
         _ x: MLXArray, cache: KVCache?, previousTopk: [MLXArray?]
     ) -> (MLXArray, [MLXArray?]) {
@@ -1056,15 +1073,16 @@ public final class GLM5NextModelInner: Module {
         super.init()
     }
 
-    /// One-token decode passes deferred hyper-connection state between
-    /// half-layers (`GLM5NextDecoderLayer.decodeDeferred`) where MLX computes
-    /// the expand's comb product without NAX (`glm5NextHCDeferredExact`).
+    /// One-token decode (one token per row, any number of rows) passes
+    /// deferred hyper-connection state between half-layers
+    /// (`GLM5NextDecoderLayer.decodeDeferred`) where MLX computes the expand's
+    /// comb product without NAX (`glm5NextHCDeferredExact`).
     var deferredDecode = true
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         var h = repeated(expandedDimensions(embedTokens(inputs), axis: 2), count: hcMult, axis: 2)
 
-        if deferredDecode, glm5NextHCDeferredExact, inputs.dim(0) == 1, inputs.dim(1) == 1,
+        if deferredDecode, glm5NextHCDeferredExact, inputs.dim(1) == 1,
             layers.allSatisfy({ $0.deferredDecodeSupported(dtype: h.dtype) })
         {
             var state = GLM5NextHCState.materialized(h)

@@ -797,6 +797,423 @@ final class GLM5NextTests: XCTestCase {
         XCTAssertEqual(shared.offset, 1)
     }
 
+    /// Stack per-row caches into the batched form a continuous-batching
+    /// forward uses: recurrent states concatenated along the batch axis, sparse
+    /// layers as a `GLM5NextLatentCacheBatch` over the row caches.
+    private func batchCaches(_ rows: [[KVCache]]) -> [KVCache] {
+        (0 ..< rows[0].count).map { layer -> KVCache in
+            if rows[0][layer] is MambaCache {
+                let batch = MambaCache()
+                batch[0] = concatenated(rows.map { ($0[layer] as! MambaCache)[0]! }, axis: 0)
+                batch[1] = concatenated(rows.map { ($0[layer] as! MambaCache)[1]! }, axis: 0)
+                return batch
+            }
+            return GLM5NextLatentCacheBatch(
+                rowCaches: rows.map { $0[layer] as! any GLM5NextLatentCache })
+        }
+    }
+
+    private func randomAffine(_ shape: [Int], bits: Int, groupSize: Int = 64, seed: UInt64)
+        -> GLM5NextAffine
+    {
+        let w = withRandomState(MLXRandom.RandomState(seed: seed)) {
+            (0.05 * MLXRandom.normal(shape)).asType(.bfloat16)
+        }
+        let (q, scales, biases) = MLX.quantized(w, groupSize: groupSize, bits: bits)
+        return GLM5NextAffine(
+            weight: q, scales: scales, biases: biases!, bits: bits, groupSize: groupSize)
+    }
+
+    private func assertRowsEqual(
+        _ batched: MLXArray, _ rows: [MLXArray], _ message: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) {
+        assertBitwiseEqual(batched, concatenated(rows, axis: 0), message, file: file, line: line)
+    }
+
+    /// Every fused decode kernel run on B = 2, 4 and 8 rows equals the B = 1
+    /// calls stacked, bit for bit: KDA (precomputed gates, 4/8-bit gate rows,
+    /// 5-bit gate rows; one and two tokens per row), multi-qmv, the router, the
+    /// MoE experts (one and two tokens per row), the HC mix and norm, and the
+    /// deferred HC pre (both forms) and post.
+    func testBatchedDecodeKernelsMatchStackedRowsBitwise() throws {
+        let (heads, dk) = (2, 128)
+        let qkv = heads * dk
+        let fb8 = randomAffine([qkv, dk], bits: 8, seed: 201)
+        let gb8 = randomAffine([qkv, dk], bits: 8, seed: 202)
+        let fb5 = randomAffine([qkv, dk], bits: 5, seed: 203)
+        let gb5 = randomAffine([qkv, dk], bits: 5, seed: 204)
+        let convWeight = withRandomState(MLXRandom.RandomState(seed: 205)) {
+            (0.3 * MLXRandom.normal([3 * qkv, 4, 1])).asType(.bfloat16)
+        }
+        let aLog = withRandomState(MLXRandom.RandomState(seed: 206)) { MLXRandom.normal([heads]) * 0.5 }
+        let dtBias = withRandomState(MLXRandom.RandomState(seed: 207)) { MLXRandom.normal([qkv]) * 0.5 }
+        let normWeight = withRandomState(MLXRandom.RandomState(seed: 208)) {
+            (1 + 0.1 * MLXRandom.normal([dk])).asType(.bfloat16)
+        }
+        let projections = (0 ..< 6).map {
+            randomAffine([[512, 512, 512, 128, 128, 64][$0], 1024], bits: 8, seed: 210 + UInt64($0))
+        }
+        let (experts, topK, hidden, inter) = (64, 8, 512, 512)
+        let gate = randomAffine([experts, inter, hidden], bits: 4, seed: 220)
+        let up = randomAffine([experts, inter, hidden], bits: 4, seed: 221)
+        let down = randomAffine([experts, hidden, inter], bits: 4, seed: 222)
+        let sharedGate = randomAffine([inter, hidden], bits: 8, seed: 223)
+        let sharedUp = randomAffine([inter, hidden], bits: 8, seed: 224)
+        let sharedDown = randomAffine([hidden, inter], bits: 8, seed: 225)
+        let (routerWeight, routerBias) = withRandomState(MLXRandom.RandomState(seed: 226)) {
+            (0.05 * MLXRandom.normal([experts, hidden]), 0.01 * MLXRandom.normal([experts]))
+        }
+        let D = 1024
+        let (fn, scale, base, hcNormWeight) = withRandomState(MLXRandom.RandomState(seed: 227)) {
+            (
+                0.05 * MLXRandom.normal([24, 4 * D]), 1 + 0.2 * MLXRandom.normal([3]),
+                0.5 * MLXRandom.normal([24]), (1 + 0.1 * MLXRandom.normal([D])).asType(.bfloat16)
+            )
+        }
+
+        for B in [2, 4, 8] {
+            func rnd(_ shape: [Int], _ seed: Int, _ scale: Float = 1, _ dtype: DType = .bfloat16)
+                -> MLXArray
+            {
+                withRandomState(MLXRandom.RandomState(seed: UInt64(1000 * B + seed))) {
+                    (scale * MLXRandom.normal(shape)).asType(dtype)
+                }
+            }
+            func row(_ a: MLXArray, _ r: Int) -> MLXArray { a[r ..< (r + 1)] }
+
+            // KDA: precomputed gates (1 and 2 tokens per row), gate rows.
+            for T in [1, 2] {
+                let (q, k, v) = (rnd([B, T, qkv], 1), rnd([B, T, qkv], 2), rnd([B, T, qkv], 3))
+                let (aPre, gatePre, bRaw) = (
+                    rnd([B, T, qkv], 4), rnd([B, T, qkv], 5), rnd([B, T, heads], 6)
+                )
+                let (fa, ga) = (rnd([B, T, dk], 7), rnd([B, T, dk], 8))
+                let convState = rnd([B, 3, 3 * qkv], 9)
+                let state = rnd([B, heads, dk, dk], 10, 0.1, .float32)
+                func pre(_ r: Int?) -> (y: MLXArray, convState: MLXArray, state: MLXArray)? {
+                    let s = { (a: MLXArray) in r.map { row(a, $0) } ?? a }
+                    return glm5NextKDADecodeStep(
+                        q: s(q), k: s(k), v: s(v), aPre: s(aPre), gatePre: s(gatePre),
+                        bRaw: s(bRaw), convState: s(convState), convWeight: convWeight,
+                        aLog: aLog, dtBias: dtBias, normWeight: normWeight, state: s(state),
+                        heads: heads, headDim: dk, lowerBound: -5, normEps: 1e-5)
+                }
+                func rows(
+                    _ fb: GLM5NextAffine, _ gb: GLM5NextAffine, _ r: Int?
+                ) -> (y: MLXArray, convState: MLXArray, state: MLXArray)? {
+                    let s = { (a: MLXArray) in r.map { row(a, $0) } ?? a }
+                    return glm5NextKDADecodeStep(
+                        q: s(q), k: s(k), v: s(v), fa: s(fa), ga: s(ga), fb: fb, gb: gb,
+                        bRaw: s(bRaw), convState: s(convState), convWeight: convWeight,
+                        aLog: aLog, dtBias: dtBias, normWeight: normWeight, state: s(state),
+                        heads: heads, headDim: dk, lowerBound: -5, normEps: 1e-5)
+                }
+                var variants: [(String, (Int?) -> (y: MLXArray, convState: MLXArray, state: MLXArray)?)] = [
+                    ("precomputed", pre), ("8-bit gate rows", { rows(fb8, gb8, $0) }),
+                ]
+                if T == 1 { variants.append(("5-bit gate rows", { rows(fb5, gb5, $0) })) }
+                for (name, run) in variants {
+                    let batched = try XCTUnwrap(run(nil), "KDA \(name) B=\(B) T=\(T)")
+                    let singles = (0 ..< B).map { run($0)! }
+                    assertRowsEqual(batched.y, singles.map(\.y), "KDA \(name) y B=\(B) T=\(T)")
+                    assertRowsEqual(
+                        batched.convState, singles.map(\.convState), "KDA \(name) conv B=\(B) T=\(T)")
+                    assertRowsEqual(
+                        batched.state, singles.map(\.state), "KDA \(name) state B=\(B) T=\(T)")
+                }
+            }
+
+            // Multi-qmv over one vector per row.
+            let xq = rnd([B, 1024], 20)
+            let multi = try XCTUnwrap(glm5NextMultiQMV(xq, projections), "multi-qmv B=\(B)")
+            let multiRows = (0 ..< B).map { glm5NextMultiQMV(row(xq, $0), projections)! }
+            for i in projections.indices {
+                assertRowsEqual(multi[i], multiRows.map { $0[i] }, "multi-qmv part \(i) B=\(B)")
+            }
+
+            // Router and experts: one and two tokens per row (flattened).
+            for T in [1, 2] {
+                let x = rnd([B * T, hidden], 30 + T, Float(T))
+                let router = try XCTUnwrap(
+                    glm5NextMoERouter(
+                        x, weight: routerWeight, bias: routerBias, topK: topK, scaling: 2.5,
+                        normalize: true))
+                let routerRows = (0 ..< (B * T)).map {
+                    glm5NextMoERouter(
+                        row(x, $0), weight: routerWeight, bias: routerBias, topK: topK,
+                        scaling: 2.5, normalize: true)!
+                }
+                assertRowsEqual(router.0, routerRows.map(\.0), "router experts B=\(B) T=\(T)")
+                assertRowsEqual(router.1, routerRows.map(\.1), "router scores B=\(B) T=\(T)")
+                func experts(_ x: MLXArray) -> MLXArray? {
+                    let (sig, biased) = glm5NextRouterLogits(x, weight: routerWeight, bias: routerBias)
+                    return glm5NextMoEExperts(
+                        x, sig: sig, biased: biased, topK: topK, scaling: 2.5, normalize: true,
+                        limit: 10, gate: gate, up: up, down: down, sharedGate: sharedGate,
+                        sharedUp: sharedUp, sharedDown: sharedDown)
+                }
+                let moe = try XCTUnwrap(experts(x), "experts B=\(B) T=\(T)")
+                assertRowsEqual(moe, (0 ..< (B * T)).map { experts(row(x, $0))! }, "experts B=\(B) T=\(T)")
+            }
+
+            // Hyper-connections: mix + norm, deferred pre (both forms) and post.
+            let hx = rnd([B, 1, 4, D], 40)
+            let mixes = try XCTUnwrap(glm5NextHCMix(hx, fn: fn, eps: 1e-5))
+            assertRowsEqual(
+                mixes, (0 ..< B).map { glm5NextHCMix(row(hx, $0), fn: fn, eps: 1e-5)! }, "hc mix B=\(B)")
+            func norm(_ x: MLXArray, _ m: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+                glm5NextHCNorm(
+                    x, mixes: m, scale: scale, base: base, normWeight: hcNormWeight,
+                    sinkhornIterations: 20, hcEps: 1e-6, normEps: 1e-5)!
+            }
+            let normed = norm(hx, mixes)
+            let normRows = (0 ..< B).map { norm(row(hx, $0), row(mixes, $0)) }
+            assertRowsEqual(normed.0, normRows.map(\.0), "hc norm B=\(B)")
+            assertRowsEqual(normed.2, normRows.map(\.2), "hc comb B=\(B)")
+
+            func pre(_ x: MLXArray?, _ d: (y: MLXArray, mm: MLXArray, post: MLXArray)?)
+                -> (MLXArray, MLXArray, MLXArray)
+            {
+                glm5NextHCPre(
+                    x: x, deferred: d, fn: fn, scale: scale, base: base,
+                    normWeight: hcNormWeight, normEps: 1e-5, hcEps: 1e-6, branchNormEps: 1e-5)
+            }
+            let p = pre(hx, nil)
+            let pRows = (0 ..< B).map { pre(row(hx, $0), nil) }
+            assertRowsEqual(p.0, pRows.map(\.0), "hc pre normalized B=\(B)")
+            assertRowsEqual(p.1, pRows.map(\.1), "hc pre mixes B=\(B)")
+            func post(_ m: MLXArray, _ h: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+                glm5NextHCPost(
+                    mixes: m, scale: scale, base: base, residual: h, sinkhornIterations: 20,
+                    hcEps: 1e-6)
+            }
+            let q = post(p.1, p.2)
+            let qRows = (0 ..< B).map { post(row(p.1, $0), row(p.2, $0)) }
+            assertRowsEqual(q.0, qRows.map(\.0), "hc post post B=\(B)")
+            assertRowsEqual(q.1, qRows.map(\.1), "hc post comb B=\(B)")
+            assertRowsEqual(q.2, qRows.map(\.2), "hc post mm B=\(B)")
+            let y = rnd([B, 1, D], 41)
+            let d = pre(nil, (y, q.2, q.0))
+            let dRows = (0 ..< B).map { pre(nil, (row(y, $0), row(q.2, $0), row(q.0, $0))) }
+            assertRowsEqual(d.0, dRows.map(\.0), "hc deferred pre normalized B=\(B)")
+            assertRowsEqual(d.1, dRows.map(\.1), "hc deferred pre mixes B=\(B)")
+            assertRowsEqual(d.2, dRows.map(\.2), "hc deferred pre h B=\(B)")
+        }
+    }
+
+    /// A model whose every decode kernel engages: hidden 1024 (deferred HC),
+    /// head_dim-128 KDA with 8 heads, 32 indexer heads, 128 experts of 512,
+    /// affine-quantized as the artifact (4-bit experts, 8-bit elsewhere).
+    private func fusedShapesModel(seed: UInt64) throws -> GLM5NextTextModel {
+        var json = textConfigJSON(indexTopk: 8, linearHeadDim: 128)
+        for (from, to) in [
+            (#""hidden_size": 64"#, #""hidden_size": 1024"#),
+            (#""intermediate_size": 96"#, #""intermediate_size": 512"#),
+            (#""moe_intermediate_size": 32"#, #""moe_intermediate_size": 512"#),
+            (#""n_routed_experts": 4"#, #""n_routed_experts": 128"#),
+            (#""num_experts_per_tok": 2"#, #""num_experts_per_tok": 8"#),
+            (#""kv_lora_rank": 32"#, #""kv_lora_rank": 64"#),
+            (#""q_lora_rank": 32"#, #""q_lora_rank": 64"#),
+            (#""qk_nope_head_dim": 32"#, #""qk_nope_head_dim": 64"#),
+            (#""v_head_dim": 32"#, #""v_head_dim": 64"#),
+            (#""index_n_heads": 2"#, #""index_n_heads": 32"#),
+            (#""linear_attn_config": {"num_heads": 2"#, #""linear_attn_config": {"num_heads": 8"#),
+        ] {
+            json = json.replacingOccurrences(of: from, with: to)
+        }
+        let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+        try config.validateModelConfiguration()
+        let model = GLM5NextTextModel(config)
+        randomize(model, seed: seed)
+        castToBFloat16(model)
+        quantize(model: model) { path, module in
+            guard module is Linear || module is SwitchLinear || module is MultiLinear else {
+                return nil
+            }
+            return path.contains("switch_mlp") ? (64, 4, .affine) : (64, 8, .affine)
+        }
+        eval(model)
+        model.train(false)
+        return model
+    }
+
+    /// Every fused decode kernel covers `model`'s layers for `rows` one-token
+    /// rows, so a batched test exercises them rather than the op path.
+    private func assertFusedDecodeCovers(_ model: GLM5NextTextModel, rows: Int) throws {
+        let layers = model.model.layers
+        let x = MLXArray.zeros([rows, model.configuration.hiddenSize], dtype: .bfloat16)
+        XCTAssertTrue(layers.allSatisfy { $0.deferredDecodeSupported(dtype: .bfloat16) })
+        XCTAssertNotNil(
+            glm5NextHCMix(
+                MLXArray.zeros([rows, 1, 4, x.dim(1)], dtype: .bfloat16), fn: layers[0].attnHC.fn,
+                eps: 1e-5), "HC mix kernel")
+        for layer in layers {
+            if let kda = layer.selfAttn as? GLM5NextLinearAttention {
+                let parts = [
+                    kda.qProj, kda.kProj, kda.vProj, kda.forgetGate.fAProj, kda.gAProj, kda.bProj,
+                ].compactMap { glm5NextAffine($0) }
+                XCTAssertEqual(parts.count, 6)
+                XCTAssertNotNil(glm5NextMultiQMV(x, parts), "KDA projections in one multi-qmv")
+                XCTAssertNotNil(glm5NextAffine(kda.forgetGate.fBProj))
+            }
+            if let attention = layer.selfAttn as? GLM5NextAttention, let indexer = attention.indexer {
+                XCTAssertNotNil(
+                    glm5NextDSASelect(
+                        q: MLXArray.zeros([1, indexer.numHeads * indexer.headDim]),
+                        weights: MLXArray.zeros([1, indexer.numHeads]), weightScale: 1,
+                        pooledKeys: MLXArray.zeros([1, 40, indexer.headDim]), kvLength: 160,
+                        heads: indexer.numHeads, dim: indexer.headDim,
+                        indexTopk: indexer.indexTopk, kpool: indexer.kpool,
+                        tail: indexer.alwaysSelectTail), "DSA selection kernel")
+            }
+            if let moe = layer.mlp as? GLM5NextMoE {
+                let gate = moe.gate
+                XCTAssertNotNil(
+                    glm5NextMoERouter(
+                        x, weight: gate.weight, bias: gate.eScoreCorrectionBias, topK: gate.topK,
+                        scaling: gate.scaling, normalize: gate.normalize), "router kernels")
+                let shared = try XCTUnwrap(moe.sharedExperts)
+                let (sig, biased) = glm5NextRouterLogits(
+                    x, weight: gate.weight, bias: gate.eScoreCorrectionBias)
+                XCTAssertNotNil(
+                    glm5NextMoEExperts(
+                        x, sig: sig, biased: biased, topK: gate.topK, scaling: gate.scaling,
+                        normalize: gate.normalize, limit: try XCTUnwrap(moe.limit),
+                        gate: try XCTUnwrap(glm5NextAffine(moe.switchMLP.gateProjection)),
+                        up: try XCTUnwrap(glm5NextAffine(moe.switchMLP.upProjection)),
+                        down: try XCTUnwrap(glm5NextAffine(moe.switchMLP.downProjection)),
+                        sharedGate: try XCTUnwrap(glm5NextAffine(shared.gateProj)),
+                        sharedUp: try XCTUnwrap(glm5NextAffine(shared.upProj)),
+                        sharedDown: try XCTUnwrap(glm5NextAffine(shared.downProj))),
+                    "MoE expert kernels")
+            }
+        }
+    }
+
+    /// Decode widths per step for `B` rows: two-token (MTP verify) steps only
+    /// while the forward stays within 8 flattened tokens, the batched
+    /// exactness contract (past the core's qmv batch limit, 12 on M3 Ultra and
+    /// 13 on M5 for the real projections, quantized matmuls take qmm).
+    private func batchedWidths(_ widths: [Int], rows: Int) -> [Int] {
+        widths.map { rows * $0 <= 8 ? $0 : 1 }
+    }
+
+    /// Continuous-batching exactness (SPEC-038 FR-CB10): B = 2, 4 and 8 rows
+    /// of different context lengths (dense and sparse DSA rows, crossing
+    /// `index_topk` and pool windows while decoding) decoded together, one
+    /// token per row and then two-token (MTP verify) rows up to 8 flattened
+    /// tokens, give each row's serial logits bit for bit, with and without the
+    /// deferred HC chain.
+    func testBatchedDecodeMatchesSerialRowsBitwise() throws {
+        let model = try fusedShapesModel(seed: 131)
+        let lengths = [3, 9, 5, 14, 7, 11, 6, 12]
+        let prompts = lengths.enumerated().map { tokens($1, seed: UInt64(140 + $0)) }
+        let steps = (0 ..< 8).map { tokens(8, seed: UInt64(160 + $0)) }
+        let widths = [1, 1, 1, 1, 2, 1, 2]
+        try assertFusedDecodeCovers(model, rows: 8)
+        for deferred in [true, false] {
+            model.model.deferredDecode = deferred
+            for B in [2, 4, 8] {
+                let widths = batchedWidths(widths, rows: B)
+                func prefilled(_ r: Int) throws -> [KVCache] {
+                    let cache = try model.newCache(parameters: nil)
+                    eval(model(prompts[r], cache: cache))
+                    return cache
+                }
+                var serial = [[MLXArray]]()
+                for r in 0 ..< B {
+                    let cache = try prefilled(r)
+                    var logits = [MLXArray]()
+                    var at = 0
+                    for w in widths {
+                        logits.append(model(steps[r][0..., at ..< (at + w)], cache: cache))
+                        eval(logits.last!)
+                        at += w
+                    }
+                    serial.append(logits)
+                }
+                let caches = batchCaches(try (0 ..< B).map(prefilled))
+                var at = 0
+                for (s, w) in widths.enumerated() {
+                    let input = concatenated(
+                        (0 ..< B).map { steps[$0][0..., at ..< (at + w)] }, axis: 0)
+                    let logits = model(input, cache: caches)
+                    eval(logits)
+                    for r in 0 ..< B {
+                        assertBitwiseEqual(
+                            logits[r ..< (r + 1)], serial[r][s],
+                            "deferred=\(deferred) B=\(B) row \(r) step \(s) width \(w)")
+                    }
+                    at += w
+                }
+            }
+        }
+        model.model.deferredDecode = true
+    }
+
+    /// The same exactness on the real 4-layer GLM-5.3-Flash cut (set
+    /// `GLM5NEXT_CUT_DIR`; run with `MLX_ENABLE_TF32=0` on NAX GPUs): rows of
+    /// 2040+ tokens cross `index_topk` = 2048 (dense to sparse DSA) while
+    /// decoding together, up to 8 flattened tokens per forward.
+    func testBatchedDecodeMatchesSerialRowsOnRealCut() throws {
+        guard let path = ProcessInfo.processInfo.environment["GLM5NEXT_CUT_DIR"] else {
+            throw XCTSkip("GLM5NEXT_CUT_DIR is not set")
+        }
+        let dir = URL(fileURLWithPath: path)
+        let data = try Data(contentsOf: dir.appendingPathComponent("config.json"))
+        let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
+        let model = GLM5NextModel(try JSONDecoder().decode(GLM5NextConfiguration.self, from: data))
+        try loadWeights(
+            modelDirectory: dir, model: model, perLayerQuantization: base.perLayerQuantization)
+        model.train(false)
+        let prompts = (0 ..< 8).map { r in
+            withRandomState(MLXRandom.RandomState(seed: UInt64(170 + r))) {
+                MLXRandom.randInt(0 ..< 150_000, [1, 2040 + 3 * r]).asType(.int32)
+            }
+        }
+        let steps = (0 ..< 8).map { r in
+            withRandomState(MLXRandom.RandomState(seed: UInt64(180 + r))) {
+                MLXRandom.randInt(0 ..< 150_000, [1, 12]).asType(.int32)
+            }
+        }
+        let widths = [1, 1, 1, 1, 1, 1, 2, 1, 1, 2]
+        let text = model.languageModel
+        for B in [2, 4, 8] {
+            let widths = batchedWidths(widths, rows: B)
+            func prefilled(_ r: Int) throws -> [KVCache] {
+                let cache = try model.newCache(parameters: nil)
+                eval(model(prompts[r], cache: cache))
+                return cache
+            }
+            var serial = [[MLXArray]]()
+            for r in 0 ..< B {
+                let cache = try prefilled(r)
+                var logits = [MLXArray]()
+                var at = 0
+                for w in widths {
+                    logits.append(model(steps[r][0..., at ..< (at + w)], cache: cache))
+                    eval(logits.last!)
+                    at += w
+                }
+                serial.append(logits)
+            }
+            let caches = batchCaches(try (0 ..< B).map(prefilled))
+            var at = 0
+            for (s, w) in widths.enumerated() {
+                let input = concatenated((0 ..< B).map { steps[$0][0..., at ..< (at + w)] }, axis: 0)
+                let logits = model(input, cache: caches)
+                eval(logits)
+                for r in 0 ..< B {
+                    assertBitwiseEqual(
+                        logits[r ..< (r + 1)], serial[r][s], "real cut B=\(B) row \(r) step \(s)")
+                }
+                at += w
+            }
+        }
+        XCTAssertEqual(text.model.layers.count, 4)
+    }
+
     // MARK: - Weight names
 
     /// Tensor names of GLM-5.3-Flash-oQ4e-mtp (`model.safetensors.index.json`,
