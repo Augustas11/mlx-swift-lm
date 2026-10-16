@@ -19,6 +19,9 @@ public protocol GLM5NextLatentCache: KVCache {
 
     /// Append pooled keys `[1, n, D]` for the windows `takeCompleteWindows` returned.
     func appendPooled(_ pooled: MLXArray)
+
+    /// The latent of the cached tokens `[1, 1, offset, R]`, `nil` while empty.
+    var validLatent: MLXArray? { get }
 }
 
 /// A sparse-attention layer cache for several sequences decoded in one
@@ -73,6 +76,10 @@ public final class GLM5NextAttentionCache: BaseKVCache, GLM5NextLatentCache {
         self.kpool = kpool
         self.maxTrim = maxTrim
         super.init()
+    }
+
+    public var validLatent: MLXArray? {
+        offset > 0 ? latent.map { $0[.ellipsis, ..<offset, 0...] } : nil
     }
 
     /// Folded raw keys kept for `trim`.

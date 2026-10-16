@@ -476,8 +476,11 @@ final class GLM5NextLinearAttention: Module {
     /// delta rule and gated norm of every row).
     var fusedDecode = true
 
-    func callAsFunction(_ x: MLXArray, cache: MambaCache?) -> MLXArray {
+    func callAsFunction(_ x: MLXArray, cache: MambaCache?, checkpointAfter: Int? = nil) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
+        if let split = checkpointAfter, let cache, L > 1 {
+            return verifyColumns(x, cache: cache, checkpointAfter: split)
+        }
         if fusedDecode, !training, let cache, L <= 8, let y = fusedDecodeStep(x, cache: cache) {
             return y
         }
@@ -514,6 +517,62 @@ final class GLM5NextLinearAttention: Module {
 
         let gate = gBProj(gAProj(x)).reshaped(shape)
         return oProj(oNorm(out, gate: gate).reshaped(B, L, -1))
+    }
+
+    /// MTP verification: every column as a one-token decode step, so each
+    /// verified column equals the serial decode of that token, with the
+    /// recurrent state after the first `checkpointAfter` columns saved as the
+    /// cache's speculative checkpoint. The fused path projects all columns in
+    /// one multi-qmv (row-independent) and runs the KDA kernel per column.
+    private func verifyColumns(_ x: MLXArray, cache: MambaCache, checkpointAfter split: Int)
+        -> MLXArray
+    {
+        let (B, L) = (x.dim(0), x.dim(1))
+        func save() {
+            cache.saveSpeculativeCheckpoint(
+                convState: cache[0]!, recurrentState: cache[1]!, advancedBy: split)
+        }
+        if fusedDecode, !training, let lowerBound = forgetGate.lowerBound, convKernelSize == 4,
+            let fb = glm5NextAffine(forgetGate.fBProj), let gb = glm5NextAffine(gBProj),
+            let projected = inputProjections(x.reshaped(B * L, 1, x.dim(-1)))
+        {
+            let parts = projected.map { $0.reshaped(B, L, -1) }
+            var convState =
+                cache[0]
+                ?? MLXArray.zeros([B, convKernelSize - 1, 3 * projectionDim], dtype: x.dtype)
+            var state =
+                cache[1] ?? MLXArray.zeros([B, numHeads, headDim, headDim], dtype: .float32)
+            var steps = [(y: MLXArray, convState: MLXArray, state: MLXArray)]()
+            for c in 0 ..< L {
+                func col(_ a: MLXArray) -> MLXArray { a[0..., c ..< (c + 1)] }
+                guard
+                    let step = glm5NextKDADecodeStep(
+                        q: col(parts[0]), k: col(parts[1]), v: col(parts[2]), fa: col(parts[3]),
+                        ga: col(parts[4]), fb: fb, gb: gb, bRaw: col(parts[5]),
+                        convState: convState, convWeight: conv1d.weight,
+                        aLog: forgetGate.aLog, dtBias: forgetGate.dtBias,
+                        normWeight: oNorm.weight, state: state, heads: numHeads, headDim: headDim,
+                        lowerBound: lowerBound, normEps: oNorm.eps)
+                else { break }
+                steps.append(step)
+                (convState, state) = (step.convState, step.state)
+            }
+            if steps.count == L {
+                for (c, step) in steps.enumerated() {
+                    cache[0] = step.convState
+                    cache[1] = step.state
+                    cache.advance(1)
+                    if c + 1 == split { save() }
+                }
+                return oProj(concatenated(steps.map(\.y), axis: 1))
+            }
+        }
+        var outputs = [MLXArray]()
+        for c in 0 ..< L {
+            outputs.append(self(x[0..., c ..< (c + 1)], cache: cache))
+            if c + 1 == split { save() }
+        }
+        return concatenated(outputs, axis: 1)
     }
 
     /// One token per row: the q, k, v, f_a, g_a and b projections `[B, 1, N]`,
@@ -809,8 +868,16 @@ final class GLM5NextAttention: Module {
     /// carries at most 8 flattened tokens (rows x tokens per row): past the
     /// MLX core's qmv batch limit (12 on M3 Ultra, 13 on M5 for these
     /// projection sizes) quantized matmuls switch to qmm.
+    ///
+    /// `perColumn` (MTP verification) attends each row's columns one at a
+    /// time, each as a one-token decode step (fused selection, unmasked
+    /// SDPA), so a verified column equals the serial decode of that token;
+    /// selections are then carried per (row, column). `rowLengths` limits
+    /// each row to its leading valid columns (right-padded packed rows); the
+    /// padded columns attend nothing and write no cache.
     func callAsFunction(
-        _ x: MLXArray, cache: KVCache?, previousTopk: [MLXArray?]
+        _ x: MLXArray, cache: KVCache?, previousTopk: [MLXArray?], perColumn: Bool = false,
+        rowLengths: [Int]? = nil
     ) -> (MLXArray, [MLXArray?]) {
         let (B, L) = (x.dim(0), x.dim(1))
         let rows: [any GLM5NextLatentCache]
@@ -834,14 +901,43 @@ final class GLM5NextAttention: Module {
         let latentIn = expandedDimensions(kvALayerNorm(kvAProj(x)), axis: 1)
         let qLatent = callMultiLinear(embedQ, q)
 
+        precondition(rowLengths == nil || rowLengths!.count == rows.count)
         var attended = [MLXArray]()
         var selections = [MLXArray?]()
         for (index, rowCache) in rows.enumerated() {
             func row(_ a: MLXArray) -> MLXArray { rows.count == 1 ? a : a[index ..< (index + 1)] }
+            let (rx, rq, rl) = (row(x), row(qResid), row(latentIn))
+            let rqLatent = row(qLatent)
+            if perColumn {
+                var columns = [MLXArray]()
+                for c in 0 ..< L {
+                    let slot = index * L + c
+                    let (out, topk) = attendRow(
+                        x: rx[0..., c ..< (c + 1)], qResid: rq[0..., c ..< (c + 1)],
+                        qLatent: rqLatent[0..., 0..., c ..< (c + 1)],
+                        latentIn: rl[0..., 0..., c ..< (c + 1)], cache: rowCache,
+                        previousTopk: slot < previousTopk.count ? previousTopk[slot] : nil)
+                    columns.append(out)
+                    selections.append(topk)
+                }
+                attended.append(columns.count == 1 ? columns[0] : concatenated(columns, axis: 2))
+                continue
+            }
+            let valid = rowLengths?[index] ?? L
+            precondition(valid >= 1 && valid <= L, "GLM5Next row length \(valid) outside 1...\(L)")
             let (out, topk) = attendRow(
-                x: row(x), qResid: row(qResid), qLatent: row(qLatent), latentIn: row(latentIn),
+                x: valid == L ? rx : rx[0..., ..<valid],
+                qResid: valid == L ? rq : rq[0..., ..<valid],
+                qLatent: valid == L ? rqLatent : rqLatent[0..., 0..., ..<valid],
+                latentIn: valid == L ? rl : rl[0..., 0..., ..<valid],
                 cache: rowCache, previousTopk: index < previousTopk.count ? previousTopk[index] : nil)
-            attended.append(out)
+            if valid < L {
+                let padding = MLXArray.zeros(
+                    [out.dim(0), out.dim(1), L - valid, out.dim(3)], dtype: out.dtype)
+                attended.append(concatenated([out, padding], axis: 2))
+            } else {
+                attended.append(out)
+            }
             selections.append(topk)
         }
         let all = attended.count == 1 ? attended[0] : concatenated(attended, axis: 0)
@@ -952,18 +1048,21 @@ final class GLM5NextDecoderLayer: Module {
     }
 
     /// `x: [B, L, hc_mult, D]`.
-    func callAsFunction(_ x: MLXArray, cache: KVCache?, previousTopk: [MLXArray?]) -> (
-        MLXArray, [MLXArray?]
-    ) {
+    /// `checkpointAfter` marks MTP verification: attention runs column by
+    /// column (see `GLM5NextAttention`, `GLM5NextLinearAttention`).
+    func callAsFunction(
+        _ x: MLXArray, cache: KVCache?, previousTopk: [MLXArray?], checkpointAfter: Int? = nil
+    ) -> (MLXArray, [MLXArray?]) {
         let (normed, post, comb) = attnHC.normalizedBranchInput(x, norm: inputLayerNorm)
         let attention: MLXArray
         var topk = previousTopk
         if isLinear {
             attention = (selfAttn as! GLM5NextLinearAttention)(
-                normed, cache: linearCache(cache))
+                normed, cache: linearCache(cache), checkpointAfter: checkpointAfter)
         } else {
             (attention, topk) = (selfAttn as! GLM5NextAttention)(
-                normed, cache: cache, previousTopk: previousTopk)
+                normed, cache: cache, previousTopk: previousTopk,
+                perColumn: checkpointAfter != nil && x.dim(1) > 1)
         }
         let h = glm5NextHCExpand(attention, x, post, comb)
 
@@ -1080,6 +1179,14 @@ public final class GLM5NextModelInner: Module {
     var deferredDecode = true
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        norm(hidden(inputs, cache: cache))
+    }
+
+    /// The hidden state after the last layer, streams averaged, before the
+    /// final norm `[B, L, D]`: what the MTP head consumes. `checkpointAfter`
+    /// runs an MTP verification (every column as a one-token decode step,
+    /// recurrent checkpoint after that many columns).
+    func hidden(_ inputs: MLXArray, cache: [KVCache]?, checkpointAfter: Int? = nil) -> MLXArray {
         var h = repeated(expandedDimensions(embedTokens(inputs), axis: 2), count: hcMult, axis: 2)
 
         if deferredDecode, glm5NextHCDeferredExact, inputs.dim(1) == 1,
@@ -1091,14 +1198,15 @@ public final class GLM5NextModelInner: Module {
                 (state, topk) = layer.decodeDeferred(
                     state, cache: cache?[index], previousTopk: topk)
             }
-            return norm(state.materialize().mean(axis: 2))
+            return state.materialize().mean(axis: 2)
         }
 
         var topk = [MLXArray?]()
         for (index, layer) in layers.enumerated() {
-            (h, topk) = layer(h, cache: cache?[index], previousTopk: topk)
+            (h, topk) = layer(
+                h, cache: cache?[index], previousTopk: topk, checkpointAfter: checkpointAfter)
         }
-        return norm(h.mean(axis: 2))
+        return h.mean(axis: 2)
     }
 }
 
@@ -1133,11 +1241,41 @@ public final class GLM5NextTextModel: Module, LLMModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let hidden = model(inputs, cache: cache)
+        logits(model(inputs, cache: cache))
+    }
+
+    func logits(_ normalized: MLXArray) -> MLXArray {
         if let lmHead {
-            return lmHead(hidden)
+            return lmHead(normalized)
         }
-        return model.embedTokens.asLinear(hidden)
+        return model.embedTokens.asLinear(normalized)
+    }
+
+    /// With `mtpEmitFlagKey` set: the pre-final-norm hidden state the MTP head
+    /// consumes (`mtpLastHiddenStatesKey`, `[B, L, D]`) and the last sparse
+    /// layer's latent as `sharedKV["full_attention"]` (keys and values both
+    /// `[B, 1, T, kv_lora_rank]`, rows right-padded to the longest). A
+    /// `mtpCacheCheckpointIndexKey` makes the forward an MTP verification:
+    /// each column runs as a one-token decode step and every KDA cache keeps
+    /// its state after that many columns as the speculative checkpoint.
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        guard state?[mtpEmitFlagKey] ?? false else {
+            return LMOutput(logits: self(input.tokens, cache: cache))
+        }
+        let hidden = model.hidden(
+            input.tokens, cache: cache, checkpointAfter: state?[mtpCacheCheckpointIndexKey])
+        var outState = state ?? LMOutput.State()
+        outState[mtpLastHiddenStatesKey] = hidden
+        if let cache, let source = model.layers.lastIndex(where: { !$0.isLinear }),
+            let (latent, offset) = glm5NextSharedLatent(cache[source])
+        {
+            outState[mtpSharedKVStatesKey] = ["full_attention": (latent, latent)]
+            outState[mtpSharedKVOffsetsKey] = ["full_attention": offset]
+            outState[mtpSharedKVSourceIndicesKey] = ["full_attention": source]
+        }
+        return LMOutput(logits: logits(model.norm(hidden)), state: outState)
     }
 
     /// One cache per decoder layer. Sparse-attention layers keep the whole
@@ -1169,6 +1307,36 @@ public final class GLM5NextTextModel: Module, LLMModel {
     public var loraLayers: [Module] { model.layers }
 }
 
+/// A sparse layer cache's latent `[B, 1, T, R]` (batched rows right-padded to
+/// the longest) and its offset (the longest row's), or `nil` while empty.
+func glm5NextSharedLatent(_ cache: KVCache) -> (MLXArray, Int)? {
+    let rows: [any GLM5NextLatentCache]
+    switch cache {
+    case let batch as any GLM5NextBatchedLatentCache: rows = batch.rowCaches
+    case let serial as any GLM5NextLatentCache: rows = [serial]
+    default: return nil
+    }
+    let latents = rows.map(\.validLatent)
+    guard let longest = rows.map(\.offset).max(), longest > 0,
+        let template = latents.compactMap({ $0 }).first
+    else { return nil }
+    if rows.count == 1, let latent = latents[0] { return (latent, longest) }
+    let padded = latents.map { latent -> MLXArray in
+        let length = latent?.dim(2) ?? 0
+        let pad = MLXArray.zeros(
+            [1, template.dim(1), longest - length, template.dim(3)], dtype: template.dtype)
+        guard let latent else { return pad }
+        return length == longest ? latent : concatenated([latent, pad], axis: 2)
+    }
+    return (concatenated(padded, axis: 0), longest)
+}
+
+extension GLM5NextTextModel: SpeculativeCacheRewindModel {
+    /// One verified token is rewound in place: sparse layers trim exactly,
+    /// KDA layers restore the checkpoint the verify pass saved.
+    public var maximumNativeTargetCacheRewind: Int { 1 }
+}
+
 /// `glm5_next` checkpoints: the text model nested under `language_model`, with
 /// vision tensors alongside (dropped).
 public final class GLM5NextModel: Module, LLMModel {
@@ -1184,6 +1352,12 @@ public final class GLM5NextModel: Module, LLMModel {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)
+    }
+
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        languageModel(input, cache: cache, state: state)
     }
 
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
@@ -1686,4 +1860,8 @@ extension GLM5NextTextModel {
 
 extension GLM5NextModel {
     public var toolCallFormat: ToolCallFormat? { .glm4 }
+}
+
+extension GLM5NextModel: SpeculativeCacheRewindModel {
+    public var maximumNativeTargetCacheRewind: Int { 1 }
 }

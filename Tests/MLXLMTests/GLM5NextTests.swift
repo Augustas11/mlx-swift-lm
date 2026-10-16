@@ -1214,6 +1214,130 @@ final class GLM5NextTests: XCTestCase {
         XCTAssertEqual(text.model.layers.count, 4)
     }
 
+    // MARK: - MTP
+
+    private func emitState(checkpoint: Int? = nil) -> LMOutput.State {
+        var state = LMOutput.State()
+        state[mtpEmitFlagKey] = true
+        state[mtpCacheCheckpointIndexKey] = checkpoint
+        return state
+    }
+
+    /// Bitwise equality of two cache lists: recurrent states, and the
+    /// latent, pooled keys and partial pool window of every sparse layer.
+    private func assertCachesEqual(_ a: [KVCache], _ b: [KVCache], _ what: String) {
+        for (index, (x, y)) in zip(a, b).enumerated() {
+            if let x = x as? MambaCache, let y = y as? MambaCache {
+                assertBitwiseEqual(x[0], y[0], "\(what): layer \(index) conv state")
+                assertBitwiseEqual(x[1], y[1], "\(what): layer \(index) recurrent state")
+            } else {
+                XCTAssertEqual(x.offset, y.offset, "\(what): layer \(index) offset")
+                for i in 0 ..< 4 {
+                    assertBitwiseEqual(x.state[i], y.state[i], "\(what): layer \(index) state \(i)")
+                }
+            }
+        }
+    }
+
+    /// An MTP verification forward (two columns, checkpoint after the first)
+    /// gives each column the logits of a serial one-token decode bit for bit,
+    /// emits the pre-norm hidden state and the last sparse layer's latent,
+    /// and a one-token rewind (sparse trim + KDA checkpoint restore) leaves
+    /// every cache equal to decoding only the first column.
+    func testMTPVerifyColumnsMatchDecodeAndRewindIsExact() throws {
+        let model = try fusedShapesModel(seed: 191)
+        let prompt = tokens(13, seed: 192)
+        let pair = tokens(2, seed: 193)
+        let next = tokens(1, seed: 194)
+        for deferred in [true, false] {
+            model.model.deferredDecode = deferred
+            let verified = try model.newCache(parameters: nil)
+            let serial = try model.newCache(parameters: nil)
+            eval(model(prompt, cache: verified), model(prompt, cache: serial))
+
+            let output = model(LMInput.Text(tokens: pair), cache: verified, state: emitState(checkpoint: 1))
+            let first = model(pair[0..., ..<1], cache: serial)
+            let afterFirst = serial.map { $0.copy() }
+            let second = model(pair[0..., 1...], cache: serial)
+            assertBitwiseEqual(output.logits[0..., ..<1], first, "deferred=\(deferred) column 0")
+            assertBitwiseEqual(output.logits[0..., 1...], second, "deferred=\(deferred) column 1")
+
+            let hidden = try XCTUnwrap(output.state?[mtpLastHiddenStatesKey])
+            XCTAssertEqual(hidden.shape, [1, 2, model.configuration.hiddenSize])
+            let shared = try XCTUnwrap(output.state?[mtpSharedKVStatesKey]?["full_attention"])
+            XCTAssertEqual(shared.0.dim(-2), 15)
+            XCTAssertEqual(output.state?[mtpSharedKVSourceIndicesKey]?["full_attention"], 5)
+
+            // Both columns kept: the caches equal decoding both tokens.
+            let accepted = verified.map { $0.copy() }
+            assertCachesEqual(accepted, serial, "deferred=\(deferred) both columns kept")
+            XCTAssertEqual(rewindSpeculativePromptCache(verified, numTokens: 1), 1)
+            assertCachesEqual(verified, afterFirst, "deferred=\(deferred) after rewind")
+            assertBitwiseEqual(
+                model(next, cache: verified), model(next, cache: afterFirst),
+                "deferred=\(deferred) decode after rewind")
+        }
+        model.model.deferredDecode = true
+        XCTAssertEqual(model.maximumNativeTargetCacheRewind, 1)
+    }
+
+    /// Proposes the plain-greedy continuation, except a wrong token every
+    /// third round, so the iterator exercises the target's accept path
+    /// (both verify columns kept) and its in-place rewind.
+    private final class OracleDrafter: Module, MTPDrafterModel {
+        let expected: [Int]
+        let promptLength: Int
+        let maximumBlockSize: Int? = 2
+        private var round = 0
+
+        init(expected: [Int], promptLength: Int) {
+            self.expected = expected
+            self.promptLength = promptLength
+            super.init()
+        }
+
+        func draftBlock(
+            target _: any LanguageModel, lastToken _: MLXArray, lastHidden _: MLXArray,
+            sharedKV _: [String: (MLXArray, MLXArray)], positionDeltas _: MLXArray?,
+            queryOffset: Int, blockSize _: Int, sampler _: any LogitSampler
+        ) -> MLXArray {
+            round += 1
+            let next = queryOffset - promptLength + 1
+            let token = next < expected.count ? expected[next] : 0
+            return MLXArray([Int32(round % 3 == 0 ? (token + 1) % 64 : token)]).reshaped(1, 1)
+        }
+    }
+
+    /// The MTP iterator over the GLM target with proposals that are accepted
+    /// two rounds in three: output equals plain greedy, and the accepted
+    /// count shows both paths ran.
+    func testMTPIteratorAcceptAndRewindOnGLMTargetMatchPlainGreedy() throws {
+        let model = try fusedShapesModel(seed: 251)
+        let prompt = tokens(13, seed: 252).reshaped(-1)
+        let parameters = greedyParameters(maxTokens: 30)
+        var plain = try TokenIterator(prompt: prompt, model: model, parameters: parameters)
+        var expected = [Int]()
+        while let token = plain.next() { expected.append(token) }
+        let drafter = OracleDrafter(expected: expected, promptLength: 13)
+        var speculative = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: prompt), mainModel: model, drafter: drafter,
+            parameters: parameters, blockSize: 2)
+        var produced = [Int]()
+        while let token = speculative.next() { produced.append(token) }
+        XCTAssertNil(speculative.passthroughReason)
+        XCTAssertEqual(produced, expected)
+        XCTAssertGreaterThan(speculative.acceptedCount, 4)
+        XCTAssertLessThan(speculative.acceptedCount, speculative.proposedCount)
+    }
+
+    private func greedyParameters(maxTokens: Int) -> GenerateParameters {
+        var parameters = GenerateParameters(maxTokens: maxTokens, temperature: 0)
+        // The MTP iterator prefills the prompt in one forward; match it.
+        parameters.prefill.stepSize = Int.max
+        parameters.prefill.chunking = .unchunked
+        return parameters
+    }
+
     // MARK: - Weight names
 
     /// Tensor names of GLM-5.3-Flash-oQ4e-mtp (`model.safetensors.index.json`,
