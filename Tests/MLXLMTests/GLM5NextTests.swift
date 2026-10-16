@@ -13,7 +13,7 @@ final class GLM5NextTests: XCTestCase {
     /// Six layers: three dense KDA, then DSA (own indexer) + MoE, KDA + MoE,
     /// and DSA with a shared indexer + MoE. Dims are multiples of 32 so every
     /// projection can be quantized at group size 32.
-    private func textConfigJSON(indexTopk: Int = 8, nextn: Int = 1) -> String {
+    private func textConfigJSON(indexTopk: Int = 8, nextn: Int = 1, linearHeadDim: Int = 32) -> String {
         """
         {
             "model_type": "glm5_next_text", "vocab_size": 64, "hidden_size": 64,
@@ -33,7 +33,7 @@ final class GLM5NextTests: XCTestCase {
             "mlp_layer_types": ["dense", "dense", "dense", "sparse", "sparse", "sparse"],
             "indexer_types": ["full", "full", "full", "full", "full", "shared"],
             "swiglu_limit": 10.0,
-            "linear_attn_config": {"num_heads": 2, "head_dim": 32,
+            "linear_attn_config": {"num_heads": 2, "head_dim": \(linearHeadDim),
                 "short_conv_kernel_size": 4, "gate_lower_bound": -5.0},
             "hc_mult": 4, "hc_eps": 1e-6, "hc_sinkhorn_iters": 20,
             "first_k_dense_replace": 3
@@ -41,10 +41,10 @@ final class GLM5NextTests: XCTestCase {
         """
     }
 
-    private func configuration(indexTopk: Int = 8, nextn: Int = 1, nested: Bool = false) throws
-        -> GLM5NextConfiguration
-    {
-        let text = textConfigJSON(indexTopk: indexTopk, nextn: nextn)
+    private func configuration(
+        indexTopk: Int = 8, nextn: Int = 1, nested: Bool = false, linearHeadDim: Int = 32
+    ) throws -> GLM5NextConfiguration {
+        let text = textConfigJSON(indexTopk: indexTopk, nextn: nextn, linearHeadDim: linearHeadDim)
         let json = nested ? #"{"model_type": "glm5_next", "text_config": \#(text)}"# : text
         let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
         try config.validateModelConfiguration()
@@ -255,6 +255,104 @@ final class GLM5NextTests: XCTestCase {
         eval(yKernel, sKernel, yOps, sOps)
         XCTAssertLessThan(maxAbsDifference(yKernel, yOps), 1e-4)
         XCTAssertLessThan(maxAbsDifference(sKernel, sOps), 1e-4)
+    }
+
+    // MARK: - Fused decode kernels
+
+    /// Cast floating parameters to bfloat16 (the artifact's activation dtype),
+    /// keeping the ones the checkpoint stores in float32.
+    private func castToBFloat16(_ model: Module) {
+        let parameters = model.parameters().flattened().map { key, value -> (String, MLXArray) in
+            let keepsFloat32 =
+                key.hasSuffix("A_log") || key.hasSuffix("dt_bias") || key.contains("_hc.")
+                || key.hasSuffix("mlp.gate.weight") || key.hasSuffix("e_score_correction_bias")
+            return (key, keepsFloat32 ? value : value.asType(.bfloat16))
+        }
+        model.update(parameters: ModuleParameters.unflattened(parameters))
+        eval(model)
+    }
+
+    private func assertBitwiseEqual(
+        _ a: MLXArray?, _ b: MLXArray?, _ message: String, file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard let a, let b else {
+            return XCTAssertTrue(a == nil && b == nil, message, file: file, line: line)
+        }
+        eval(a, b)
+        XCTAssertEqual(a.shape, b.shape, message, file: file, line: line)
+        XCTAssertEqual(a.dtype, b.dtype, message, file: file, line: line)
+        XCTAssertTrue(
+            arrayEqual(a, b).item(Bool.self),
+            "\(message): max |diff| \(maxAbsDifference(a, b))", file: file, line: line)
+    }
+
+    /// `glm5NextKDADecodeStep` must reproduce the KDA op path bit for bit:
+    /// output, conv state and recurrent state, from an empty cache, for single
+    /// tokens and for short blocks, over a carried state.
+    func testFusedKDADecodeMatchesOpPathBitwise() throws {
+        let config = try configuration(linearHeadDim: 128)
+        let attention = GLM5NextLinearAttention(config)
+        randomize(attention, seed: 11)
+        castToBFloat16(attention)
+        let input = withRandomState(MLXRandom.RandomState(seed: 13)) {
+            MLXRandom.normal([1, 24, config.hiddenSize]).asType(.bfloat16)
+        }
+
+        let fusedCache = MambaCache()
+        let opCache = MambaCache()
+        // Token 0 starts from an empty cache; then 1-token steps, then 3-token blocks.
+        var start = 0
+        for width in [1, 1, 1, 1, 1, 3, 3, 1, 3, 8] {
+            let x = input[0..., start ..< (start + width)]
+            attention.fusedDecode = true
+            let fused = attention(x, cache: fusedCache)
+            attention.fusedDecode = false
+            let reference = attention(x, cache: opCache)
+            attention.fusedDecode = true
+            assertBitwiseEqual(fused, reference, "output at token \(start) width \(width)")
+            assertBitwiseEqual(fusedCache[0], opCache[0], "conv state at token \(start)")
+            assertBitwiseEqual(fusedCache[1], opCache[1], "recurrent state at token \(start)")
+            start += width
+        }
+        XCTAssertNotNil(
+            glm5NextKDADecodeStep(
+                q: attention.qProj(input[0..., ..<1]), k: attention.kProj(input[0..., ..<1]),
+                v: attention.vProj(input[0..., ..<1]),
+                aPre: attention.forgetGate.project(input[0..., ..<1]),
+                gatePre: attention.gBProj(attention.gAProj(input[0..., ..<1])),
+                bRaw: attention.bProj(input[0..., ..<1]), convState: fusedCache[0]!,
+                convWeight: attention.conv1d.weight, aLog: attention.forgetGate.aLog,
+                dtBias: attention.forgetGate.dtBias, normWeight: attention.oNorm.weight,
+                state: fusedCache[1]!, heads: attention.numHeads, headDim: attention.headDim,
+                lowerBound: attention.forgetGate.lowerBound!, normEps: attention.oNorm.eps),
+            "the fused kernel must cover the real head_dim 128 decode shape")
+    }
+
+    /// End to end: decode logits with the fused KDA step equal the op path's.
+    func testFusedDecodeKeepsModelLogitsBitwise() throws {
+        let model = GLM5NextTextModel(try configuration(indexTopk: 8, linearHeadDim: 128))
+        randomize(model)
+        castToBFloat16(model)
+        let input = tokens(30)
+
+        func decode(fused: Bool) throws -> [MLXArray] {
+            for layer in model.model.layers where layer.isLinear {
+                (layer.selfAttn as! GLM5NextLinearAttention).fusedDecode = fused
+            }
+            let cache = try model.newCache(parameters: nil)
+            var logits = [model(input[0..., ..<20], cache: cache)[0..., -1]]
+            for t in 20 ..< 30 {
+                logits.append(model(input[0..., t ..< (t + 1)], cache: cache)[0..., -1])
+            }
+            eval(logits)
+            return logits
+        }
+        let fused = try decode(fused: true)
+        let reference = try decode(fused: false)
+        for (step, (a, b)) in zip(fused, reference).enumerated() {
+            assertBitwiseEqual(a, b, "logits at step \(step)")
+        }
     }
 
     // MARK: - Weight names

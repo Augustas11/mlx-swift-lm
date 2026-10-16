@@ -217,8 +217,11 @@ final class GLM5NextGatedRMSNorm: Module {
         super.init()
     }
 
+    /// mlx-vlm's `Glm5NextRMSNormGated` op graph, which the fused decode kernel replays.
     func callAsFunction(_ x: MLXArray, gate: MLXArray) -> MLXArray {
-        let normed = MLXFast.rmsNorm(x.asType(.float32), weight: weight.asType(.float32), eps: eps)
+        let xf = x.asType(.float32)
+        let variance = (xf * xf).mean(axis: -1, keepDims: true)
+        let normed = weight.asType(.float32) * (xf * rsqrt(variance + eps))
         return (normed * sigmoid(gate.asType(.float32))).asType(x.dtype)
     }
 }
@@ -257,10 +260,15 @@ final class GLM5NextForgetGate: Module {
         super.init()
     }
 
+    /// The low-rank gate projection `[B, L, H * Dk]`, before the decay.
+    func project(_ x: MLXArray) -> MLXArray {
+        fBProj(fAProj(x))
+    }
+
     /// Multiplicative per-channel decay `[B, L, H, Dk]` in float32.
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
-        let a = fBProj(fAProj(x)).reshaped(B, L, numHeads, headDim)
+        let a = project(x).reshaped(B, L, numHeads, headDim)
         let aLog = aLog.reshaped(numHeads, 1)
         let dtBias = dtBias.reshaped(numHeads, headDim)
         if let lowerBound {
@@ -310,8 +318,15 @@ final class GLM5NextLinearAttention: Module {
         super.init()
     }
 
+    /// One-sequence decode runs `glm5NextKDADecodeStep` (one dispatch for the
+    /// conv, norms, gates, delta rule and gated norm).
+    var fusedDecode = true
+
     func callAsFunction(_ x: MLXArray, cache: MambaCache?) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
+        if fusedDecode, !training, let cache, B == 1, L <= 8, let y = fusedDecodeStep(x, cache: cache) {
+            return y
+        }
         let mixed = concatenated([qProj(x), kProj(x), vProj(x)], axis: -1)
 
         let convState =
@@ -322,17 +337,14 @@ final class GLM5NextLinearAttention: Module {
 
         let parts = split(convOut, indices: [projectionDim, 2 * projectionDim], axis: -1)
         let shape = [B, L, numHeads, headDim]
-        // kimi_linear l2norm: x / sqrt(sum(x^2) + 1e-6), with q further scaled by Dk^-1/2.
-        let eps = 1e-6 / Float(headDim)
-        let scale = pow(Float(headDim), -0.5)
+        // mlx-vlm `_l2norm`: x * rsqrt(sum(x^2) + 1e-6) in float32; q also scaled by Dk^-1/2.
+        func l2norm(_ x: MLXArray) -> MLXArray {
+            x * rsqrt((x * x).sum(axis: -1, keepDims: true) + 1e-6)
+        }
         let q =
-            (MLXFast.rmsNorm(
-                parts[0].reshaped(shape).asType(.float32), weight: MLXArray.mlxNone, eps: eps)
-            * (scale * scale)).asType(x.dtype)
-        let k =
-            (MLXFast.rmsNorm(
-                parts[1].reshaped(shape).asType(.float32), weight: MLXArray.mlxNone, eps: eps)
-            * scale).asType(x.dtype)
+            (l2norm(parts[0].reshaped(shape).asType(.float32)) * Float(pow(Double(headDim), -0.5)))
+            .asType(x.dtype)
+        let k = l2norm(parts[1].reshaped(shape).asType(.float32)).asType(x.dtype)
         let v = parts[2].reshaped(shape)
 
         let decay = forgetGate(x)
@@ -348,6 +360,28 @@ final class GLM5NextLinearAttention: Module {
 
         let gate = gBProj(gAProj(x)).reshaped(shape)
         return oProj(oNorm(out, gate: gate).reshaped(B, L, -1))
+    }
+
+    private func fusedDecodeStep(_ x: MLXArray, cache: MambaCache) -> MLXArray? {
+        guard let lowerBound = forgetGate.lowerBound else { return nil }
+        let L = x.dim(1)
+        let convState =
+            cache[0] ?? MLXArray.zeros([1, convKernelSize - 1, 3 * projectionDim], dtype: x.dtype)
+        let state =
+            cache[1] ?? MLXArray.zeros([1, numHeads, headDim, headDim], dtype: .float32)
+        guard convKernelSize == 4,
+            let fused = glm5NextKDADecodeStep(
+                q: qProj(x), k: kProj(x), v: vProj(x),
+                aPre: forgetGate.project(x), gatePre: gBProj(gAProj(x)), bRaw: bProj(x),
+                convState: convState, convWeight: self.conv1d.weight,
+                aLog: forgetGate.aLog, dtBias: forgetGate.dtBias, normWeight: oNorm.weight,
+                state: state, heads: numHeads, headDim: headDim,
+                lowerBound: lowerBound, normEps: oNorm.eps)
+        else { return nil }
+        cache[0] = fused.convState
+        cache[1] = fused.state
+        cache.advance(L)
+        return oProj(fused.y)
     }
 }
 
