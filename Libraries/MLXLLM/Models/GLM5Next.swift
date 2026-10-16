@@ -270,9 +270,11 @@ final class GLM5NextMoE: Module, UnaryLayer {
     @ModuleInfo(key: "gate") var gate: GLM5NextMoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_experts") var sharedExperts: GLM5NextMLP?
+    let limit: Float?
 
     init(_ config: GLM5NextConfiguration) {
         _gate.wrappedValue = GLM5NextMoEGate(config)
+        self.limit = config.swigluLimit
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
@@ -285,7 +287,12 @@ final class GLM5NextMoE: Module, UnaryLayer {
         super.init()
     }
 
+    /// The expert half of a one-token decode as `glm5NextMoEExperts` (two
+    /// kernels after the router logits); the gate's `fusedDecode` controls it.
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if let fused = fusedDecodeStep(x) {
+            return fused
+        }
         let (indices, scores) = gate(x)
         let routed = switchMLP(x, indices)
         var y = weightedExpertSum(routed, scores).asType(x.dtype)
@@ -293,6 +300,50 @@ final class GLM5NextMoE: Module, UnaryLayer {
             y = y + sharedExperts(x)
         }
         return y
+    }
+
+    private func fusedDecodeStep(_ x: MLXArray) -> MLXArray? {
+        let rows = x.shape.dropLast().reduce(1, *)
+        guard gate.fusedDecode, !gate.training, rows == 1, gate.nGroup <= 1,
+            let limit, let sharedExperts
+        else { return nil }
+        let x2 = x.reshaped(1, x.dim(-1))
+        guard glm5NextMoERouterCovered(x2, weight: gate.weight, bias: gate.eScoreCorrectionBias),
+            let gateParts = Self.affine(switchMLP.gateProjection),
+            let upParts = Self.affine(switchMLP.upProjection),
+            let downParts = Self.affine(switchMLP.downProjection),
+            let sharedGate = Self.affine(sharedExperts.gateProj),
+            let sharedUp = Self.affine(sharedExperts.upProj),
+            let sharedDown = Self.affine(sharedExperts.downProj)
+        else { return nil }
+        let (sig, biased) = glm5NextRouterLogits(
+            x2, weight: gate.weight, bias: gate.eScoreCorrectionBias)
+        return glm5NextMoEExperts(
+            x2, sig: sig, biased: biased, topK: gate.topK, scaling: gate.scaling,
+            normalize: gate.normalize, limit: limit,
+            gate: gateParts, up: upParts, down: downParts,
+            sharedGate: sharedGate, sharedUp: sharedUp, sharedDown: sharedDown
+        )?.reshaped(x.shape)
+    }
+
+    private static func affine(_ module: Module) -> GLM5NextAffine? {
+        switch module {
+        case let switchLinear as QuantizedSwitchLinear:
+            let parts = switchLinear.quantizedParts
+            guard switchLinear.mode == .affine, parts.bias == nil, let biases = parts.biases
+            else { return nil }
+            return GLM5NextAffine(
+                weight: parts.weight, scales: parts.scales, biases: biases,
+                bits: switchLinear.bits, groupSize: switchLinear.groupSize)
+        case let linear as QuantizedLinear:
+            guard linear.mode == .affine, linear.bias == nil, let biases = linear.biases
+            else { return nil }
+            return GLM5NextAffine(
+                weight: linear.weight, scales: linear.scales, biases: biases,
+                bits: linear.bits, groupSize: linear.groupSize)
+        default:
+            return nil
+        }
     }
 }
 

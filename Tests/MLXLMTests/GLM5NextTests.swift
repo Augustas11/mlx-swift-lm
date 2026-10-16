@@ -461,6 +461,70 @@ final class GLM5NextTests: XCTestCase {
         assertBitwiseEqual(nextNormalized, nextChain.0, "branch input after a folded expand")
     }
 
+    /// `glm5NextMoEExperts` (gate/up with the router's selection replayed,
+    /// down + routing-weighted combine + shared expert) reproduces the MoE op
+    /// path bit for bit on an affine-quantized layer: 4-bit routed experts
+    /// and an 8-bit shared expert, as the artifact stores them.
+    func testFusedMoEExpertsMatchOpPathBitwise() throws {
+        var json = textConfigJSON()
+        for (from, to) in [
+            (#""hidden_size": 64"#, #""hidden_size": 512"#),
+            (#""moe_intermediate_size": 32"#, #""moe_intermediate_size": 512"#),
+            (#""n_routed_experts": 4"#, #""n_routed_experts": 64"#),
+            (#""num_experts_per_tok": 2"#, #""num_experts_per_tok": 8"#),
+        ] {
+            json = json.replacingOccurrences(of: from, with: to)
+        }
+        let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+        let moe = GLM5NextMoE(config)
+        randomize(moe, seed: 71)
+        castToBFloat16(moe)
+        // The router gate stays float32, as sanitize keeps it.
+        moe.gate.update(parameters: ModuleParameters.unflattened([
+            "weight": moe.gate.weight.asType(.float32)
+        ]))
+        quantize(model: moe) { path, _ in
+            if path.hasPrefix("gate") { return nil }
+            return path.hasPrefix("shared_experts") ? (64, 8, .affine) : (64, 4, .affine)
+        }
+        eval(moe)
+        moe.train(false)
+        XCTAssertTrue(moe.switchMLP.gateProjection is QuantizedSwitchLinear)
+        for seed in 0 ..< 24 {
+            let x = withRandomState(MLXRandom.RandomState(seed: UInt64(80 + seed))) {
+                (Float(seed % 3 + 1) * MLXRandom.normal([1, 1, 512])).asType(.bfloat16)
+            }
+            moe.gate.fusedDecode = false
+            let reference = moe(x)
+            moe.gate.fusedDecode = true
+            let fused = moe(x)
+            assertBitwiseEqual(fused, reference, "MoE output for input \(seed)")
+        }
+        let x2 = MLXArray.zeros([1, 512], dtype: .bfloat16)
+        let (sig, biased) = glm5NextRouterLogits(
+            x2, weight: moe.gate.weight, bias: moe.gate.eScoreCorrectionBias)
+        let affine = { (module: Module) -> GLM5NextAffine in
+            if let s = module as? QuantizedSwitchLinear {
+                let p = s.quantizedParts
+                return GLM5NextAffine(
+                    weight: p.weight, scales: p.scales, biases: p.biases!, bits: s.bits,
+                    groupSize: s.groupSize)
+            }
+            let l = module as! QuantizedLinear
+            return GLM5NextAffine(
+                weight: l.weight, scales: l.scales, biases: l.biases!, bits: l.bits,
+                groupSize: l.groupSize)
+        }
+        let shared = try XCTUnwrap(moe.sharedExperts)
+        XCTAssertNotNil(
+            glm5NextMoEExperts(
+                x2, sig: sig, biased: biased, topK: 8, scaling: 2.5, normalize: true, limit: 10,
+                gate: affine(moe.switchMLP.gateProjection), up: affine(moe.switchMLP.upProjection),
+                down: affine(moe.switchMLP.downProjection), sharedGate: affine(shared.gateProj),
+                sharedUp: affine(shared.upProj), sharedDown: affine(shared.downProj)),
+            "the fused experts must cover this layer")
+    }
+
     /// `glm5NextMoERouter` reproduces the router op path bit for bit: the
     /// selected experts in argPartition's order (ties to the lower expert),
     /// and the normalized, scaled scores.

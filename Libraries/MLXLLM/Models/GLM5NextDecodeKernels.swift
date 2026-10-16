@@ -670,33 +670,46 @@ private final class GLM5NextRouterKernels: Sendable {
     }
 }
 
-/// The noaux_tc router for `n_group == 1` and rows `x: [T, K]`, each as a
-/// one-token GEMV: `(indices uint32 [T, topK], scores fp32 [T, topK])`, or
-/// `nil` outside the replicated gemv configuration.
-func glm5NextMoERouter(
-    _ x: MLXArray, weight: MLXArray, bias: MLXArray, topK: Int, scaling: Float, normalize: Bool
-) -> (MLXArray, MLXArray)? {
-    guard x.ndim == 2, weight.ndim == 2, bias.ndim == 1,
-        weight.dtype == .float32, bias.dtype == .float32,
-        [.bfloat16, .float16, .float32].contains(x.dtype)
-    else { return nil }
-    let (T, K) = (x.dim(0), x.dim(1))
-    let E = weight.dim(0)
-    // MLX's gemv for x @ W.T takes the bm = 4, bn = 1 layout for E < 4096 and
-    // K < 16 * E; full 128-wide K blocks and whole 4-row tiles.
-    guard weight.dim(1) == K, bias.dim(0) == E, E >= 16, E < 4096, E % 16 == 0, E <= 1024,
-        K > 64, K % 128 == 0, K < 16 * E, (1 ... min(32, E)).contains(topK)
-    else { return nil }
-    let kernels = GLM5NextRouterKernels.shared
-    let logits = kernels.logits(
+/// `(sigmoid(x @ W.T), sigmoid + bias)` `[T, E]` fp32, one-token GEMV rows;
+/// the caller checks the shapes (`glm5NextMoERouterCovered`).
+func glm5NextRouterLogits(_ x: MLXArray, weight: MLXArray, bias: MLXArray) -> (MLXArray, MLXArray) {
+    let (T, K, E) = (x.dim(0), x.dim(1), weight.dim(0))
+    let logits = GLM5NextRouterKernels.shared.logits(
         [x, weight, bias],
         template: [("T", x.dtype), ("K", K), ("E", E)],
         grid: (128 * (E / 4), T, 1),
         threadGroup: (128, 1, 1),
         outputShapes: [[T, E], [T, E]],
         outputDTypes: [.float32, .float32])
-    let selected = kernels.select(
-        [logits[0], logits[1], MLXArray([scaling])],
+    return (logits[0], logits[1])
+}
+
+/// Whether the router kernels replay MLX's gemv for `x: [T, K]` and `W: [E, K]`.
+func glm5NextMoERouterCovered(_ x: MLXArray, weight: MLXArray, bias: MLXArray) -> Bool {
+    guard x.ndim == 2, weight.ndim == 2, bias.ndim == 1,
+        weight.dtype == .float32, bias.dtype == .float32,
+        [.bfloat16, .float16, .float32].contains(x.dtype)
+    else { return false }
+    let (K, E) = (x.dim(1), weight.dim(0))
+    // MLX's gemv for x @ W.T takes the bm = 4, bn = 1 layout for E < 4096 and
+    // K < 16 * E; full 128-wide K blocks and whole 4-row tiles.
+    return weight.dim(1) == K && bias.dim(0) == E && E >= 16 && E < 4096 && E % 16 == 0
+        && E <= 1024 && K > 64 && K % 128 == 0 && K < 16 * E
+}
+
+/// The noaux_tc router for `n_group == 1` and rows `x: [T, K]`, each as a
+/// one-token GEMV: `(indices uint32 [T, topK], scores fp32 [T, topK])`, or
+/// `nil` outside the replicated gemv configuration.
+func glm5NextMoERouter(
+    _ x: MLXArray, weight: MLXArray, bias: MLXArray, topK: Int, scaling: Float, normalize: Bool
+) -> (MLXArray, MLXArray)? {
+    guard glm5NextMoERouterCovered(x, weight: weight, bias: bias),
+        (1 ... min(32, weight.dim(0))).contains(topK)
+    else { return nil }
+    let (T, E) = (x.dim(0), weight.dim(0))
+    let logits = glm5NextRouterLogits(x, weight: weight, bias: bias)
+    let selected = GLM5NextRouterKernels.shared.select(
+        [logits.0, logits.1, MLXArray([scaling])],
         template: [("E", E), ("TOPK", topK), ("NORM", normalize && topK > 1)],
         grid: (32 * T, 1, 1),
         threadGroup: (32, 1, 1),
@@ -1116,4 +1129,696 @@ func glm5NextHCPost(
         outputShapes: [[1, 1, 4], [1, 1, 4, 4], [4 * D]],
         outputDTypes: [.float32, .float32, .float32])
     return (out[0], out[1], out[2])
+}
+
+// MARK: - MoE experts (one token)
+//
+// Adapted from oMLX v0.7.1rc1 `moe_gate_up_swiglu` (SELECT form) and
+// `moe_down_combine` (Apache-2.0). The gate/up kernel replays the router's
+// top-k in every routed threadgroup (publishing the routes and routing
+// weights), and computes each routed and the shared expert's gate/up rows
+// with MLX's qmv_fast arithmetic plus the clamped SwiGLU; the down kernel
+// computes the routed down rows, the routing-weighted sum (bf16-rounded
+// expert outputs times fp32 scores, unfused, summed in route order) and the
+// shared expert's down rows, as gather_qmv + weightedExpertSum + the shared
+// MLP + add do. The selection normalizes with `total + 1e-20`, the op path's
+// form.
+
+private let glm5NextQMVHeader = """
+    #include <metal_simdgroup>
+    #include <metal_stdlib>
+    using namespace metal;
+
+    template <int bits>
+    constexpr int glm_pack_factor() {
+      return (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : 32 / bits);
+    }
+
+    template <int bits>
+    constexpr int glm_bytes_per_pack() {
+      return ((bits & (bits - 1)) == 0) ? 4 : (bits == 5 ? 5 : 3);
+    }
+
+    // Verbatim copy of MLX quantized.h load_vector (U = float).
+    template <typename T, int values_per_thread, int bits>
+    inline float glm_load_vector(const device T* x, thread float* x_thread) {
+      float sum = 0;
+      if (bits == 3) {
+        for (int i = 0; i < values_per_thread; i += 8) {
+          sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+              float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
+          x_thread[i] = x[i];
+          x_thread[i + 1] = x[i + 1] / 8.0f;
+          x_thread[i + 2] = x[i + 2] / 64.0f;
+          x_thread[i + 3] = x[i + 3] / 2.0f;
+          x_thread[i + 4] = x[i + 4] / 16.0f;
+          x_thread[i + 5] = x[i + 5] / 128.0f;
+          x_thread[i + 6] = x[i + 6] / 4.0f;
+          x_thread[i + 7] = x[i + 7] / 32.0f;
+        }
+      } else if (bits == 4) {
+        for (int i = 0; i < values_per_thread; i += 4) {
+          sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
+          x_thread[i] = x[i];
+          x_thread[i + 1] = x[i + 1] / 16.0f;
+          x_thread[i + 2] = x[i + 2] / 256.0f;
+          x_thread[i + 3] = x[i + 3] / 4096.0f;
+        }
+      } else if (bits == 5) {
+        for (int i = 0; i < values_per_thread; i += 8) {
+          sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+              float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
+          x_thread[i] = x[i];
+          x_thread[i + 1] = x[i + 1] / 32.0f;
+          x_thread[i + 2] = x[i + 2] / 4.0f;
+          x_thread[i + 3] = x[i + 3] / 128.0f;
+          x_thread[i + 4] = x[i + 4] / 16.0f;
+          x_thread[i + 5] = x[i + 5] / 2.0f;
+          x_thread[i + 6] = x[i + 6] / 64.0f;
+          x_thread[i + 7] = x[i + 7] / 8.0f;
+        }
+      } else if (bits == 6) {
+        for (int i = 0; i < values_per_thread; i += 4) {
+          sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
+          x_thread[i] = x[i];
+          x_thread[i + 1] = x[i + 1] / 64.0f;
+          x_thread[i + 2] = x[i + 2] / 16.0f;
+          x_thread[i + 3] = x[i + 3] / 4.0f;
+        }
+      } else if (bits == 8) {
+        for (int i = 0; i < values_per_thread; i++) {
+          sum += x[i];
+          x_thread[i] = x[i];
+        }
+      }
+      return sum;
+    }
+
+    // Verbatim copy of MLX quantized.h qdot (U = float).
+    template <int values_per_thread, int bits>
+    inline float glm_qdot(
+        const device uint8_t* w,
+        const thread float* x_thread,
+        float scale,
+        float bias,
+        float sum) {
+      float accum = 0;
+      if (bits == 3) {
+        for (int i = 0; i < (values_per_thread / 8); i++) {
+          x_thread += 8 * i;
+          w += 3 * i;
+
+          accum += (w[0] & 0x07) * x_thread[0];
+          accum += (w[0] & 0x38) * x_thread[1];
+          accum += (w[0] & 0xc0) * x_thread[2];
+          accum += (w[1] & 0x01) * (x_thread[2] * 256.0f);
+
+          accum += (w[1] & 0x0e) * x_thread[3];
+          accum += (w[1] & 0x70) * x_thread[4];
+          accum += (w[1] & 0x80) * x_thread[5];
+          accum += (w[2] & 0x03) * (x_thread[5] * 256.0f);
+
+          accum += (w[2] & 0x1c) * x_thread[6];
+          accum += (w[2] & 0xe0) * x_thread[7];
+        }
+      } else if (bits == 4) {
+        const device uint16_t* ws = (const device uint16_t*)w;
+        for (int i = 0; i < (values_per_thread / 4); i++) {
+          accum +=
+              (x_thread[4 * i] * (ws[i] & 0x000f) +
+               x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+               x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+               x_thread[4 * i + 3] * (ws[i] & 0xf000));
+        }
+      } else if (bits == 5) {
+        for (int i = 0; i < (values_per_thread / 8); i++) {
+          x_thread += 8 * i;
+          w += 5 * i;
+          accum += (w[0] & 0x1f) * x_thread[0];
+          accum += (w[0] & 0xe0) * x_thread[1];
+          accum += (w[1] & 0x3) * (x_thread[1] * 256.0f);
+          accum += (w[1] & 0x7c) * x_thread[2];
+          accum += (w[1] & 0x80) * x_thread[3];
+          accum += (w[2] & 0xf) * (x_thread[3] * 256.0f);
+          accum += (w[2] & 0xf0) * x_thread[4];
+          accum += (w[3] & 0x1) * (x_thread[4] * 256.0f);
+          accum += (w[3] & 0x3e) * x_thread[5];
+          accum += (w[3] & 0xc0) * x_thread[6];
+          accum += (w[4] & 0x7) * (x_thread[6] * 256.0f);
+          accum += (w[4] & 0xf8) * x_thread[7];
+        }
+      } else if (bits == 6) {
+        for (int i = 0; i < (values_per_thread / 4); i++) {
+          x_thread += 4 * i;
+          w += 3 * i;
+          accum += (w[0] & 0x3f) * x_thread[0];
+          accum += (w[0] & 0xc0) * x_thread[1];
+          accum += (w[1] & 0x0f) * (x_thread[1] * 256.0f);
+          accum += (w[1] & 0xf0) * x_thread[2];
+          accum += (w[2] & 0x03) * (x_thread[2] * 256.0f);
+          accum += (w[2] & 0xfc) * x_thread[3];
+        }
+      } else if (bits == 8) {
+        for (int i = 0; i < values_per_thread; i++) {
+          accum += x_thread[i] * w[i];
+        }
+      }
+      return scale * accum + sum * bias;
+    }
+
+    // qmv_fast_impl for RPS consecutive rows of one [N, K] affine matrix
+    // (row pointers already offset to the first row), one simdgroup.  Leaves the
+    // per-lane partial sums in `result`; the caller simd_sums them.
+    template <typename T, int K, int group_size, int bits, int RPS>
+    inline void glm_qmv_rows(
+        const device uint8_t* ws,
+        const device T* scales,
+        const device T* biases,
+        const device T* x,
+        uint simd_lid,
+        thread float* result) {
+      constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+      constexpr int pack_factor = glm_pack_factor<bits>();
+      constexpr int bytes_per_pack = glm_bytes_per_pack<bits>();
+      constexpr int values_per_thread = pack_factor * packs_per_thread;
+      constexpr int block_size = values_per_thread * 32;
+      constexpr int scale_step_per_thread = group_size / values_per_thread;
+      constexpr int in_vec_size_w = K * bytes_per_pack / pack_factor;
+      constexpr int in_vec_size_g = K / group_size;
+
+      thread float x_thread[values_per_thread];
+      ws += simd_lid * packs_per_thread * bytes_per_pack;
+      scales += simd_lid / scale_step_per_thread;
+      biases += simd_lid / scale_step_per_thread;
+      x += simd_lid * values_per_thread;
+
+      for (int k = 0; k < K; k += block_size) {
+        float sum = glm_load_vector<T, values_per_thread, bits>(x, x_thread);
+        for (int row = 0; row < RPS; row++) {
+          const device uint8_t* wl = ws + row * in_vec_size_w;
+          const device T* sl = scales + row * in_vec_size_g;
+          const device T* bl = biases + row * in_vec_size_g;
+          float s = sl[0];
+          float b = bl[0];
+          result[row] += glm_qdot<values_per_thread, bits>(wl, x_thread, s, b, sum);
+        }
+        ws += block_size * bytes_per_pack / pack_factor;
+        scales += block_size / group_size;
+        biases += block_size / group_size;
+        x += block_size;
+      }
+    }
+
+    // Verbatim copy of MLX quantized.h dequantize (U = float) for 4/5/6/8 bits.
+    template <int N, int bits>
+    inline void glm_dequantize(const device uint8_t* w, float scale, float bias, thread float* w_local) {
+      const float s = float(scale);
+      const float b = float(bias);
+      if (bits == 4) {
+        float sc[2] = {s, s / 16.0f};
+        for (int i = 0; i < (N / 2); i++) {
+          w_local[2 * i] = static_cast<float>(sc[0] * (w[i] & 0x0f) + b);
+          w_local[2 * i + 1] = static_cast<float>(sc[1] * (w[i] & 0xf0) + b);
+        }
+      } else if (bits == 5) {
+        for (int i = 0; i < (N / 8); i++) {
+          w_local += 8 * i;
+          w += 5 * i;
+          w_local[0] = static_cast<float>((w[0] & 0x1f) * s + b);
+          w_local[1] =
+              static_cast<float>((((w[0] & 0xe0) >> 5) + ((w[1] & 0x3) << 3)) * s + b);
+          w_local[2] = static_cast<float>(((w[1] & 0x7c) >> 2) * s + b);
+          w_local[3] =
+              static_cast<float>((((w[1] & 0x80) >> 7) + ((w[2] & 0xf) << 1)) * s + b);
+          w_local[4] =
+              static_cast<float>((((w[2] & 0xf0) >> 4) + ((w[3] & 0x1) << 4)) * s + b);
+          w_local[5] = static_cast<float>(((w[3] & 0x3e) >> 1) * s + b);
+          w_local[6] =
+              static_cast<float>((((w[3] & 0xc0) >> 6) + ((w[4] & 0x7) << 2)) * s + b);
+          w_local[7] = static_cast<float>(((w[4] & 0xf8) >> 3) * s + b);
+        }
+      } else if (bits == 6) {
+        for (int i = 0; i < (N / 4); i++) {
+          w_local += 4 * i;
+          w += 3 * i;
+          w_local[0] = static_cast<float>((w[0] & 0x3f) * s + b);
+          w_local[1] =
+              static_cast<float>((((w[0] >> 6) & 0x03) + ((w[1] & 0x0f) << 2)) * s + b);
+          w_local[2] =
+              static_cast<float>((((w[1] >> 4) & 0x0f) + ((w[2] & 0x03) << 4)) * s + b);
+          w_local[3] = static_cast<float>(((w[2] >> 2) & 0x3f) * s + b);
+        }
+      } else if (bits == 8) {
+        for (int i = 0; i < N; i++) {
+          w_local[i] = static_cast<float>(s * w[i] + b);
+        }
+      }
+    }
+
+    // MLX qmv_wide_impl (affine, k_lanes = 8) for one weight row and NV input
+    // vectors: each lane reduces groups k_lane, k_lane + 8, ... in 8-value
+    // sub-chunks; the caller applies the 4/2/1 shuffle-down ladder.
+    template <typename T, int K, int GS, int BITS, int NV>
+    inline void glm_qmv_wide_row(
+        const device uint8_t* wrow,
+        const device T* srow,
+        const device T* brow,
+        const device T* x,
+        int nv,
+        int k_lane,
+        thread float* result) {
+      constexpr int sub = 8;
+      constexpr int G = K / GS;
+      for (int g = k_lane; g < G; g += 8) {
+        float scale = srow[g];
+        float bias = brow[g];
+        for (int sc = 0; sc < GS / sub; sc++) {
+          const int k0 = g * GS + sc * sub;
+          const device uint8_t* wc = wrow + k0 * BITS / 8;
+          float w_dq[sub];
+          glm_dequantize<sub, BITS>(wc, scale, bias, w_dq);
+          for (int v = 0; v < NV; v++) {
+            if (v < nv) {
+              const device T* xc = x + v * K + k0;
+              float acc = 0;
+              for (int i = 0; i < sub; i++) {
+                acc += static_cast<float>(xc[i]) * w_dq[i];
+              }
+              result[v] += acc;
+            }
+          }
+        }
+      }
+    }
+
+    // Same expressions as MLX's Sigmoid / Minimum / Maximum functors.
+    template <typename T>
+    inline T glm_sigmoid(T x) {
+      auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
+      return (x < 0) ? y : 1 - y;
+    }
+    template <typename T>
+    inline T glm_minimum(T x, T y) {
+      if (metal::isnan(x)) {
+        return x;
+      }
+      return x < y ? x : y;
+    }
+    template <typename T>
+    inline T glm_maximum(T x, T y) {
+      if (metal::isnan(x)) {
+        return x;
+      }
+      return x > y ? x : y;
+    }
+
+    // The router's top-k selection (the select kernel's loop, one simdgroup):
+    // argpartition order of the biased scores, i.e. descending values with ties
+    // to the lower expert index and NaNs last (lowest index first). Every lane
+    // ends with the same picked[].
+    template <int E, int TOPK, typename P>
+    inline void glm_router_topk(P bz, uint lane, thread int* picked) {
+      constexpr int PER = (E + 31) / 32;
+      float vals[PER];
+      bool taken[PER];
+      for (int j = 0; j < PER; j++) {
+        const int e = j * 32 + int(lane);
+        vals[j] = e < E ? bz[e] : -INFINITY;
+        taken[j] = e >= E;
+      }
+      for (int r = 0; r < TOPK; r++) {
+        float best = -INFINITY;
+        int best_e = 0x7fffffff;
+        for (int j = 0; j < PER; j++) {
+          const int e = j * 32 + int(lane);
+          if (!taken[j] && !isnan(vals[j]) &&
+              (best_e == 0x7fffffff || vals[j] > best || (vals[j] == best && e < best_e))) {
+            best = vals[j];
+            best_e = e;
+          }
+        }
+        for (ushort off = 16; off >= 1; off >>= 1) {
+          float ob = simd_shuffle_xor(best, off);
+          int oe = simd_shuffle_xor(best_e, off);
+          const bool other_better = oe != 0x7fffffff &&
+              (best_e == 0x7fffffff || ob > best || (ob == best && oe < best_e));
+          if (other_better) {
+            best = ob;
+            best_e = oe;
+          }
+        }
+        if (best_e == 0x7fffffff) {
+          for (int j = 0; j < PER; j++) {
+            const int e = j * 32 + int(lane);
+            if (!taken[j] && e < best_e) {
+              best_e = e;
+            }
+          }
+          for (ushort off = 16; off >= 1; off >>= 1) {
+            best_e = min(best_e, simd_shuffle_xor(best_e, off));
+          }
+        }
+        picked[r] = best_e;
+        if ((best_e % 32) == int(lane)) {
+          taken[best_e / 32] = true;
+        }
+      }
+    }
+
+    // Glm5NextClampedSwiGLU / Glm5NextMLP epilogue on bfloat16 projections:
+    //   silu(minimum(gate, limit)) * minimum(maximum(up, -limit), limit)
+    template <typename T>
+    inline T glm_clamped_swiglu(T gate, T up, T limit, T neg_limit) {
+      T g = glm_minimum(gate, limit);
+      T s = g * glm_sigmoid(g);
+      T u = glm_minimum(glm_maximum(up, neg_limit), limit);
+      return s * u;
+    }
+    """
+
+private let glm5NextMoEGateUpSource = """
+      const uint simd_lid = thread_index_in_simdgroup;
+      const uint simd_gid = simdgroup_index_in_threadgroup;
+    #if SLOT_MAJOR
+      // Route slots vary fastest, so the slots of an expert that several
+      // tokens share read its row block back to back (cache hits).
+      const int tile = int(threadgroup_position_in_grid.z);
+      const int z = int(threadgroup_position_in_grid.y);
+    #else
+      const int tile = int(threadgroup_position_in_grid.y);
+      const int z = int(threadgroup_position_in_grid.z);
+    #endif
+      const T lim = T(limit[0]);
+      const T neg_lim = T(-limit[0]);
+    #if SHARED_WIDE
+      // Last z slice: the shared expert for all NTOK tokens with MLX's
+      // multi-row qmv_wide arithmetic (8 lanes per row, 4 rows per simdgroup).
+      if (z == NTOK * TOPK) {
+        const int k_lane = int(simd_lid) % 8;
+        const int row = (tile * NSG + int(simd_gid)) * 4 + int(simd_lid) / 8;
+        constexpr int WB = K * SBITS / 8;
+        constexpr int G = K / SGS;
+        float g_res[NTOK];
+        float u_res[NTOK];
+        for (int v = 0; v < NTOK; v++) {
+          g_res[v] = 0.0f;
+          u_res[v] = 0.0f;
+        }
+        glm_qmv_wide_row<T, K, SGS, SBITS, NTOK>(
+            (const device uint8_t*)sh_gate_w + size_t(row) * WB, sh_gate_s + row * G,
+            sh_gate_b + row * G, x, NTOK, k_lane, g_res);
+        glm_qmv_wide_row<T, K, SGS, SBITS, NTOK>(
+            (const device uint8_t*)sh_up_w + size_t(row) * WB, sh_up_s + row * G,
+            sh_up_b + row * G, x, NTOK, k_lane, u_res);
+        for (int v = 0; v < NTOK; v++) {
+          g_res[v] += simd_shuffle_down(g_res[v], 4);
+          g_res[v] += simd_shuffle_down(g_res[v], 2);
+          g_res[v] += simd_shuffle_down(g_res[v], 1);
+          u_res[v] += simd_shuffle_down(u_res[v], 4);
+          u_res[v] += simd_shuffle_down(u_res[v], 2);
+          u_res[v] += simd_shuffle_down(u_res[v], 1);
+        }
+        if (k_lane == 0) {
+          for (int v = 0; v < NTOK; v++) {
+            shared_out[size_t(v) * N + row] = glm_clamped_swiglu<T>(
+                static_cast<T>(g_res[v]), static_cast<T>(u_res[v]), lim, neg_lim);
+          }
+        }
+        return;
+      }
+      constexpr int RT = TOPK;
+    #else
+      constexpr int RT = TOPK + HAS_SHARED;
+    #endif
+      const int token = z / RT;
+      const int r = z - token * RT;
+      const int out_row = (tile * NSG + int(simd_gid)) * RPS;
+      const device T* xr = x + token * K;
+
+      float g_res[RPS] = {0};
+      float u_res[RPS] = {0};
+      if (r < TOPK) {
+    #if SELECT
+        // One token: this simdgroup replays the router's selection on the
+        // biased sigmoid scores (no separate select dispatch); slot 0 / tile 0
+        // publishes the routes and routing weights for the down kernel.
+        int picked[TOPK];
+        glm_router_topk<NE, TOPK>(sel_biased, simd_lid, picked);
+        const int expert = picked[r];
+        if (z == 0 && tile == 0 && simd_gid == 0 && simd_lid == 0) {
+          float total = 0.0f;
+          float gathered[TOPK];
+          for (int q = 0; q < TOPK; q++) {
+            gathered[q] = sel_sig[picked[q]];
+            total = gathered[q] + total;
+          }
+          for (int q = 0; q < TOPK; q++) {
+            float qv = SEL_NORM ? gathered[q] / (total + 1e-20f) : gathered[q];
+            float sv = qv * sel_scaling[0];
+            sel_indices[q] = uint(picked[q]);
+            sel_scores[q] = sv;
+          }
+        }
+    #else
+        const int expert = int(indices[token * TOPK + r]);
+    #endif
+        constexpr int WB = K * RBITS / 8;   // bytes per weight row
+        constexpr int G = K / RGS;          // groups per row
+        // ESTRIDE rows per expert; a fused [gate; up] tensor (ESTRIDE = 2N) is
+        // passed as both gate and up with the up rows UP_OFF = N further on.
+        const size_t row0 = size_t(expert) * ESTRIDE + out_row;
+        const size_t urow0 = row0 + UP_OFF;
+        glm_qmv_rows<T, K, RGS, RBITS, RPS>(
+            (const device uint8_t*)gate_w + row0 * WB, gate_s + row0 * G,
+            gate_b + row0 * G, xr, simd_lid, g_res);
+        glm_qmv_rows<T, K, RGS, RBITS, RPS>(
+            (const device uint8_t*)up_w + urow0 * WB, up_s + urow0 * G,
+            up_b + urow0 * G, xr, simd_lid, u_res);
+      } else {
+    #if HAS_SHARED
+        constexpr int WB = K * SBITS / 8;
+        constexpr int G = K / SGS;
+        const size_t row0 = size_t(out_row);
+        glm_qmv_rows<T, K, SGS, SBITS, RPS>(
+            (const device uint8_t*)sh_gate_w + row0 * WB, sh_gate_s + row0 * G,
+            sh_gate_b + row0 * G, xr, simd_lid, g_res);
+        glm_qmv_rows<T, K, SGS, SBITS, RPS>(
+            (const device uint8_t*)sh_up_w + row0 * WB, sh_up_s + row0 * G,
+            sh_up_b + row0 * G, xr, simd_lid, u_res);
+    #endif
+      }
+      device T* o = out + size_t(z) * N + out_row;
+      for (int row = 0; row < RPS; row++) {
+        float gv = simd_sum(g_res[row]);
+        float uv = simd_sum(u_res[row]);
+        if (simd_lid == 0) {
+          o[row] = glm_clamped_swiglu<T>(static_cast<T>(gv), static_cast<T>(uv), lim, neg_lim);
+        }
+      }
+    """
+
+private let glm5NextMoEDownSource = """
+      const uint simd_lid = thread_index_in_simdgroup;
+      const uint simd_gid = simdgroup_index_in_threadgroup;
+    #if SLOT_MAJOR
+      // Tokens vary fastest: experts they share are read back to back.
+      const int tile = int(threadgroup_position_in_grid.z);
+      const int token = int(threadgroup_position_in_grid.y);
+    #else
+      const int tile = int(threadgroup_position_in_grid.y);
+      const int token = int(threadgroup_position_in_grid.z);
+    #endif
+      // Activation slots per token: the routed ones, then the shared expert's.
+      constexpr int RT = TOPK + HAS_SHARED;
+      const int out_row = (tile * NSG + int(simd_gid)) * RPS;
+
+      float acc[RPS] = {0};
+      constexpr int WB = K * RBITS / 8;
+      constexpr int G = K / RGS;
+      for (int r = 0; r < TOPK; r++) {
+        const int expert = int(indices[token * TOPK + r]);
+        const size_t row0 = size_t(expert) * N + out_row;
+        float res[RPS] = {0};
+        glm_qmv_rows<T, K, RGS, RBITS, RPS>(
+            (const device uint8_t*)down_w + row0 * WB, down_s + row0 * G,
+            down_b + row0 * G, act + (size_t(token) * RT + r) * K, simd_lid, res);
+        const float score = scores[token * TOPK + r];
+        for (int row = 0; row < RPS; row++) {
+          float v = simd_sum(res[row]);
+          // The reference rounds the fp32 product in its own Multiply kernel
+          // before the Sum; keep the compiler from contracting it into an FMA.
+          volatile float weighted = static_cast<float>(static_cast<T>(v)) * score;
+          acc[row] += weighted;
+        }
+      }
+    #if HAS_SHARED
+      float sres[RPS] = {0};
+      {
+        constexpr int SWB = K * SBITS / 8;
+        constexpr int SG = K / SGS;
+        const size_t row0 = size_t(out_row);
+        const device T* sh_x = act + (size_t(token) * RT + TOPK) * K;
+        glm_qmv_rows<T, K, SGS, SBITS, RPS>(
+            (const device uint8_t*)sh_down_w + row0 * SWB, sh_down_s + row0 * SG,
+            sh_down_b + row0 * SG, sh_x, simd_lid, sres);
+      }
+    #endif
+    #if SHARED_WIDE_DOWN
+      // Shared expert down projection of this token with the multi-row qmv_wide
+      // arithmetic its own [T, K] matmul uses (8 lanes per row; each token's
+      // accumulation is independent of the others).
+      {
+        static_assert(RPS == 4, "qmv_wide rows per simdgroup");
+        constexpr int SWB = K * SBITS / 8;
+        constexpr int SG = K / SGS;
+        const int k_lane = int(simd_lid) % 8;
+        const int srow = out_row + int(simd_lid) / 8;
+        float sv[1] = {0.0f};
+        glm_qmv_wide_row<T, K, SGS, SBITS, 1>(
+            (const device uint8_t*)sh_down_w + size_t(srow) * SWB, sh_down_s + srow * SG,
+            sh_down_b + srow * SG, sh_act + size_t(token) * K, 1, k_lane, sv);
+        sv[0] += simd_shuffle_down(sv[0], 4);
+        sv[0] += simd_shuffle_down(sv[0], 2);
+        sv[0] += simd_shuffle_down(sv[0], 1);
+        if (k_lane == 0) {
+          const int r = int(simd_lid) / 8;
+          float a = acc[0];
+          for (int row = 1; row < RPS; row++) {
+            a = row == r ? acc[row] : a;
+          }
+          out[size_t(token) * N + srow] = static_cast<T>(a) + static_cast<T>(sv[0]);
+        }
+      }
+      return;
+    #endif
+      device T* o = out + size_t(token) * N + out_row;
+      for (int row = 0; row < RPS; row++) {
+    #if HAS_SHARED
+        float sv = simd_sum(sres[row]);
+    #endif
+        if (simd_lid == 0) {
+    #if HAS_SHARED
+          o[row] = static_cast<T>(acc[row]) + static_cast<T>(sv);
+    #elif ADD_SHARED_Y
+          o[row] = static_cast<T>(acc[row]) + shared_y[size_t(token) * N + out_row + row];
+    #else
+          o[row] = static_cast<T>(acc[row]);
+    #endif
+        }
+      }
+    """
+
+private final class GLM5NextMoEKernels: Sendable {
+    static let shared = GLM5NextMoEKernels()
+    let gateUp: MLXFast.MLXFastKernel
+    let down: MLXFast.MLXFastKernel
+
+    private init() {
+        gateUp = MLXFast.metalKernel(
+            name: "glm5next_moe_gate_up_select",
+            inputNames: [
+                "x", "sel_sig", "sel_biased", "sel_scaling", "limit", "gate_w", "gate_s",
+                "gate_b", "up_w", "up_s", "up_b", "sh_gate_w", "sh_gate_s", "sh_gate_b",
+                "sh_up_w", "sh_up_s", "sh_up_b",
+            ],
+            outputNames: ["out", "sel_indices", "sel_scores"],
+            source: "#define HAS_SHARED 1\n#define SHARED_WIDE 0\n#define SLOT_MAJOR 0\n#define SELECT 1\n" + glm5NextMoEGateUpSource,
+            header: glm5NextQMVHeader)
+        down = MLXFast.metalKernel(
+            name: "glm5next_moe_down_combine",
+            inputNames: [
+                "act", "indices", "scores", "down_w", "down_s", "down_b", "sh_down_w",
+                "sh_down_s", "sh_down_b",
+            ],
+            outputNames: ["out"],
+            source: "#define HAS_SHARED 1\n#define ADD_SHARED_Y 0\n#define SLOT_MAJOR 0\n#define SHARED_WIDE_DOWN 0\n" + glm5NextMoEDownSource,
+            header: glm5NextQMVHeader)
+    }
+}
+
+/// An affine quantized projection's `(weight, scales, biases, bits, groupSize)`.
+struct GLM5NextAffine {
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray
+    let bits: Int
+    let groupSize: Int
+}
+
+/// MLX's qmv_fast tiles for these kernels: full 8-row output tiles and whole
+/// 32-lane K blocks.
+private func glm5NextQMVFastCovered(bits: Int, groupSize: Int, n: Int, k: Int) -> Bool {
+    guard [3, 4, 5, 6, 8].contains(bits), [32, 64, 128].contains(groupSize) else { return false }
+    let packFactor = (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : 32 / bits)
+    let valuesPerThread = packFactor * 2
+    return groupSize % valuesPerThread == 0 && n % 8 == 0 && k % (valuesPerThread * 32) == 0
+}
+
+/// One token's routed + shared experts: router logits (`glm5NextRouterLogits`
+/// outputs `sig`, `biased`) to the combined output `[1, K]`, or `nil` when
+/// the shapes are not covered.
+func glm5NextMoEExperts(
+    _ x: MLXArray, sig: MLXArray, biased: MLXArray, topK: Int, scaling: Float,
+    normalize: Bool, limit: Float,
+    gate: GLM5NextAffine, up: GLM5NextAffine, down: GLM5NextAffine,
+    sharedGate: GLM5NextAffine, sharedUp: GLM5NextAffine, sharedDown: GLM5NextAffine
+) -> MLXArray? {
+    let rps = 4
+    let nsg = 2
+    guard x.ndim == 2, x.dim(0) == 1, [.bfloat16, .float16].contains(x.dtype),
+        sig.dtype == .float32, biased.dtype == .float32, sig.ndim == 2, sig.dim(0) == 1,
+        biased.shape == sig.shape, sig.dim(1) <= 1024, (1 ... 32).contains(topK),
+        gate.weight.ndim == 3, gate.weight.shape == up.weight.shape,
+        (gate.bits, gate.groupSize) == (up.bits, up.groupSize),
+        (sharedGate.bits, sharedGate.groupSize) == (sharedUp.bits, sharedUp.groupSize),
+        down.weight.ndim == 3
+    else { return nil }
+    let K = x.dim(1)
+    let N = gate.weight.dim(1)
+    let experts = sig.dim(1)
+    let dtype = x.dtype
+    for p in [gate, up, down, sharedGate, sharedUp, sharedDown]
+    where p.scales.dtype != dtype || p.biases.dtype != dtype {
+        return nil
+    }
+    guard gate.weight.dim(0) >= experts, down.weight.dim(1) == K, down.weight.dim(0) >= experts,
+        sharedGate.weight.dim(0) == N, sharedUp.weight.dim(0) == N, sharedDown.weight.dim(0) == K,
+        gate.weight.dim(2) * 32 / gate.bits == K, sharedGate.weight.dim(1) * 32 / sharedGate.bits == K,
+        down.weight.dim(2) * 32 / down.bits == N, sharedDown.weight.dim(1) * 32 / sharedDown.bits == N,
+        glm5NextQMVFastCovered(bits: gate.bits, groupSize: gate.groupSize, n: N, k: K),
+        glm5NextQMVFastCovered(bits: sharedGate.bits, groupSize: sharedGate.groupSize, n: N, k: K),
+        glm5NextQMVFastCovered(bits: down.bits, groupSize: down.groupSize, n: K, k: N),
+        glm5NextQMVFastCovered(bits: sharedDown.bits, groupSize: sharedDown.groupSize, n: K, k: N),
+        N % (rps * nsg) == 0, K % (rps * nsg) == 0
+    else { return nil }
+
+    let kernels = GLM5NextMoEKernels.shared
+    let slots = topK + 1
+    let selected = kernels.gateUp(
+        [x, sig, biased, MLXArray([scaling]), MLXArray([limit]),
+         gate.weight, gate.scales, gate.biases, up.weight, up.scales, up.biases,
+         sharedGate.weight, sharedGate.scales, sharedGate.biases,
+         sharedUp.weight, sharedUp.scales, sharedUp.biases],
+        template: [
+            ("T", dtype), ("K", K), ("N", N), ("TOPK", topK), ("RBITS", gate.bits),
+            ("RGS", gate.groupSize), ("RPS", rps), ("NSG", nsg), ("ESTRIDE", N), ("UP_OFF", 0),
+            ("NE", experts), ("SEL_NORM", normalize && topK > 1),
+            ("SBITS", sharedGate.bits), ("SGS", sharedGate.groupSize),
+        ],
+        grid: (32, (N / (rps * nsg)) * nsg, slots),
+        threadGroup: (32, nsg, 1),
+        outputShapes: [[1, slots, N], [1, topK], [1, topK]],
+        outputDTypes: [dtype, .uint32, .float32])
+    return kernels.down(
+        [selected[0], selected[1], selected[2], down.weight, down.scales, down.biases,
+         sharedDown.weight, sharedDown.scales, sharedDown.biases],
+        template: [
+            ("T", dtype), ("K", N), ("N", K), ("TOPK", topK), ("RBITS", down.bits),
+            ("RGS", down.groupSize), ("RPS", rps), ("NSG", nsg),
+            ("SBITS", sharedDown.bits), ("SGS", sharedDown.groupSize),
+        ],
+        grid: (32, (K / (rps * nsg)) * nsg, 1),
+        threadGroup: (32, nsg, 1),
+        outputShapes: [[1, K]],
+        outputDTypes: [dtype])[0]
 }
