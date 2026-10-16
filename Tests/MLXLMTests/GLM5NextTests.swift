@@ -571,6 +571,77 @@ final class GLM5NextTests: XCTestCase {
                 bias: gate.eScoreCorrectionBias, topK: 8, scaling: 2.5, normalize: true))
     }
 
+    /// The quantized KDA decode (`glm5NextMultiQMV` for q, k, v, f_a, g_a and
+    /// b grouped by bit width, f_b / g_b rows inside the KDA kernel) is bitwise
+    /// equal to the op path for the artifact's 8-bit and 5-bit layers, mixed
+    /// widths in one layer, and 4-bit.
+    func testQuantizedFusedKDADecodeMatchesOpPathBitwise() throws {
+        var json = textConfigJSON(linearHeadDim: 128)
+        json = json.replacingOccurrences(of: #""hidden_size": 64"#, with: #""hidden_size": 512"#)
+        json = json.replacingOccurrences(
+            of: #""linear_attn_config": {"num_heads": 2"#, with: #""linear_attn_config": {"num_heads": 8"#)
+        let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+        XCTAssertEqual(config.linearNumHeads, 8)
+        let cases: [(String, (String) -> Int)] = [
+            ("8-bit", { _ in 8 }),
+            ("5-bit", { _ in 5 }),
+            ("4-bit", { _ in 4 }),
+            ("mixed", { path in path.hasPrefix("q_proj") || path.hasPrefix("v_proj") ? 5 : 8 }),
+        ]
+        for (name, bits) in cases {
+            let attention = GLM5NextLinearAttention(config)
+            randomize(attention, seed: 91)
+            castToBFloat16(attention)
+            quantize(model: attention) { path, module in
+                guard module is Linear else { return nil }
+                return (64, bits(path), .affine)
+            }
+            eval(attention)
+            attention.train(false)
+            XCTAssertTrue(attention.qProj is QuantizedLinear, name)
+            let input = withRandomState(MLXRandom.RandomState(seed: 93)) {
+                MLXRandom.normal([1, 12, 512]).asType(.bfloat16)
+            }
+            let fusedCache = MambaCache()
+            let opCache = MambaCache()
+            var start = 0
+            for width in [1, 1, 1, 6, 1, 1, 1] {
+                let x = input[0..., start ..< (start + width)]
+                attention.fusedDecode = true
+                let fused = attention(x, cache: fusedCache)
+                attention.fusedDecode = false
+                let reference = attention(x, cache: opCache)
+                attention.fusedDecode = true
+                assertBitwiseEqual(fused, reference, "\(name) output at token \(start)")
+                assertBitwiseEqual(fusedCache[0], opCache[0], "\(name) conv state at \(start)")
+                assertBitwiseEqual(fusedCache[1], opCache[1], "\(name) state at \(start)")
+                start += width
+            }
+            let x = input[0..., ..<1].reshaped(1, 512)
+            let parts = [
+                attention.qProj, attention.kProj, attention.vProj,
+                attention.forgetGate.fAProj, attention.gAProj, attention.bProj,
+            ].compactMap { glm5NextAffine($0) }
+            XCTAssertEqual(parts.count, 6, name)
+            if name != "mixed" {
+                XCTAssertNotNil(glm5NextMultiQMV(x, parts), "\(name): one multi-qmv dispatch")
+            }
+            let x3 = x.reshaped(1, 1, 512)
+            XCTAssertNotNil(
+                glm5NextKDADecodeStep(
+                    q: attention.qProj(x3), k: attention.kProj(x3), v: attention.vProj(x3),
+                    fa: attention.forgetGate.fAProj(x3), ga: attention.gAProj(x3),
+                    fb: try XCTUnwrap(glm5NextAffine(attention.forgetGate.fBProj)),
+                    gb: try XCTUnwrap(glm5NextAffine(attention.gBProj)),
+                    bRaw: attention.bProj(x3), convState: fusedCache[0]!,
+                    convWeight: attention.conv1d.weight, aLog: attention.forgetGate.aLog,
+                    dtBias: attention.forgetGate.dtBias, normWeight: attention.oNorm.weight,
+                    state: fusedCache[1]!, heads: attention.numHeads, headDim: attention.headDim,
+                    lowerBound: attention.forgetGate.lowerBound!, normEps: attention.oNorm.eps),
+                "\(name): gate rows run inside the KDA kernel")
+        }
+    }
+
     /// End to end: decode logits with the fused KDA step equal the op path's.
     func testFusedDecodeKeepsModelLogitsBitwise() throws {
         let model = GLM5NextTextModel(try configuration(indexTopk: 8, linearHeadDim: 128))

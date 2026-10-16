@@ -65,6 +65,15 @@ private let glm5NextKDASource = """
       threadgroup T ys[TOK][DK];
       threadgroup float gs[TOK][DK];
       threadgroup T betas[TOK];
+    #if GATE_ROWS
+      threadgroup T as_[TOK][DK];
+      threadgroup T gates[TOK][DK];
+    #define A_PRE(t, i) as_[t][i]
+    #define GATE_PRE(t, c) gates[t][c]
+    #else
+    #define A_PRE(t, i) a_pre[(t) * QKV + h * DK + (i)]
+    #define GATE_PRE(t, c) gate_pre[(t) * QKV + h * DK + (c)]
+    #endif
 
       // 1. Short conv over [conv_state; q|k|v] and SiLU.
       if (tid < uint(3 * DK)) {
@@ -101,12 +110,83 @@ private let glm5NextKDASource = """
         }
       }
 
+    #if GATE_ROWS && GATE5
+      // One token, 5-bit K = 128 gate rows: MLX's qmv (qmv_impl): lanes 0..15
+      // load 8 values each, lanes 16..31 add nothing, one simd_sum per row.
+      {
+        static_assert(TOK == 1 && DK == 128, "5-bit gate rows: one token");
+        constexpr int WBYTES = 128 * 5 / 8;
+        constexpr int G = 128 / GS;
+        for (int rr = 0; rr < (2 * DK) / 32; rr++) {
+          const int q = int(sg) * ((2 * DK) / 32) + rr;
+          const int which = q / DK;
+          const int i = q % DK;
+          const int row = h * DK + i;
+          float result = 0;
+          if (lane < 16u) {
+            const device T* xin = (which == 0 ? fa_in : ga_in) + int(lane) * 8;
+            float x_thread[8];
+            float sum = glm_load_vector<T, 8, 5>(xin, x_thread);
+            const device uint8_t* wl = (const device uint8_t*)(which == 0 ? fb_w : gb_w)
+                + size_t(row) * WBYTES + int(lane) * 5;
+            const device T* sl = (which == 0 ? fb_s : gb_s) + row * G + int(lane) / (GS / 8);
+            const device T* bl = (which == 0 ? fb_b : gb_b) + row * G + int(lane) / (GS / 8);
+            const float s = sl[0];
+            const float b = bl[0];
+            result += glm_qdot<8, 5>(wl, x_thread, s, b, sum);
+          }
+          result = simd_sum(result);
+          if (lane == 0) {
+            if (which == 0) {
+              as_[0][i] = static_cast<T>(result);
+            } else {
+              gates[0][i] = static_cast<T>(result);
+            }
+          }
+        }
+      }
+    #elif GATE_ROWS
+      // 4/8-bit K = 128 gate rows: MLX's qmv_quad (one quad of lanes per row).
+      {
+        constexpr int VPT = 32;
+        constexpr int WBYTES = 128 * BITS / 8;
+        constexpr int G = 128 / GS;
+        const int quad = int(tid) / 4;
+        const int ql = int(tid) % 4;
+        const int which = quad / DK;
+        const int i = quad % DK;
+        const int row = h * DK + i;
+        const device uint8_t* wl = (const device uint8_t*)(which == 0 ? fb_w : gb_w)
+            + size_t(row) * WBYTES + ql * (VPT * BITS / 8);
+        const device T* sl = (which == 0 ? fb_s : gb_s) + row * G + ql / (GS / VPT);
+        const device T* bl = (which == 0 ? fb_b : gb_b) + row * G + ql / (GS / VPT);
+        const float s = sl[0];
+        const float b = bl[0];
+        for (int t = 0; t < TOK; t++) {
+          const device T* xin = (which == 0 ? fa_in : ga_in) + t * DK + ql * VPT;
+          float x_thread[VPT];
+          float sum = glm_load_vector<T, VPT, BITS>(xin, x_thread);
+          float result = 0;
+          result += glm_qdot<VPT, BITS>(wl, x_thread, s, b, sum);
+          result = quad_sum(result);
+          if (ql == 0) {
+            if (which == 0) {
+              as_[t][i] = static_cast<T>(result);
+            } else {
+              gates[t][i] = static_cast<T>(result);
+            }
+          }
+        }
+      }
+    #endif
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
       // 3b. g = exp(lower * sigmoid(exp(A_log) * (a + dt_bias))), beta.
       if (tid < uint(TOK * DK)) {
         const int t = int(tid) / DK;
         const int i = int(tid) % DK;
         float ea = metal::precise::exp(a_log[h]);
-        float af = static_cast<float>(a_pre[t * QKV + h * DK + i]);
+        float af = static_cast<float>(A_PRE(t, i));
         float s1 = af + dt_bias[h * DK + i];
         float s2 = ea * s1;
         float s3 = glm_sigmoid<float>(s2);
@@ -116,7 +196,6 @@ private let glm5NextKDASource = """
       if (tid < uint(TOK)) {
         betas[tid] = glm_sigmoid<T>(b_in[tid * H + h]);
       }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
 
       // 2. l2norm(q) * q_scale, l2norm(k): x * rsqrt(sum(x * x) + eps) in fp32.
       if (sg < uint(2 * TOK)) {
@@ -202,28 +281,47 @@ private let glm5NextKDASource = """
           float xn = x[e] * r;
           float wf = static_cast<float>(norm_w[c]);
           float wx = wf * xn;
-          float gf = static_cast<float>(gate_pre[t * QKV + h * DK + c]);
+          float gf = static_cast<float>(GATE_PRE(t, c));
           float gsg = glm_sigmoid<float>(gf);
           float o = wx * gsg;
           y[t * QKV + h * DK + c] = static_cast<T>(o);
         }
       }
+    #undef A_PRE
+    #undef GATE_PRE
     """
 
 private final class GLM5NextKDAKernel: Sendable {
     static let shared = GLM5NextKDAKernel()
-    let kernel: MLXFast.MLXFastKernel
+    /// Gate projections precomputed (`a_pre`, `gate_pre` inputs).
+    let precomputed: MLXFast.MLXFastKernel
+    /// Gate rows computed in the kernel: 4/8-bit (qmv_quad) and 5-bit (qmv).
+    let quadGates: MLXFast.MLXFastKernel
+    let fiveBitGates: MLXFast.MLXFastKernel
+
+    private static let common = [
+        "q_in", "k_in", "v_in", "b_in", "conv_state", "conv_w", "a_log", "dt_bias", "norm_w",
+        "state_in", "consts",
+    ]
+    private static let gateRows = ["fa_in", "ga_in", "fb_w", "fb_s", "fb_b", "gb_w", "gb_s", "gb_b"]
 
     private init() {
-        kernel = MLXFast.metalKernel(
-            name: "glm5next_kda_decode",
-            inputNames: [
-                "q_in", "k_in", "v_in", "a_pre", "gate_pre", "b_in", "conv_state", "conv_w",
-                "a_log", "dt_bias", "norm_w", "state_in", "consts",
-            ],
-            outputNames: ["y", "conv_state_out", "state_out"],
-            source: glm5NextKDASource,
-            header: glm5NextKernelHeader)
+        func make(_ name: String, _ inputs: [String], _ defines: String) -> MLXFast.MLXFastKernel {
+            MLXFast.metalKernel(
+                name: name, inputNames: inputs,
+                outputNames: ["y", "conv_state_out", "state_out"],
+                source: defines + glm5NextKDASource,
+                header: glm5NextQMVHeader)
+        }
+        precomputed = make(
+            "glm5next_kda_decode", Self.common + ["a_pre", "gate_pre"],
+            "#define GATE_ROWS 0\n#define GATE5 0\n")
+        quadGates = make(
+            "glm5next_kda_decode_gates", Self.common + Self.gateRows,
+            "#define GATE_ROWS 1\n#define GATE5 0\n")
+        fiveBitGates = make(
+            "glm5next_kda_decode_gates5", Self.common + Self.gateRows,
+            "#define GATE_ROWS 1\n#define GATE5 1\n")
     }
 }
 
@@ -264,17 +362,168 @@ func glm5NextKDADecodeStep(
     let consts = MLXArray(
         [Float(pow(Double(headDim), -0.5)), l2Eps, normEps, lowerBound,
          Float(1.0 / Double(headDim))])
-    let outputs = GLM5NextKDAKernel.shared.kernel(
-        [q, k, v, aPre, gatePre, bRaw, convState, convWeight, aLog.reshaped(-1),
-         dtBias.reshaped(-1), normWeight, state, consts],
+    let outputs = GLM5NextKDAKernel.shared.precomputed(
+        [q, k, v, bRaw, convState, convWeight, aLog.reshaped(-1), dtBias.reshaped(-1),
+         normWeight, state, consts, aPre, gatePre],
         template: [
             ("T", dtype), ("TOK", T), ("DK", headDim), ("QKV", qkv), ("H", heads),
+            ("BITS", 8), ("GS", 64),
         ],
         grid: (1024 * heads, 1, 1),
         threadGroup: (1024, 1, 1),
         outputShapes: [[1, T, qkv], [1, 3, 3 * qkv], [1, heads, headDim, headDim]],
         outputDTypes: [dtype, dtype, .float32])
     return (outputs[0], outputs[1], outputs[2])
+}
+
+/// `glm5NextKDADecodeStep` with the low-rank gate projections' second
+/// halves (`f_b`, `g_b`, K = head_dim = 128) computed in the kernel from
+/// `fa`/`ga` (`[1, T, 128]`): MLX's qmv_quad rows for 4/8 bits, its qmv rows
+/// for 5 bits and one token. `nil` when not covered.
+func glm5NextKDADecodeStep(
+    q: MLXArray, k: MLXArray, v: MLXArray, fa: MLXArray, ga: MLXArray,
+    fb: GLM5NextAffine, gb: GLM5NextAffine, bRaw: MLXArray,
+    convState: MLXArray, convWeight: MLXArray,
+    aLog: MLXArray, dtBias: MLXArray, normWeight: MLXArray, state: MLXArray,
+    heads: Int, headDim: Int, lowerBound: Float, normEps: Float, l2Eps: Float = 1e-6
+) -> (y: MLXArray, convState: MLXArray, state: MLXArray)? {
+    let dtype = q.dtype
+    guard dtype == .bfloat16 || dtype == .float16, headDim == 128, heads >= 1,
+        q.ndim == 3, q.dim(0) == 1, (1 ... 8).contains(q.dim(1))
+    else { return nil }
+    let T = q.dim(1)
+    let qkv = heads * headDim
+    for part in [q, k, v] where part.shape != [1, T, qkv] || part.dtype != dtype {
+        return nil
+    }
+    for part in [fa, ga] where part.shape != [1, T, headDim] || part.dtype != dtype {
+        return nil
+    }
+    guard (fb.bits, fb.groupSize) == (gb.bits, gb.groupSize), [32, 64, 128].contains(fb.groupSize),
+        fb.bits == 4 || fb.bits == 8 || (fb.bits == 5 && T == 1),
+        fb.weight.shape == [qkv, 128 * fb.bits / 32], gb.weight.shape == fb.weight.shape,
+        fb.scales.dtype == dtype, gb.scales.dtype == dtype,
+        fb.biases.dtype == dtype, gb.biases.dtype == dtype,
+        bRaw.shape == [1, T, heads], bRaw.dtype == dtype,
+        convState.shape == [1, 3, 3 * qkv], convState.dtype == dtype,
+        convWeight.shape == [3 * qkv, 4, 1], convWeight.dtype == dtype,
+        aLog.size == heads, aLog.dtype == .float32,
+        dtBias.size == qkv, dtBias.dtype == .float32,
+        normWeight.shape == [headDim],
+        state.shape == [1, heads, headDim, headDim], state.dtype == .float32
+    else { return nil }
+    let consts = MLXArray(
+        [Float(pow(Double(headDim), -0.5)), l2Eps, normEps, lowerBound,
+         Float(1.0 / Double(headDim))])
+    let kernels = GLM5NextKDAKernel.shared
+    let kernel = fb.bits == 5 ? kernels.fiveBitGates : kernels.quadGates
+    let outputs = kernel(
+        [q, k, v, bRaw, convState, convWeight, aLog.reshaped(-1), dtBias.reshaped(-1),
+         normWeight, state, consts, fa, ga, fb.weight, fb.scales, fb.biases,
+         gb.weight, gb.scales, gb.biases],
+        template: [
+            ("T", dtype), ("TOK", T), ("DK", headDim), ("QKV", qkv), ("H", heads),
+            ("BITS", fb.bits), ("GS", fb.groupSize),
+        ],
+        grid: (1024 * heads, 1, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [[1, T, qkv], [1, 3, 3 * qkv], [1, heads, headDim, headDim]],
+        outputDTypes: [dtype, dtype, .float32])
+    return (outputs[0], outputs[1], outputs[2])
+}
+
+// MARK: - Multi-projection qmv (one token)
+
+/// `[linear(x) for linear in parts]` for up to six affine projections with
+/// the same bits and group size, one dispatch: each output row with MLX's
+/// qmv_fast arithmetic (oMLX `multi_qmv`, extended to six parts).
+private let glm5NextMultiQMVSource = """
+      const uint lane = thread_index_in_simdgroup;
+      const int sg = int(simdgroup_index_in_threadgroup);
+      const int row0 = int(threadgroup_position_in_grid.x) * 8;
+      constexpr int WB = K * BITS / 8;
+      constexpr int G = K / GS;
+      const device uint8_t* w = (const device uint8_t*)w0;
+      const device T* sc = s0;
+      const device T* bi = b0;
+      device T* y = y0;
+      int local = row0;
+    #if NP > 1
+      if (row0 >= N0) { w = (const device uint8_t*)w1; sc = s1; bi = b1; y = y1; local = row0 - N0; }
+    #endif
+    #if NP > 2
+      if (row0 >= N0 + N1) { w = (const device uint8_t*)w2; sc = s2; bi = b2; y = y2; local = row0 - N0 - N1; }
+    #endif
+    #if NP > 3
+      if (row0 >= N0 + N1 + N2) { w = (const device uint8_t*)w3; sc = s3; bi = b3; y = y3; local = row0 - N0 - N1 - N2; }
+    #endif
+    #if NP > 4
+      if (row0 >= N0 + N1 + N2 + N3) { w = (const device uint8_t*)w4; sc = s4; bi = b4; y = y4; local = row0 - N0 - N1 - N2 - N3; }
+    #endif
+    #if NP > 5
+      if (row0 >= N0 + N1 + N2 + N3 + N4) { w = (const device uint8_t*)w5; sc = s5; bi = b5; y = y5; local = row0 - N0 - N1 - N2 - N3 - N4; }
+    #endif
+      const int r0 = local + sg * 4;
+      float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+      glm_qmv_rows<T, K, GS, BITS, 4>(
+          w + size_t(r0) * WB, sc + r0 * G, bi + r0 * G, x, lane, result);
+      for (int r = 0; r < 4; r++) {
+        float v = simd_sum(result[r]);
+        if (lane == 0) {
+          y[r0 + r] = static_cast<T>(v);
+        }
+      }
+    """
+
+private final class GLM5NextMultiQMVKernels: @unchecked Sendable {
+    static let shared = GLM5NextMultiQMVKernels()
+    private let lock = NSLock()
+    private var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+
+    func kernel(parts: Int) -> MLXFast.MLXFastKernel {
+        lock.lock()
+        defer { lock.unlock() }
+        if let kernel = kernels[parts] { return kernel }
+        let inputs = ["x"] + (0 ..< parts).flatMap { ["w\($0)", "s\($0)", "b\($0)"] }
+        let kernel = MLXFast.metalKernel(
+            name: "glm5next_multi_qmv_p\(parts)", inputNames: inputs,
+            outputNames: (0 ..< parts).map { "y\($0)" },
+            source: "#define NP \(parts)\n" + glm5NextMultiQMVSource + "\n#undef NP\n",
+            header: glm5NextQMVHeader)
+        kernels[parts] = kernel
+        return kernel
+    }
+}
+
+/// One-token outputs `[1, N_i]` of up to six projections sharing bits and
+/// group size, or `nil` when not covered.
+func glm5NextMultiQMV(_ x: MLXArray, _ parts: [GLM5NextAffine]) -> [MLXArray]? {
+    guard x.ndim == 2, x.dim(0) == 1, [.bfloat16, .float16].contains(x.dtype),
+        (1 ... 6).contains(parts.count)
+    else { return nil }
+    let K = x.dim(1)
+    let (bits, groupSize) = (parts[0].bits, parts[0].groupSize)
+    var rows = [Int]()
+    for p in parts {
+        guard (p.bits, p.groupSize) == (bits, groupSize), p.weight.ndim == 2,
+            p.weight.dim(1) * 32 / bits == K, p.scales.dtype == x.dtype, p.biases.dtype == x.dtype,
+            glm5NextQMVFastCovered(bits: bits, groupSize: groupSize, n: p.weight.dim(0), k: K)
+        else { return nil }
+        rows.append(p.weight.dim(0))
+    }
+    var template: [(String, any KernelTemplateArg)] = [
+        ("T", x.dtype), ("K", K), ("BITS", bits), ("GS", groupSize),
+    ]
+    for i in 0 ..< 5 {
+        template.append(("N\(i)", i < rows.count ? rows[i] : 0))
+    }
+    return GLM5NextMultiQMVKernels.shared.kernel(parts: parts.count)(
+        [x] + parts.flatMap { [$0.weight, $0.scales, $0.biases] },
+        template: template,
+        grid: (64 * (rows.reduce(0, +) / 8), 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: rows.map { [1, $0] },
+        outputDTypes: Array(repeating: x.dtype, count: rows.count))
 }
 
 // MARK: - Hyper-connection decode (mix GEMV, Sinkhorn + collapse + RMSNorm)

@@ -172,6 +172,27 @@ final class GLM5NextHyperConnection: Module {
     }
 }
 
+/// An affine quantized projection's parts for the fused decode kernels.
+func glm5NextAffine(_ module: Module) -> GLM5NextAffine? {
+    switch module {
+    case let switchLinear as QuantizedSwitchLinear:
+        let parts = switchLinear.quantizedParts
+        guard switchLinear.mode == .affine, parts.bias == nil, let biases = parts.biases
+        else { return nil }
+        return GLM5NextAffine(
+            weight: parts.weight, scales: parts.scales, biases: biases,
+            bits: switchLinear.bits, groupSize: switchLinear.groupSize)
+    case let linear as QuantizedLinear:
+        guard linear.mode == .affine, linear.bias == nil, let biases = linear.biases
+        else { return nil }
+        return GLM5NextAffine(
+            weight: linear.weight, scales: linear.scales, biases: biases,
+            bits: linear.bits, groupSize: linear.groupSize)
+    default:
+        return nil
+    }
+}
+
 // MARK: - Feed-forward
 
 final class GLM5NextMLP: Module, UnaryLayer {
@@ -309,12 +330,12 @@ final class GLM5NextMoE: Module, UnaryLayer {
         else { return nil }
         let x2 = x.reshaped(1, x.dim(-1))
         guard glm5NextMoERouterCovered(x2, weight: gate.weight, bias: gate.eScoreCorrectionBias),
-            let gateParts = Self.affine(switchMLP.gateProjection),
-            let upParts = Self.affine(switchMLP.upProjection),
-            let downParts = Self.affine(switchMLP.downProjection),
-            let sharedGate = Self.affine(sharedExperts.gateProj),
-            let sharedUp = Self.affine(sharedExperts.upProj),
-            let sharedDown = Self.affine(sharedExperts.downProj)
+            let gateParts = glm5NextAffine(switchMLP.gateProjection),
+            let upParts = glm5NextAffine(switchMLP.upProjection),
+            let downParts = glm5NextAffine(switchMLP.downProjection),
+            let sharedGate = glm5NextAffine(sharedExperts.gateProj),
+            let sharedUp = glm5NextAffine(sharedExperts.upProj),
+            let sharedDown = glm5NextAffine(sharedExperts.downProj)
         else { return nil }
         let (sig, biased) = glm5NextRouterLogits(
             x2, weight: gate.weight, bias: gate.eScoreCorrectionBias)
@@ -326,25 +347,6 @@ final class GLM5NextMoE: Module, UnaryLayer {
         )?.reshaped(x.shape)
     }
 
-    private static func affine(_ module: Module) -> GLM5NextAffine? {
-        switch module {
-        case let switchLinear as QuantizedSwitchLinear:
-            let parts = switchLinear.quantizedParts
-            guard switchLinear.mode == .affine, parts.bias == nil, let biases = parts.biases
-            else { return nil }
-            return GLM5NextAffine(
-                weight: parts.weight, scales: parts.scales, biases: biases,
-                bits: switchLinear.bits, groupSize: switchLinear.groupSize)
-        case let linear as QuantizedLinear:
-            guard linear.mode == .affine, linear.bias == nil, let biases = linear.biases
-            else { return nil }
-            return GLM5NextAffine(
-                weight: linear.weight, scales: linear.scales, biases: biases,
-                bits: linear.bits, groupSize: linear.groupSize)
-        default:
-            return nil
-        }
-    }
 }
 
 // MARK: - Kimi Delta Attention (linear layers)
@@ -504,6 +506,35 @@ final class GLM5NextLinearAttention: Module {
         return oProj(oNorm(out, gate: gate).reshaped(B, L, -1))
     }
 
+    /// One token's q, k, v, f_a, g_a and b projections `[1, 1, N]`, one
+    /// `glm5NextMultiQMV` dispatch per (bits, group size); a group the kernel
+    /// does not cover runs its modules. `nil` unless every module is affine.
+    private func inputProjections(_ x: MLXArray) -> [MLXArray]? {
+        let modules: [Module] = [qProj, kProj, vProj, forgetGate.fAProj, gAProj, bProj]
+        let parts = modules.compactMap(glm5NextAffine)
+        guard parts.count == modules.count else { return nil }
+        let x2 = x.reshaped(1, x.dim(-1))
+        var outputs = [MLXArray?](repeating: nil, count: modules.count)
+        var groups: [[Int]] = []
+        for i in parts.indices {
+            if let g = groups.firstIndex(where: {
+                (parts[$0[0]].bits, parts[$0[0]].groupSize) == (parts[i].bits, parts[i].groupSize)
+            }) {
+                groups[g].append(i)
+            } else {
+                groups.append([i])
+            }
+        }
+        for group in groups {
+            if let ys = glm5NextMultiQMV(x2, group.map { parts[$0] }) {
+                for (i, y) in zip(group, ys) { outputs[i] = y.reshaped(1, 1, -1) }
+            } else {
+                for i in group { outputs[i] = (modules[i] as! UnaryLayer)(x) }
+            }
+        }
+        return outputs.map { $0! }
+    }
+
     private func fusedDecodeStep(_ x: MLXArray, cache: MambaCache) -> MLXArray? {
         guard let lowerBound = forgetGate.lowerBound else { return nil }
         let L = x.dim(1)
@@ -511,15 +542,29 @@ final class GLM5NextLinearAttention: Module {
             cache[0] ?? MLXArray.zeros([1, convKernelSize - 1, 3 * projectionDim], dtype: x.dtype)
         let state =
             cache[1] ?? MLXArray.zeros([1, numHeads, headDim, headDim], dtype: .float32)
-        guard convKernelSize == 4,
-            let fused = glm5NextKDADecodeStep(
+        guard convKernelSize == 4 else { return nil }
+        let fused: (y: MLXArray, convState: MLXArray, state: MLXArray)?
+        if L == 1, let projected = inputProjections(x),
+            let fb = glm5NextAffine(forgetGate.fBProj), let gb = glm5NextAffine(gBProj),
+            let step = glm5NextKDADecodeStep(
+                q: projected[0], k: projected[1], v: projected[2], fa: projected[3],
+                ga: projected[4], fb: fb, gb: gb, bRaw: projected[5],
+                convState: convState, convWeight: self.conv1d.weight,
+                aLog: forgetGate.aLog, dtBias: forgetGate.dtBias, normWeight: oNorm.weight,
+                state: state, heads: numHeads, headDim: headDim,
+                lowerBound: lowerBound, normEps: oNorm.eps)
+        {
+            fused = step
+        } else {
+            fused = glm5NextKDADecodeStep(
                 q: qProj(x), k: kProj(x), v: vProj(x),
                 aPre: forgetGate.project(x), gatePre: gBProj(gAProj(x)), bRaw: bProj(x),
                 convState: convState, convWeight: self.conv1d.weight,
                 aLog: forgetGate.aLog, dtBias: forgetGate.dtBias, normWeight: oNorm.weight,
                 state: state, heads: numHeads, headDim: headDim,
                 lowerBound: lowerBound, normEps: oNorm.eps)
-        else { return nil }
+        }
+        guard let fused else { return nil }
         cache[0] = fused.convState
         cache[1] = fused.state
         cache.advance(L)
