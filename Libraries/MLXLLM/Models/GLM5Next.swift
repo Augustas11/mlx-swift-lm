@@ -152,6 +152,13 @@ final class GLM5NextMoEGate: Module {
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray
 
     private let select: @Sendable (MLXArray, MLXArray) -> (MLXArray, MLXArray)
+    let topK: Int
+    let nGroup: Int
+    let scaling: Float
+    let normalize: Bool
+
+    /// Up to 8 one-sequence tokens route with `glm5NextMoERouter` (two kernels).
+    var fusedDecode = true
 
     init(_ config: GLM5NextConfiguration) {
         let experts = config.nRoutedExperts
@@ -163,6 +170,10 @@ final class GLM5NextMoEGate: Module {
         let topkGroup = config.topkGroup
         let scaling = config.routedScalingFactor
         let normalize = config.normTopkProb
+        self.topK = topK
+        self.nGroup = nGroup
+        self.scaling = scaling
+        self.normalize = normalize
         self.select = compile { logits, bias in
             let scores = sigmoid(logits.asType(.float32))
             var choice = scores + bias
@@ -193,6 +204,15 @@ final class GLM5NextMoEGate: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        let rows = x.shape.dropLast().reduce(1, *)
+        if fusedDecode, !training, nGroup <= 1, rows <= 8,
+            let (indices, scores) = glm5NextMoERouter(
+                x.reshaped(rows, x.dim(-1)), weight: weight, bias: eScoreCorrectionBias,
+                topK: topK, scaling: scaling, normalize: normalize)
+        {
+            let shape = Array(x.shape.dropLast()) + [topK]
+            return (indices.reshaped(shape), scores.reshaped(shape))
+        }
         let logits = matmul(x.asType(.float32), weight.asType(.float32).T)
         return select(logits, eScoreCorrectionBias)
     }

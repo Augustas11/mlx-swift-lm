@@ -388,6 +388,52 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
+    /// `glm5NextMoERouter` reproduces the router op path bit for bit: the
+    /// selected experts in argPartition's order (ties to the lower expert),
+    /// and the normalized, scaled scores.
+    func testFusedMoERouterMatchesOpPathBitwise() throws {
+        var json = textConfigJSON()
+        for (from, to) in [
+            (#""hidden_size": 64"#, #""hidden_size": 512"#),
+            (#""n_routed_experts": 4"#, #""n_routed_experts": 64"#),
+            (#""num_experts_per_tok": 2"#, #""num_experts_per_tok": 8"#),
+        ] {
+            json = json.replacingOccurrences(of: from, with: to)
+        }
+        let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+        let gate = GLM5NextMoEGate(config)
+        var weight = withRandomState(MLXRandom.RandomState(seed: 41)) {
+            0.05 * MLXRandom.normal([64, 512])
+        }
+        var bias = withRandomState(MLXRandom.RandomState(seed: 42)) {
+            0.01 * MLXRandom.normal([64])
+        }
+        // Experts 9 and 3 tie exactly with 40 and 17: the lower index must win.
+        weight[40] = weight[9]
+        weight[17] = weight[3]
+        bias[40] = bias[9]
+        bias[17] = bias[3]
+        gate.update(parameters: ModuleParameters.unflattened([
+            "weight": weight, "e_score_correction_bias": bias,
+        ]))
+        gate.train(false)
+        for seed in 0 ..< 32 {
+            let x = withRandomState(MLXRandom.RandomState(seed: UInt64(50 + seed))) {
+                MLXRandom.normal([1, 1, 512]).asType(.bfloat16)
+            }
+            gate.fusedDecode = false
+            let (indices, scores) = gate(x)
+            gate.fusedDecode = true
+            let (fusedIndices, fusedScores) = gate(x)
+            assertBitwiseEqual(fusedIndices, indices, "experts for input \(seed)")
+            assertBitwiseEqual(fusedScores, scores, "scores for input \(seed)")
+        }
+        XCTAssertNotNil(
+            glm5NextMoERouter(
+                MLXArray.zeros([1, 512], dtype: .bfloat16), weight: gate.weight,
+                bias: gate.eScoreCorrectionBias, topK: 8, scaling: 2.5, normalize: true))
+    }
+
     /// End to end: decode logits with the fused KDA step equal the op path's.
     func testFusedDecodeKeepsModelLogitsBitwise() throws {
         let model = GLM5NextTextModel(try configuration(indexTopk: 8, linearHeadDim: 128))
@@ -405,6 +451,7 @@ final class GLM5NextTests: XCTestCase {
             for layer in model.model.layers {
                 layer.attnHC.fusedDecode = false
                 layer.ffnHC.fusedDecode = false
+                (layer.mlp as? GLM5NextMoE)?.gate.fusedDecode = false
             }
             let cache = try model.newCache(parameters: nil)
             var logits = [model(input[0..., ..<20], cache: cache)[0..., -1]]

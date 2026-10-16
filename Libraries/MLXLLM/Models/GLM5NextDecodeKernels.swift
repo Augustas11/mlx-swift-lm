@@ -19,7 +19,7 @@
 //  notice is included; the software is provided "as is", without warranty of
 //  any kind.
 //
-//  The KDA kernel and `glm5NextHCMix` replay the arithmetic of the op graphs
+//  The KDA, router and `glm5NextHCMix` kernels replay the arithmetic of the op graphs
 //  they replace (rounding points, reduction order, MLX's Sigmoid functor);
 //  `glm5NextHCNorm` is the reference model's own decode kernel (fast exp,
 //  FMA collapse). `GLM5NextTests` checks each one.
@@ -538,4 +538,167 @@ func glm5NextHCNorm(
         outputShapes: [[B, L, D], [B, L, hc], [B, L, hc, hc]],
         outputDTypes: [x.dtype, .float32, .float32])
     return (outputs[0], outputs[1], outputs[2])
+}
+
+// MARK: - MoE router (one token per row)
+
+/// `sigmoid(x @ W.T)` and `sigmoid + bias` per expert: MLX's fp32 gemv lane
+/// order and shuffle ladder for one row per simdgroup (oMLX `moe_router`).
+private let glm5NextRouterLogitsSource = """
+      const uint lane = thread_index_in_simdgroup;
+      const uint sg = simdgroup_index_in_threadgroup;
+      const int tok = int(threadgroup_position_in_grid.y);
+      const int out_row = int(threadgroup_position_in_grid.x) * 4 + int(sg);
+      if (out_row >= E) {
+        return;
+      }
+      const device float* mat = w + size_t(out_row) * K;
+      const device T* xv = x + size_t(tok) * K;
+      float result = 0.0f;
+      int bn = int(lane) * 4;
+      for (int i = 0; i < K / 128; ++i) {
+        float v_coeff[4];
+        for (int tn = 0; tn < 4; tn++) {
+          v_coeff[tn] = static_cast<float>(xv[bn + tn]);
+        }
+        float inter[4];
+        for (int tn = 0; tn < 4; tn++) {
+          inter[tn] = mat[bn + tn];
+        }
+        for (int tn = 0; tn < 4; tn++) {
+          result += inter[tn] * v_coeff[tn];
+        }
+        bn += 128;
+      }
+      for (ushort sn = 16; sn >= 1; sn >>= 1) {
+        result += simd_shuffle_down(result, sn);
+      }
+      if (lane == 0) {
+        float sgm = glm_sigmoid<float>(result);
+        float biased = sgm + bias[out_row];
+        sig[size_t(tok) * E + out_row] = sgm;
+        biased_out[size_t(tok) * E + out_row] = biased;
+      }
+    """
+
+/// Top-k in argPartition's order (descending biased score, ties to the
+/// lower expert), the gathered sigmoid scores, their sequential sum, the
+/// normalization and the routed scaling factor.
+private let glm5NextRouterSelectSource = """
+      const uint lane = thread_index_in_simdgroup;
+      const int tok = int(threadgroup_position_in_grid.x);
+      constexpr int PER = (E + 31) / 32;
+      const device float* bz = biased + size_t(tok) * E;
+      const device float* sz = sig + size_t(tok) * E;
+      float vals[PER];
+      bool taken[PER];
+      for (int j = 0; j < PER; j++) {
+        const int e = j * 32 + int(lane);
+        vals[j] = e < E ? bz[e] : -INFINITY;
+        taken[j] = e >= E;
+      }
+      int picked[TOPK];
+      for (int r = 0; r < TOPK; r++) {
+        float best = -INFINITY;
+        int best_e = 0x7fffffff;
+        for (int j = 0; j < PER; j++) {
+          const int e = j * 32 + int(lane);
+          if (!taken[j] && !isnan(vals[j]) &&
+              (best_e == 0x7fffffff || vals[j] > best || (vals[j] == best && e < best_e))) {
+            best = vals[j];
+            best_e = e;
+          }
+        }
+        for (ushort off = 16; off >= 1; off >>= 1) {
+          float ob = simd_shuffle_xor(best, off);
+          int oe = simd_shuffle_xor(best_e, off);
+          const bool other_better = oe != 0x7fffffff &&
+              (best_e == 0x7fffffff || ob > best || (ob == best && oe < best_e));
+          if (other_better) {
+            best = ob;
+            best_e = oe;
+          }
+        }
+        if (best_e == 0x7fffffff) {
+          // Only NaNs remain: argpartition's sort puts them last, lowest index first.
+          for (int j = 0; j < PER; j++) {
+            const int e = j * 32 + int(lane);
+            if (!taken[j] && e < best_e) {
+              best_e = e;
+            }
+          }
+          for (ushort off = 16; off >= 1; off >>= 1) {
+            best_e = min(best_e, simd_shuffle_xor(best_e, off));
+          }
+        }
+        picked[r] = best_e;
+        if ((best_e % 32) == int(lane)) {
+          taken[best_e / 32] = true;
+        }
+      }
+      if (lane == 0) {
+        float total = 0.0f;
+        float gathered[TOPK];
+        for (int r = 0; r < TOPK; r++) {
+          gathered[r] = sz[picked[r]];
+          total = gathered[r] + total;
+        }
+        for (int r = 0; r < TOPK; r++) {
+          float q = NORM ? gathered[r] / (total + 1e-20f) : gathered[r];
+          float s = q * scaling[0];
+          indices[tok * TOPK + r] = uint(picked[r]);
+          scores[tok * TOPK + r] = s;
+        }
+      }
+    """
+
+private final class GLM5NextRouterKernels: Sendable {
+    static let shared = GLM5NextRouterKernels()
+    let logits: MLXFast.MLXFastKernel
+    let select: MLXFast.MLXFastKernel
+
+    private init() {
+        logits = MLXFast.metalKernel(
+            name: "glm5next_router_logits", inputNames: ["x", "w", "bias"],
+            outputNames: ["sig", "biased_out"], source: glm5NextRouterLogitsSource,
+            header: glm5NextKernelHeader)
+        select = MLXFast.metalKernel(
+            name: "glm5next_router_select", inputNames: ["sig", "biased", "scaling"],
+            outputNames: ["indices", "scores"], source: glm5NextRouterSelectSource)
+    }
+}
+
+/// The noaux_tc router for `n_group == 1` and rows `x: [T, K]`, each as a
+/// one-token GEMV: `(indices uint32 [T, topK], scores fp32 [T, topK])`, or
+/// `nil` outside the replicated gemv configuration.
+func glm5NextMoERouter(
+    _ x: MLXArray, weight: MLXArray, bias: MLXArray, topK: Int, scaling: Float, normalize: Bool
+) -> (MLXArray, MLXArray)? {
+    guard x.ndim == 2, weight.ndim == 2, bias.ndim == 1,
+        weight.dtype == .float32, bias.dtype == .float32,
+        [.bfloat16, .float16, .float32].contains(x.dtype)
+    else { return nil }
+    let (T, K) = (x.dim(0), x.dim(1))
+    let E = weight.dim(0)
+    // MLX's gemv for x @ W.T takes the bm = 4, bn = 1 layout for E < 4096 and
+    // K < 16 * E; full 128-wide K blocks and whole 4-row tiles.
+    guard weight.dim(1) == K, bias.dim(0) == E, E >= 16, E < 4096, E % 16 == 0, E <= 1024,
+        K > 64, K % 128 == 0, K < 16 * E, (1 ... min(32, E)).contains(topK)
+    else { return nil }
+    let kernels = GLM5NextRouterKernels.shared
+    let logits = kernels.logits(
+        [x, weight, bias],
+        template: [("T", x.dtype), ("K", K), ("E", E)],
+        grid: (128 * (E / 4), T, 1),
+        threadGroup: (128, 1, 1),
+        outputShapes: [[T, E], [T, E]],
+        outputDTypes: [.float32, .float32])
+    let selected = kernels.select(
+        [logits[0], logits[1], MLXArray([scaling])],
+        template: [("E", E), ("TOPK", topK), ("NORM", normalize && topK > 1)],
+        grid: (32 * T, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [[T, topK], [T, topK]],
+        outputDTypes: [.uint32, .float32])
+    return (selected[0], selected[1])
 }
