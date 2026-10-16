@@ -772,7 +772,16 @@ final class GLM5NextTests: XCTestCase {
         for end in snapshots.keys.sorted() where end > 0 {
             for n in 1 ... (maxTrim + 6) where n <= end {
                 let trimmed = snapshots[end]!.copy() as! GLM5NextAttentionCache
+                XCTAssertGreaterThanOrEqual(trimmed.maxTrimCount, min(maxTrim, end))
+                let exactUpTo = trimmed.maxTrimCount
+                let viaPromptCache = trimmed.copy() as! GLM5NextAttentionCache
+                if n <= exactUpTo {
+                    XCTAssertEqual(trimPromptCache([viaPromptCache], numTokens: n), n)
+                }
                 let removed = trimmed.trim(n)
+                if n <= exactUpTo {
+                    XCTAssertEqual(removed, n, "trim(\(n)) within maxTrimCount at \(end)")
+                }
                 if n <= maxTrim {
                     XCTAssertEqual(removed, n, "trim(\(n)) at \(end) must be exact")
                 }

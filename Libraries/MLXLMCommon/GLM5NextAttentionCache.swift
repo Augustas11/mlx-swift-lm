@@ -165,6 +165,19 @@ public final class GLM5NextAttentionCache: BaseKVCache, GLM5NextLatentCache {
 
     public override var isTrimmable: Bool { true }
 
+    /// The largest `M` such that every trim of up to `M` tokens is exact
+    /// (at least `maxTrim` once that many tokens are cached).
+    public override var maxTrimCount: Int {
+        guard indexed else { return offset }
+        var m = 0
+        while m < offset {
+            let partial = (offset - m - 1) % kpool
+            guard partial == 0 || rawCount - (m + 1) >= partial else { break }
+            m += 1
+        }
+        return m
+    }
+
     public override func isTrimmable(after positions: Int) -> Bool {
         !indexed || positions <= maxTrim
     }
