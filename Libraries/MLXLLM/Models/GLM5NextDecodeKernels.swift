@@ -2071,3 +2071,266 @@ func glm5NextMoEExperts(
         outputShapes: [[1, K]],
         outputDTypes: [dtype])[0]
 }
+
+// MARK: - DSA indexer selection (one decode token)
+//
+// `GLM5NextIndexer.select` for one query of one sequence in two dispatches,
+// with the op path's arithmetic: the fp32 query x pooled-key products as
+// MLX's non-split-K steel GEMM computes them (8x8 simdgroup MMAs over
+// ascending 8-wide K chunks), maximum(., 0), the fp32 product with the scaled
+// head weights, the head sum as the looped column reduce does it (each head's
+// term plus the reduction's zero init, one simd_sum with lane = head), and
+// the candidate mask; then argPartition's top-k set (merge sort: larger
+// scores first, ties to the lower pool, NaN last) in chronological order,
+// expanded to tokens, padded with -1, and the partial-window tail.
+
+private let glm5NextDSAScoresSource = """
+      const uint lane = thread_index_in_simdgroup;
+      const uint sg = simdgroup_index_in_threadgroup;
+      const uint tid = sg * 32 + lane;
+      const int pool0 = (int(threadgroup_position_in_grid.x) * NSG + int(sg)) * 8;
+      const int P = int(dims[0]);
+      const int qpos = int(dims[1]);
+      const float wscale = wscale_in[0];
+
+      threadgroup float qf[HEADS * DIM];
+      threadgroup float kf[NSG][DIM * 8];
+      threadgroup float hs[NSG][HEADS * 8];
+      for (int e = int(tid); e < HEADS * DIM; e += NSG * 32) {
+        qf[e] = static_cast<float>(q[e]);
+      }
+      for (int e = int(lane); e < DIM * 8; e += 32) {
+        const int k = e / 8, p = e % 8;
+        const int pool = pool0 + p;
+        kf[sg][e] = pool < P ? static_cast<float>(keys[size_t(pool) * DIM + k]) : 0.0f;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      for (int hb = 0; hb < HEADS / 8; hb++) {
+        simdgroup_matrix<float, 8, 8> c = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        for (int kc = 0; kc < DIM / 8; kc++) {
+          simdgroup_matrix<float, 8, 8> a;
+          simdgroup_matrix<float, 8, 8> b;
+          simdgroup_load(a, qf + hb * 8 * DIM + kc * 8, DIM);
+          simdgroup_load(b, kf[sg] + kc * 64, 8);
+          simdgroup_multiply_accumulate(c, a, b, c);
+        }
+        simdgroup_store(c, hs[sg] + hb * 64, 8);
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+
+      // lane = head: term = maximum(dot, 0) * (w * wscale), then the reduce.
+      const float wh = static_cast<float>(w[lane]) * wscale;
+      for (int p = 0; p < 8; p++) {
+        const int pool = pool0 + p;
+        float dot = hs[sg][int(lane) * 8 + p];
+        float relu = metal::isnan(dot) ? dot : (dot > 0.0f ? dot : 0.0f);
+        volatile float term = relu * wh;
+        volatile float init = term + 0.0f;
+        float total = simd_sum(init);
+        if (lane == 0 && pool < P) {
+          const bool valid = (pool + 1) * KPOOL - 1 <= qpos;
+          scores[pool] = valid ? total : -FLT_MAX;
+        }
+      }
+    """
+
+private let glm5NextDSASelectSource = """
+      const uint tid = thread_position_in_threadgroup.x;
+      const uint lane = thread_index_in_simdgroup;
+      const uint sg = simdgroup_index_in_threadgroup;
+      constexpr uint NT = 1024;
+      const int P = int(dims[0]);
+      const int K = int(dims[1]);          // pools to select
+      const int kv_len = int(dims[2]);
+
+      threadgroup atomic_uint hist[256];
+      threadgroup uint shared_u[4];
+      threadgroup uint part_a[32];
+      threadgroup uint part_b[32];
+
+      // Orderable keys: larger score -> larger key; NaN smallest.
+      auto key_of = [&](int i) -> uint {
+    #if SELECT_ALL
+        return 0u;
+    #else
+        const float s = scores[i];
+        if (metal::isnan(s)) {
+          return 0u;
+        }
+        const uint u = as_type<uint>(s);
+        return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    #endif
+      };
+
+      // Radix select: T is the K-th largest key; `need` keys equal to T are
+      // taken (the lowest pools first).
+      uint prefix = 0u;
+      uint mask = 0u;
+      uint remaining = uint(K);
+      for (int shift = 24; shift >= 0; shift -= 8) {
+        for (uint b = tid; b < 256u; b += NT) {
+          atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = int(tid); i < P; i += int(NT)) {
+          const uint k = key_of(i);
+          if ((k & mask) == prefix) {
+            atomic_fetch_add_explicit(&hist[(k >> shift) & 0xffu], 1u, memory_order_relaxed);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+          uint acc = 0u;
+          int digit = 0;
+          for (int d = 255; d >= 0; d--) {
+            const uint c = atomic_load_explicit(&hist[d], memory_order_relaxed);
+            if (acc + c >= remaining) {
+              digit = d;
+              break;
+            }
+            acc += c;
+          }
+          shared_u[0] = uint(digit);
+          shared_u[1] = remaining - acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        prefix |= shared_u[0] << shift;
+        mask |= 0xffu << shift;
+        remaining = shared_u[1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      const uint T_key = prefix;
+      const uint need = remaining;
+
+      // Chronological compaction: pools with key > T, then the first `need`
+      // pools with key == T, in pool order.
+      uint carry_sel = 0u;
+      uint carry_eq = 0u;
+      for (int base = 0; base < P; base += int(NT)) {
+        const int i = base + int(tid);
+        const uint k = i < P ? key_of(i) : 0u;
+        const uint is_eq = (i < P && k == T_key) ? 1u : 0u;
+        const uint eq_pre = simd_prefix_exclusive_sum(is_eq);
+        if (lane == 31) {
+          part_a[sg] = eq_pre + is_eq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          const uint v = part_a[lane];
+          part_b[lane] = simd_prefix_exclusive_sum(v);
+          if (lane == 31) {
+            shared_u[2] = part_b[lane] + v;
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint eq_rank = carry_eq + part_b[sg] + eq_pre;
+        const uint chunk_eq = shared_u[2];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint sel = (i < P && (k > T_key || (is_eq && eq_rank < need))) ? 1u : 0u;
+        const uint sel_pre = simd_prefix_exclusive_sum(sel);
+        if (lane == 31) {
+          part_a[sg] = sel_pre + sel;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+          const uint v = part_a[lane];
+          part_b[lane] = simd_prefix_exclusive_sum(v);
+          if (lane == 31) {
+            shared_u[3] = part_b[lane] + v;
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sel) {
+          const uint pos = carry_sel + part_b[sg] + sel_pre;
+          for (int o = 0; o < KPOOL; o++) {
+            out[pos * KPOOL + o] = i * KPOOL + o;
+          }
+        }
+        carry_sel += shared_u[3];
+        carry_eq += chunk_eq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+
+      // -1 padding up to TOPK tokens, then the tail.
+      for (int e = K * KPOOL + int(tid); e < TOPK; e += int(NT)) {
+        out[e] = -1;
+      }
+    #if TAIL
+      if (tid < uint(KPOOL - 1)) {
+        const int visible = kv_len;
+        const int count = visible % KPOOL;
+        const int j = int(tid);
+        const int index = visible - count + j;
+        out[TOPK + j] = (j < count && index < kv_len) ? index : -1;
+      }
+    #endif
+    """
+
+private final class GLM5NextDSAKernels: @unchecked Sendable {
+    static let shared = GLM5NextDSAKernels()
+    let scores: MLXFast.MLXFastKernel
+    private let lock = NSLock()
+    private var selects: [String: MLXFast.MLXFastKernel] = [:]
+
+    private init() {
+        scores = MLXFast.metalKernel(
+            name: "glm5next_dsa_scores", inputNames: ["q", "keys", "w", "wscale_in", "dims"],
+            outputNames: ["scores"], source: glm5NextDSAScoresSource,
+            header: "#include <metal_simdgroup>\n#include <metal_simdgroup_matrix>\n")
+    }
+
+    func select(all: Bool, tail: Bool) -> MLXFast.MLXFastKernel {
+        let key = "\(all)-\(tail)"
+        lock.lock()
+        defer { lock.unlock() }
+        if let kernel = selects[key] { return kernel }
+        let kernel = MLXFast.metalKernel(
+            name: "glm5next_dsa_select" + (all ? "_all" : "") + (tail ? "_tail" : ""),
+            inputNames: ["scores", "dims"], outputNames: ["out"],
+            source: "#define SELECT_ALL \(all ? 1 : 0)\n#define TAIL \(tail ? 1 : 0)\n"
+                + glm5NextDSASelectSource)
+        selects[key] = kernel
+        return kernel
+    }
+}
+
+/// `GLM5NextIndexer.select` for one decode token: the token indices
+/// `[1, 1, indexTopk (+ kpool - 1 tail)]` int32, `-1` unused. `q` is the
+/// indexer query `[1, heads * dim]`, `weights` the raw head weights
+/// `[1, heads]`, `weightScale` the op path's scalar; `nil` when not covered.
+func glm5NextDSASelect(
+    q: MLXArray, weights: MLXArray, weightScale: Float, pooledKeys: MLXArray,
+    kvLength: Int, heads: Int, dim: Int, indexTopk: Int, kpool: Int, tail: Bool
+) -> MLXArray? {
+    guard pooledKeys.ndim == 3, pooledKeys.dim(0) == 1, pooledKeys.dim(2) == dim,
+        heads == 32, dim % 8 == 0, dim * heads <= 4096, kpool >= 1,
+        [.bfloat16, .float16, .float32].contains(q.dtype), q.size == heads * dim,
+        weights.size == heads, indexTopk % kpool == 0
+    else { return nil }
+    let P = pooledKeys.dim(1)
+    guard P > 0 else { return nil }
+    let selectK = min(indexTopk / kpool, P)
+    let all = selectK == P
+    let kernels = GLM5NextDSAKernels.shared
+    let scores: MLXArray
+    if all {
+        scores = MLXArray.zeros([1], dtype: .float32)
+    } else {
+        let nsg = 2
+        scores = kernels.scores(
+            [q.reshaped(-1), pooledKeys, weights.reshaped(-1), MLXArray([weightScale]),
+             MLXArray([Int32(P), Int32(kvLength - 1)])],
+            template: [("HEADS", heads), ("DIM", dim), ("NSG", nsg), ("KPOOL", kpool)],
+            grid: (32 * nsg * ((P + 8 * nsg - 1) / (8 * nsg)), 1, 1),
+            threadGroup: (32 * nsg, 1, 1),
+            outputShapes: [[P]], outputDTypes: [.float32])[0]
+    }
+    let width = indexTopk + (tail && kpool > 1 ? kpool - 1 : 0)
+    return kernels.select(all: all, tail: tail && kpool > 1)(
+        [scores, MLXArray([Int32(P), Int32(selectK), Int32(kvLength)])],
+        template: [("TOPK", indexTopk), ("KPOOL", kpool)],
+        grid: (1024, 1, 1), threadGroup: (1024, 1, 1),
+        outputShapes: [[1, 1, width]], outputDTypes: [.int32])[0]
+}

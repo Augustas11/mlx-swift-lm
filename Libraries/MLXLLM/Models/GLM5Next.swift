@@ -632,10 +632,22 @@ final class GLM5NextIndexer: Module {
 
     /// Token indices `[B, L, index_topk + kpool - 1]` (`-1` = unused) attended by
     /// the last `L` queries of a `kvLength`-token sequence.
+    /// One decode token selects with `glm5NextDSASelect` (two kernels).
+    var fusedDecode = true
+
     func select(
         _ x: MLXArray, qResid: MLXArray, pooledKeys: MLXArray?, kvLength: Int
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
+        if fusedDecode, !training, B == 1, L == 1, let pooledKeys,
+            let fused = glm5NextDSASelect(
+                q: wqB(qResid), weights: weightsProj(x),
+                weightScale: pow(Float(numHeads), -0.5) * softmaxScale, pooledKeys: pooledKeys,
+                kvLength: kvLength, heads: numHeads, dim: headDim, indexTopk: indexTopk,
+                kpool: kpool, tail: alwaysSelectTail)
+        {
+            return fused
+        }
         let start = kvLength - L
         let queryPositions = MLXArray(Int32(start) ..< Int32(kvLength))
         let poolCount = pooledKeys?.dim(1) ?? 0

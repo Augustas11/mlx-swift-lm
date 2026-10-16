@@ -642,6 +642,65 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
+    /// `glm5NextDSASelect` reproduces the indexer's op-path selection bit for
+    /// bit for one decode token: fp32 scores, argPartition's set with exact
+    /// score ties (duplicated pooled keys), chronological order, -1 padding
+    /// and the partial-window tail, from "every pool" (<= 512 pools) to a
+    /// 64k-token context.
+    func testFusedDSASelectMatchesOpPathBitwise() throws {
+        var json = textConfigJSON(indexTopk: 2048)
+        for (from, to) in [
+            (#""index_head_dim": 16"#, #""index_head_dim": 128"#),
+            (#""index_n_heads": 2"#, #""index_n_heads": 32"#),
+        ] {
+            json = json.replacingOccurrences(of: from, with: to)
+        }
+        let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+        let indexer = GLM5NextIndexer(config)
+        randomize(indexer, seed: 101)
+        castToBFloat16(indexer)
+        indexer.train(false)
+        let x = withRandomState(MLXRandom.RandomState(seed: 102)) {
+            MLXRandom.normal([1, 1, config.hiddenSize]).asType(.bfloat16)
+        }
+        let qResid = withRandomState(MLXRandom.RandomState(seed: 103)) {
+            MLXRandom.normal([1, 1, config.qLoraRank]).asType(.bfloat16)
+        }
+        for (pools, remainder) in [(100, 3), (512, 0), (513, 1), (2049, 2), (16389, 3)] {
+            var keys = withRandomState(MLXRandom.RandomState(seed: UInt64(104 + pools))) {
+                MLXRandom.normal([1, pools, 128]).asType(.bfloat16)
+            }
+            // Exact score ties across the selection boundary.
+            if pools > 600 {
+                for (a, b) in [(7, pools - 1), (40, 300), (41, 299), (5, 6)] {
+                    keys[0..., b] = keys[0..., a]
+                }
+            }
+            let kvLength = pools * 4 + remainder
+            indexer.fusedDecode = false
+            let reference = indexer.select(x, qResid: qResid, pooledKeys: keys, kvLength: kvLength)
+            indexer.fusedDecode = true
+            let fused = indexer.select(x, qResid: qResid, pooledKeys: keys, kvLength: kvLength)
+            assertBitwiseEqual(fused, reference, "selection with \(pools) pools")
+            if pools == 2049 {
+                // Every score equal: the boundary is decided by the tie order alone.
+                let same = broadcast(keys[0..., ..<1], to: [1, 1000, 128])
+                indexer.fusedDecode = false
+                let tiedReference = indexer.select(
+                    x, qResid: qResid, pooledKeys: same, kvLength: 4002)
+                indexer.fusedDecode = true
+                let tied = indexer.select(x, qResid: qResid, pooledKeys: same, kvLength: 4002)
+                assertBitwiseEqual(tied, tiedReference, "all-tied selection")
+            }
+            XCTAssertNotNil(
+                glm5NextDSASelect(
+                    q: indexer.wqB(qResid), weights: indexer.weightsProj(x), weightScale: 1,
+                    pooledKeys: keys, kvLength: kvLength, heads: 32, dim: 128, indexTopk: 2048,
+                    kpool: 4, tail: true),
+                "the fused selection covers \(pools) pools")
+        }
+    }
+
     /// End to end: decode logits with the fused KDA step equal the op path's.
     func testFusedDecodeKeepsModelLogitsBitwise() throws {
         let model = GLM5NextTextModel(try configuration(indexTopk: 8, linearHeadDim: 128))
