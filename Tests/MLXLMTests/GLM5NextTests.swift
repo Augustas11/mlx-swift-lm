@@ -1281,6 +1281,113 @@ final class GLM5NextTests: XCTestCase {
         XCTAssertEqual(model.maximumNativeTargetCacheRewind, 1)
     }
 
+    private func copyState(_ state: MTPDrafterState) -> MTPDrafterState {
+        MTPDrafterState(
+            cache: state.cache.map { $0.copy() }, nextPosition: state.nextPosition,
+            seedToken: state.seedToken, seedHidden: state.seedHidden,
+            proposalAppended: state.proposalAppended)
+    }
+
+    private func assertDrafterStatesEqual(
+        _ a: MTPDrafterState, _ b: MTPDrafterState, _ what: String
+    ) {
+        XCTAssertEqual(a.nextPosition, b.nextPosition, "\(what): next position")
+        XCTAssertEqual(a.proposalAppended, b.proposalAppended, "\(what): appended")
+        assertBitwiseEqual(a.seedToken, b.seedToken, "\(what): seed token")
+        assertBitwiseEqual(a.seedHidden, b.seedHidden, "\(what): seed hidden")
+        assertCachesEqual(a.cache, b.cache, what)
+    }
+
+    /// The drafter: a tentative chained proposal rolled back by the commit
+    /// (exact trim) leaves the state of a commit that never proposed, and a
+    /// packed advance of rows with zero and one accepted proposals equals
+    /// each row's serial commit bit for bit (6 flattened tokens).
+    func testMTPDrafterRollbackAndPackedAdvanceMatchSerialCommit() throws {
+        let model = try fusedShapesModel(seed: 201)
+        let drafter = GLM5NextMTPDraftModel(model.configuration)
+        let sampler = GenerateParameters(temperature: 0).sampler()
+        let D = model.configuration.hiddenSize
+
+        var prepared = [MTPDrafterState]()
+        for (r, length) in [6, 11, 13].enumerated() {
+            let prompt = tokens(length, seed: UInt64(210 + r))
+            let cache = try model.newCache(parameters: nil)
+            let out = model(LMInput.Text(tokens: prompt), cache: cache, state: emitState())
+            let bonus = argMax(out.logits[0..., -1, 0...], axis: -1)
+            var state = drafter.makeState(parameters: nil)
+            drafter.prepareDrafterState(
+                target: model, promptTokens: prompt,
+                targetHidden: try XCTUnwrap(out.state?[mtpLastHiddenStatesKey]),
+                firstBonus: bonus, positionDeltas: nil, state: &state, sampler: sampler)
+            eval(state.cache, state.seedToken!, state.seedHidden!)
+            XCTAssertEqual(state.nextPosition, length)
+            prepared.append(state)
+        }
+        let targetHidden = (0 ..< 3).map { r in
+            withRandomState(MLXRandom.RandomState(seed: UInt64(220 + r))) {
+                MLXRandom.normal([1, 2, D]).asType(.bfloat16)
+            }
+        }
+
+        // Rollback: a chained proposal appended, then rejected.
+        var proposing = copyState(prepared[0])
+        proposing.seedToken = nil
+        proposing.seedHidden = nil
+        let draft = drafter.draftBlock(
+            target: model, lastToken: MLXArray([Int32(5)]),
+            lastHidden: targetHidden[0][0..., ..<1], sharedKV: [:], positionDeltas: nil,
+            queryOffset: 0, blockSize: 2, state: &proposing, sampler: sampler)
+        XCTAssertEqual(proposing.proposalAppended, 1)
+        var neverProposed = copyState(prepared[0])
+        neverProposed.seedToken = nil
+        neverProposed.seedHidden = nil
+        drafter.commitDrafterState(
+            target: model, targetHidden: targetHidden[0], draftTokens: draft, acceptedCount: 0,
+            finalToken: MLXArray([Int32(9)]), positionDeltas: nil, state: &proposing,
+            sampler: sampler)
+        drafter.commitDrafterState(
+            target: model, targetHidden: targetHidden[0], draftTokens: draft, acceptedCount: 0,
+            finalToken: MLXArray([Int32(9)]), positionDeltas: nil, state: &neverProposed,
+            sampler: sampler)
+        assertDrafterStatesEqual(proposing, neverProposed, "rolled-back proposal")
+
+        // Packed advance vs serial commits.
+        let accepted: [[Int]] = [[], [17], []]
+        let finals = [9, 23, 41]
+        var serial = [MTPDrafterState]()
+        for r in 0 ..< 3 {
+            var state = copyState(prepared[r])
+            let proposal = state.seedToken!
+            state.seedToken = nil
+            state.seedHidden = nil
+            let draftTokens = accepted[r].isEmpty
+                ? proposal : MLXArray(accepted[r].map(Int32.init)).reshaped(1, -1)
+            drafter.commitDrafterState(
+                target: model, targetHidden: targetHidden[r], draftTokens: draftTokens,
+                acceptedCount: accepted[r].count, finalToken: MLXArray([Int32(finals[r])]),
+                positionDeltas: nil, state: &state, sampler: sampler)
+            serial.append(state)
+        }
+        let packed = try drafter.advanceAndProposePacked(
+            target: model,
+            rows: (0 ..< 3).map { r in
+                var state = prepared[r]
+                state.seedToken = nil
+                state.seedHidden = nil
+                return MTPPackedDrafterAdvanceRow(
+                    targetHidden: targetHidden[r], acceptedTokens: accepted[r],
+                    finalToken: finals[r], positionDeltas: nil, state: state)
+            },
+            sampler: sampler)
+        for r in 0 ..< 3 {
+            assertDrafterStatesEqual(packed.states[r], serial[r], "packed row \(r)")
+            assertBitwiseEqual(
+                packed.proposals[r ..< (r + 1)], serial[r].seedToken, "packed proposal \(r)")
+        }
+        // The packed advance never touches its input states.
+        XCTAssertEqual(prepared[1].cache[0].offset, 11)
+    }
+
     /// Proposes the plain-greedy continuation, except a wrong token every
     /// third round, so the iterator exercises the target's accept path
     /// (both verify columns kept) and its in-place rewind.
@@ -1336,6 +1443,81 @@ final class GLM5NextTests: XCTestCase {
         parameters.prefill.stepSize = Int.max
         parameters.prefill.chunking = .unchunked
         return parameters
+    }
+
+    /// Greedy generation through `MTPSpeculativeTokenIterator` with the GLM
+    /// drafter equals plain greedy generation token for token.
+    private func assertMTPGreedyMatchesPlain(
+        _ model: any LanguageModel, configuration: GLM5NextConfiguration, prompt: MLXArray,
+        count: Int, label: String
+    ) throws -> (proposed: Int, accepted: Int) {
+        let parameters = greedyParameters(maxTokens: count)
+        var plain = try TokenIterator(prompt: prompt, model: model, parameters: parameters)
+        var expected = [Int]()
+        while let token = plain.next() { expected.append(token) }
+
+        var speculative = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: prompt), mainModel: model,
+            drafter: GLM5NextMTPDraftModel(configuration), parameters: parameters, blockSize: 2)
+        var produced = [Int]()
+        while let token = speculative.next() { produced.append(token) }
+        XCTAssertNil(speculative.passthroughReason, "\(label): stayed speculative")
+        XCTAssertEqual(produced, expected, "\(label): MTP greedy equals plain greedy")
+        XCTAssertGreaterThan(speculative.proposedCount, 0, label)
+        return (speculative.proposedCount, speculative.acceptedCount)
+    }
+
+    func testMTPSpeculativeGreedyMatchesPlainGreedy() throws {
+        let model = try fusedShapesModel(seed: 231)
+        for deferred in [true, false] {
+            model.model.deferredDecode = deferred
+            _ = try assertMTPGreedyMatchesPlain(
+                model, configuration: model.configuration,
+                prompt: tokens(13, seed: 232).reshaped(-1), count: 24,
+                label: "deferred=\(deferred)")
+        }
+        model.model.deferredDecode = true
+    }
+
+    /// On the real 4-layer cut (`GLM5NEXT_CUT_DIR`): MTP greedy equals plain
+    /// greedy, and the acceptance rate is reported (the cut's trunk is not the
+    /// one the head was trained on, so it is a lower bound).
+    func testMTPSpeculativeGreedyMatchesPlainGreedyOnRealCut() throws {
+        guard let path = ProcessInfo.processInfo.environment["GLM5NEXT_CUT_DIR"] else {
+            throw XCTSkip("GLM5NEXT_CUT_DIR is not set")
+        }
+        let dir = URL(fileURLWithPath: path)
+        let data = try Data(contentsOf: dir.appendingPathComponent("config.json"))
+        let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
+        let configuration = try JSONDecoder().decode(GLM5NextConfiguration.self, from: data)
+        let model = GLM5NextModel(configuration)
+        try loadWeights(
+            modelDirectory: dir, model: model, perLayerQuantization: base.perLayerQuantization)
+        model.train(false)
+        XCTAssertTrue(model.languageModel.hasMTPWeights)
+        let prompt = withRandomState(MLXRandom.RandomState(seed: 240)) {
+            MLXRandom.randInt(0 ..< 150_000, [300]).asType(.int32)
+        }
+        let (proposed, accepted) = try assertMTPGreedyMatchesPlain(
+            model, configuration: configuration, prompt: prompt, count: 64, label: "real cut")
+        print("glm5next_mtp_real_cut proposed=\(proposed) accepted=\(accepted)")
+
+        // A verify pass past index_topk (sparse DSA) equals serial decode.
+        let long = withRandomState(MLXRandom.RandomState(seed: 241)) {
+            MLXRandom.randInt(0 ..< 150_000, [1, 2100]).asType(.int32)
+        }
+        let pair = MLXArray([Int32(1000), Int32(2000)]).reshaped(1, 2)
+        let verified = try model.newCache(parameters: nil)
+        let serial = try model.newCache(parameters: nil)
+        eval(model(long, cache: verified), model(long, cache: serial))
+        let output = model(LMInput.Text(tokens: pair), cache: verified, state: emitState(checkpoint: 1))
+        let first = model(pair[0..., ..<1], cache: serial)
+        let afterFirst = serial.map { $0.copy() }
+        let second = model(pair[0..., 1...], cache: serial)
+        assertBitwiseEqual(output.logits[0..., ..<1], first, "real cut verify column 0")
+        assertBitwiseEqual(output.logits[0..., 1...], second, "real cut verify column 1")
+        XCTAssertEqual(rewindSpeculativePromptCache(verified, numTokens: 1), 1)
+        assertCachesEqual(verified, afterFirst, "real cut after rewind")
     }
 
     // MARK: - Weight names
