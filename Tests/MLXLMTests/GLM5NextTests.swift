@@ -295,6 +295,7 @@ final class GLM5NextTests: XCTestCase {
         let attention = GLM5NextLinearAttention(config)
         randomize(attention, seed: 11)
         castToBFloat16(attention)
+        attention.train(false)
         let input = withRandomState(MLXRandom.RandomState(seed: 13)) {
             MLXRandom.normal([1, 24, config.hiddenSize]).asType(.bfloat16)
         }
@@ -327,6 +328,64 @@ final class GLM5NextTests: XCTestCase {
                 state: fusedCache[1]!, heads: attention.numHeads, headDim: attention.headDim,
                 lowerBound: attention.forgetGate.lowerBound!, normEps: attention.oNorm.eps),
             "the fused kernel must cover the real head_dim 128 decode shape")
+        XCTAssertFalse(attention.training, "fused paths only run in evaluation mode")
+    }
+
+    /// The HC decode kernels: the mix GEMV reproduces `rmsNorm` + `matmul`
+    /// bit for bit; the Sinkhorn + collapse + RMSNorm kernel is the reference
+    /// model's (fast exp, FMA collapse), so it stays within an fp32 ulp of the
+    /// op path on post/comb and a bf16 ulp on the normalized branch input.
+    func testFusedHyperConnectionDecodeKernels() throws {
+        var json = textConfigJSON()
+        json = json.replacingOccurrences(of: #""hidden_size": 64"#, with: #""hidden_size": 1024"#)
+        let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+        let connection = GLM5NextHyperConnection(config)
+        let norm = RMSNorm(dimensions: 1024, eps: config.rmsNormEps)
+        withRandomState(MLXRandom.RandomState(seed: 21)) {
+            connection.update(parameters: ModuleParameters.unflattened([
+                "fn": 0.05 * MLXRandom.normal(connection.fn.shape),
+                "base": 0.5 * MLXRandom.normal(connection.base.shape),
+                "scale": 1 + 0.2 * MLXRandom.normal([3]),
+            ]))
+            norm.update(parameters: ModuleParameters.unflattened([
+                "weight": (1 + 0.1 * MLXRandom.normal([1024])).asType(.bfloat16)
+            ]))
+        }
+        connection.train(false)
+        norm.train(false)
+        for (index, length) in [1, 1, 3, 8].enumerated() {
+            let x = withRandomState(MLXRandom.RandomState(seed: UInt64(30 + index))) {
+                MLXRandom.normal([1, length, 4, 1024]).asType(.bfloat16)
+            }
+            let z = MLXFast.rmsNorm(
+                x.asType(.float32).reshaped(1, length, 4 * 1024), weight: MLXArray.mlxNone,
+                eps: connection.normEps)
+            let mixes = try XCTUnwrap(glm5NextHCMix(x, fn: connection.fn, eps: connection.normEps))
+            // The reference mixes short blocks one token (one M = 1 GEMV) at a time.
+            let tokenwise = concatenated(
+                (0 ..< length).map { matmul(z[0..., $0 ..< ($0 + 1)], connection.fn.T) }, axis: 1)
+            assertBitwiseEqual(mixes, tokenwise, "mixes at length \(length)")
+
+            connection.fusedDecode = false
+            let (normedOps, postOps, combOps) = connection.normalizedBranchInput(x, norm: norm)
+            connection.fusedDecode = true
+            let fused = try XCTUnwrap(
+                glm5NextHCNorm(
+                    x, mixes: mixes, scale: connection.scale, base: connection.base,
+                    normWeight: norm.weight, sinkhornIterations: connection.sinkhornIterations,
+                    hcEps: connection.hcEps, normEps: norm.eps))
+            let (normed, post, comb) = connection.normalizedBranchInput(x, norm: norm)
+            assertBitwiseEqual(normed, fused.0, "decode path runs the kernel")
+            // Past one token the op path mixes with an M = L GEMM (TF32 on NAX
+            // GPUs), not the reference's per-token GEMV.
+            guard length == 1 else { continue }
+            XCTAssertLessThanOrEqual(maxAbsDifference(post, postOps), 1e-6)
+            XCTAssertLessThanOrEqual(maxAbsDifference(comb, combOps), 1e-6)
+            // One bf16 ulp at the normalized magnitude (|x| < 8).
+            XCTAssertLessThanOrEqual(maxAbsDifference(normed, normedOps), 0.0625)
+            XCTAssertGreaterThan(
+                (normed .== normedOps).asType(.float32).mean().item(Float.self), 0.95)
+        }
     }
 
     /// End to end: decode logits with the fused KDA step equal the op path's.
@@ -334,11 +393,18 @@ final class GLM5NextTests: XCTestCase {
         let model = GLM5NextTextModel(try configuration(indexTopk: 8, linearHeadDim: 128))
         randomize(model)
         castToBFloat16(model)
+        model.train(false)
         let input = tokens(30)
 
         func decode(fused: Bool) throws -> [MLXArray] {
             for layer in model.model.layers where layer.isLinear {
                 (layer.selfAttn as! GLM5NextLinearAttention).fusedDecode = fused
+            }
+            // Only the KDA step is compared bitwise here; the HC kernels
+            // have their own test.
+            for layer in model.model.layers {
+                layer.attnHC.fusedDecode = false
+                layer.ffnHC.fusedDecode = false
             }
             let cache = try model.newCache(parameters: nil)
             var logits = [model(input[0..., ..<20], cache: cache)[0..., -1]]

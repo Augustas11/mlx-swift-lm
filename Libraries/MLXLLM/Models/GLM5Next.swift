@@ -47,6 +47,12 @@ private func makeLimitedSwiGLU(limit: Float?) -> @Sendable (MLXArray, MLXArray) 
 final class GLM5NextHyperConnection: Module {
     let hcMult: Int
     let normEps: Float
+    let hcEps: Float
+    let sinkhornIterations: Int
+
+    /// One-sequence decode (up to 8 tokens) runs the mix GEMV and the
+    /// Sinkhorn + collapse + branch RMSNorm as two kernels, as the reference.
+    var fusedDecode = true
 
     @ParameterInfo(key: "fn") var fn: MLXArray
     @ParameterInfo(key: "base") var base: MLXArray
@@ -60,6 +66,8 @@ final class GLM5NextHyperConnection: Module {
         let eps = config.hcEps
         self.hcMult = hc
         self.normEps = config.rmsNormEps
+        self.hcEps = eps
+        self.sinkhornIterations = iterations
 
         let mix = (2 + hc) * hc
         _fn.wrappedValue = MLXArray.zeros([mix, hc * config.hiddenSize], dtype: .float32)
@@ -98,6 +106,21 @@ final class GLM5NextHyperConnection: Module {
         let (pre, post, comb) = sinkhorn(mixes, scale, base)
         let collapsed = (expandedDimensions(pre, axis: -1) * y).sum(axis: 2).asType(x.dtype)
         return (collapsed, post, comb)
+    }
+
+    /// `norm(collapsed)`, `post` and `comb` for a branch: the reference
+    /// model's decode kernels for one sequence, the op path otherwise.
+    func normalizedBranchInput(_ x: MLXArray, norm: RMSNorm) -> (MLXArray, MLXArray, MLXArray) {
+        if fusedDecode, !training, x.dim(0) == 1, x.dim(1) <= 8, hcMult == 4,
+            let mixes = glm5NextHCMix(x, fn: fn, eps: normEps),
+            let fused = glm5NextHCNorm(
+                x, mixes: mixes, scale: scale, base: base, normWeight: norm.weight,
+                sinkhornIterations: sinkhornIterations, hcEps: hcEps, normEps: norm.eps)
+        {
+            return fused
+        }
+        let (collapsed, post, comb) = self(x)
+        return (norm(collapsed), post, comb)
     }
 }
 
@@ -698,8 +721,7 @@ final class GLM5NextDecoderLayer: Module {
     func callAsFunction(_ x: MLXArray, cache: KVCache?, previousTopk: MLXArray?) -> (
         MLXArray, MLXArray?
     ) {
-        let (collapsed, post, comb) = attnHC(x)
-        let normed = inputLayerNorm(collapsed)
+        let (normed, post, comb) = attnHC.normalizedBranchInput(x, norm: inputLayerNorm)
         let attention: MLXArray
         var topk = previousTopk
         if isLinear {
@@ -711,8 +733,8 @@ final class GLM5NextDecoderLayer: Module {
         }
         let h = glm5NextHCExpand(attention, x, post, comb)
 
-        let (ffnIn, ffnPost, ffnComb) = ffnHC(h)
-        let ffnNormed = postAttentionLayerNorm(ffnIn)
+        let (ffnNormed, ffnPost, ffnComb) = ffnHC.normalizedBranchInput(
+            h, norm: postAttentionLayerNorm)
         let ffnOut = (mlp as! UnaryLayer)(ffnNormed)
         return (glm5NextHCExpand(ffnOut, h, ffnPost, ffnComb), topk)
     }

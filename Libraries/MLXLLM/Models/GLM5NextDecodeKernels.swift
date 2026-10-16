@@ -12,9 +12,17 @@
 //  the separate q/k/v projections and precomputed gate projections instead of
 //  one fused projection, and every state input is always present.
 //
-//  Each kernel replays the arithmetic of the op graph it replaces (rounding
-//  points, reduction order, MLX's Sigmoid functor), so the fused decode path
-//  and `GLM5NextLinearAttention`'s op path agree; `GLM5NextTests` checks it.
+//  `glm5NextHCNorm`'s source is mlx-vlm 0.7.8's `exact_hc_norm`
+//  (`mlx_vlm/models/fast_ops.py`, https://github.com/Blaizzy/mlx-vlm),
+//  Copyright (c) 2025 Prince Canuma, MIT License: permission is granted, free
+//  of charge, to deal in the software without restriction, provided this
+//  notice is included; the software is provided "as is", without warranty of
+//  any kind.
+//
+//  The KDA kernel and `glm5NextHCMix` replay the arithmetic of the op graphs
+//  they replace (rounding points, reduction order, MLX's Sigmoid functor);
+//  `glm5NextHCNorm` is the reference model's own decode kernel (fast exp,
+//  FMA collapse). `GLM5NextTests` checks each one.
 //
 
 import Foundation
@@ -264,5 +272,270 @@ func glm5NextKDADecodeStep(
         threadGroup: (1024, 1, 1),
         outputShapes: [[1, T, qkv], [1, 3, 3 * qkv], [1, heads, headDim, headDim]],
         outputDTypes: [dtype, dtype, .float32])
+    return (outputs[0], outputs[1], outputs[2])
+}
+
+// MARK: - Hyper-connection decode (mix GEMV, Sinkhorn + collapse + RMSNorm)
+
+/// `matmul(rmsNorm(x.flatten(-2)), fn.T)` for one token per threadgroup row:
+/// MLX's rms_looped reduction (1024 threads, 4 reads each) and its fp32 gemv
+/// lane order (oMLX `hc_mix`).
+private let glm5NextHCMixSource = """
+      const uint lid = thread_position_in_threadgroup.x;
+      const uint simd_lid = thread_index_in_simdgroup;
+      const uint simd_gid = simdgroup_index_in_threadgroup;
+      const int tok = int(threadgroup_position_in_grid.y);
+      const int row = int(threadgroup_position_in_grid.x);
+      constexpr int KSZ = HCD;
+      const device T* xr = x + size_t(tok) * KSZ;
+
+      threadgroup float local_inv_mean[1];
+      threadgroup float local_sums[32];
+      for (int v = 0; v < 4; v++) {
+        const uint vt = uint(v) * 256 + lid;
+        float acc = 0;
+        for (uint r = 0; r < uint(KSZ); r += 1024 * 4) {
+          for (int i = 0; i < 4; i++) {
+            float xi = static_cast<float>(xr[r + vt * 4 + i]);
+            acc += xi * xi;
+          }
+        }
+        acc = simd_sum(acc);
+        if (simd_lid == 0) {
+          local_sums[v * 8 + int(simd_gid)] = acc;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (simd_gid == 0) {
+        float acc = simd_sum(local_sums[simd_lid]);
+        if (simd_lid == 0) {
+          local_inv_mean[0] = metal::precise::rsqrt(acc / KSZ + eps[0]);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const float inv = local_inv_mean[0];
+
+      threadgroup float partial[8];
+      const int sgN = int(simd_gid);
+      float result = 0;
+      const device float* mrow = fn + size_t(row) * KSZ;
+      int bn = (32 * sgN + int(simd_lid)) * 4;
+      for (int i = 0; i < KSZ / 1024; ++i) {
+        float v_coeff[4];
+        float inter[4];
+        for (int tn = 0; tn < 4; tn++) {
+          v_coeff[tn] = static_cast<float>(xr[bn + tn]) * inv;
+        }
+        for (int tn = 0; tn < 4; tn++) {
+          inter[tn] = mrow[bn + tn];
+        }
+        for (int tn = 0; tn < 4; tn++) {
+          result += inter[tn] * v_coeff[tn];
+        }
+        bn += 1024;
+      }
+      for (ushort sn = 16; sn >= 1; sn >>= 1) {
+        result += simd_shuffle_down(result, sn);
+      }
+      if (simd_lid == 0) {
+        partial[sgN] = result;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sgN == 0 && simd_lid == 0) {
+        float total = partial[0];
+        for (int s = 1; s < 8; s++) {
+          total += partial[s];
+        }
+        mixes[size_t(tok) * MIX + row] = total;
+      }
+    """
+
+/// Sinkhorn (fast exp, as mlx-vlm's decode kernel), FMA collapse rounded to
+/// the activation dtype, and the branch's RMSNorm, one token per threadgroup.
+private let glm5NextHCNormSource = """
+    uint row = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+
+    constexpr int MIX = (2 + HC) * HC;
+    constexpr int BASE_OFF = 2 * HC;
+    constexpr float HC_EPS = HC_EPS_INT * 1e-9;
+    constexpr float NORM_EPS = NORM_EPS_INT * 1e-9;
+    constexpr int D4 = D / 4;
+
+    const device float* mix = mixes + row * MIX;
+    device float* post_out = post + row * HC;
+    device float* comb_out = comb + row * HC * HC;
+    threadgroup float pre_shared[HC];
+    threadgroup float local_inv_mean[1];
+    threadgroup float local_sums[32];
+
+    if (sg == 0) {
+      const float pre_scale = scale[0];
+      const float post_scale = scale[1];
+      const float comb_scale = scale[2];
+      const float active = lane < (uint)HC ? 1.0f : 0.0f;
+      const uint llane = metal::min(lane, (uint)(HC - 1));
+
+      float pre_z = mix[llane] * pre_scale + base[llane];
+      float post_z = mix[HC + llane] * post_scale + base[HC + llane];
+      float pre_v = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + HC_EPS;
+      float post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
+      if (lane < (uint)HC) {
+        pre_shared[lane] = pre_v;
+        post_out[lane] = post_v;
+      }
+
+      float4 value =
+          (*(const device float4*)(mix + BASE_OFF + llane * HC) * comb_scale +
+           *(const device float4*)(base + BASE_OFF + llane * HC)) * active;
+      float row_max = metal::max(
+          metal::max(value.x, value.y), metal::max(value.z, value.w));
+      float4 exponent = metal::fast::exp(value - row_max) * active;
+      float4 result = exponent *
+              (1.0f /
+               (exponent.x + exponent.y + exponent.z + exponent.w + HC_EPS)) +
+          HC_EPS * active;
+      float4 column_inv = 1.0f /
+          (float4(
+               simd_sum(result.x), simd_sum(result.y),
+               simd_sum(result.z), simd_sum(result.w)) +
+           HC_EPS);
+      result *= column_inv;
+      for (int iter = 1; iter < ITERS; ++iter) {
+        result *=
+            (1.0f / (result.x + result.y + result.z + result.w + HC_EPS)) *
+            active;
+        column_inv = 1.0f /
+            (float4(
+                 simd_sum(result.x), simd_sum(result.y),
+                 simd_sum(result.z), simd_sum(result.w)) +
+             HC_EPS);
+        result *= column_inv;
+      }
+      if (lane < (uint)HC) {
+        *(device float4*)(comb_out + lane * HC) = result;
+      }
+    }
+
+    if (sg == 0) {
+      local_sums[lane] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const device T* x_row = (const device T*)x_in + row * HC * D;
+    using T4 = vec<T, 4>;
+    const device T4* x0 = (const device T4*)(x_row);
+    const device T4* x1 = (const device T4*)(x_row + D);
+    const device T4* x2 = (const device T4*)(x_row + 2 * D);
+    const device T4* x3 = (const device T4*)(x_row + 3 * D);
+
+    T4 rounded = T4(0);
+    float accum = 0.0f;
+    if (tid < D4) {
+      float4 collapsed = fma(
+          float4(pre_shared[0]), float4(x0[tid]),
+          fma(
+              float4(pre_shared[1]), float4(x1[tid]),
+              fma(
+                  float4(pre_shared[2]), float4(x2[tid]),
+                  float4(pre_shared[3]) * float4(x3[tid]))));
+      rounded = T4(collapsed);
+      float4 rounded_float = float4(rounded);
+      accum += rounded_float.x * rounded_float.x;
+      accum += rounded_float.y * rounded_float.y;
+      accum += rounded_float.z * rounded_float.z;
+      accum += rounded_float.w * rounded_float.w;
+    }
+
+    accum = simd_sum(accum);
+    if (lane == 0) {
+      local_sums[sg] = accum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      accum = simd_sum(local_sums[lane]);
+      if (lane == 0) {
+        local_inv_mean[0] = metal::precise::rsqrt(accum / D + NORM_EPS);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < D4) {
+      float inv = local_inv_mean[0];
+      const device T4* weights = (const device T4*)norm_weight;
+      T4 scaled = T4(float4(rounded) * inv);
+      T4 weight = weights[tid];
+      ((device T4*)normalized)[row * D4 + tid] = T4(
+          weight.x * scaled.x,
+          weight.y * scaled.y,
+          weight.z * scaled.z,
+          weight.w * scaled.w);
+    }
+    """
+
+private final class GLM5NextHCKernels: Sendable {
+    static let shared = GLM5NextHCKernels()
+    let mix: MLXFast.MLXFastKernel
+    let norm: MLXFast.MLXFastKernel
+
+    private init() {
+        mix = MLXFast.metalKernel(
+            name: "glm5next_hc_mix", inputNames: ["x", "fn", "eps"], outputNames: ["mixes"],
+            source: glm5NextHCMixSource)
+        norm = MLXFast.metalKernel(
+            name: "glm5next_hc_norm",
+            inputNames: ["x_in", "mixes", "scale", "base", "norm_weight"],
+            outputNames: ["normalized", "post", "comb"],
+            source: glm5NextHCNormSource)
+    }
+}
+
+/// `matmul(rmsNorm(x.flatten(-2), eps), fn.T)` for `x: [B, L, HC, D]`:
+/// `[B, L, MIX]` float32, or `nil` outside the replicated configuration.
+func glm5NextHCMix(_ x: MLXArray, fn: MLXArray, eps: Float) -> MLXArray? {
+    guard x.ndim == 4, fn.ndim == 2, fn.dtype == .float32,
+        [.bfloat16, .float16, .float32].contains(x.dtype)
+    else { return nil }
+    let (B, L) = (x.dim(0), x.dim(1))
+    let K = x.dim(2) * x.dim(3)
+    let mix = fn.dim(0)
+    guard fn.dim(1) == K, K % 4096 == 0, mix < 4096, K >= 16 * mix else { return nil }
+    return GLM5NextHCKernels.shared.mix(
+        [x, fn, MLXArray([eps])],
+        template: [("T", x.dtype), ("HCD", K), ("MIX", mix)],
+        grid: (256 * mix, B * L, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[B, L, mix]],
+        outputDTypes: [.float32])[0]
+}
+
+/// Sinkhorn, collapse and the branch RMSNorm for `x: [B, L, 4, D]` and its
+/// `mixes`: `(normalized [B, L, D], post [B, L, 4], comb [B, L, 4, 4])`, or
+/// `nil` outside the kernel's configuration.
+func glm5NextHCNorm(
+    _ x: MLXArray, mixes: MLXArray, scale: MLXArray, base: MLXArray, normWeight: MLXArray,
+    sinkhornIterations: Int, hcEps: Float, normEps: Float
+) -> (MLXArray, MLXArray, MLXArray)? {
+    guard x.ndim == 4, [.bfloat16, .float16].contains(x.dtype), x.dim(2) == 4,
+        x.dim(3) % 4 == 0, x.dim(3) <= 4096, normWeight.dtype == x.dtype,
+        normWeight.shape == [x.dim(3)], mixes.dtype == .float32,
+        mixes.shape == [x.dim(0), x.dim(1), 24],
+        scale.dtype == .float32, scale.shape == [3], base.dtype == .float32, base.shape == [24]
+    else { return nil }
+    let (B, L, hc, D) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3))
+    let threads = max(32, ((D / 4 + 31) / 32) * 32)
+    let outputs = GLM5NextHCKernels.shared.norm(
+        [x, mixes, scale, base, normWeight],
+        template: [
+            ("T", x.dtype), ("HC", hc), ("D", D), ("ITERS", sinkhornIterations),
+            ("HC_EPS_INT", Int((Double(hcEps) / 1e-9).rounded())),
+            ("NORM_EPS_INT", Int((Double(normEps) / 1e-9).rounded())),
+        ],
+        grid: (B * L * threads, 1, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [[B, L, D], [B, L, hc], [B, L, hc, hc]],
+        outputDTypes: [x.dtype, .float32, .float32])
     return (outputs[0], outputs[1], outputs[2])
 }
