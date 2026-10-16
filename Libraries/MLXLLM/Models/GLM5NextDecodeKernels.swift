@@ -440,7 +440,7 @@ func glm5NextKDADecodeStep(
 private let glm5NextMultiQMVSource = """
       const uint lane = thread_index_in_simdgroup;
       const int sg = int(simdgroup_index_in_threadgroup);
-      const int row0 = int(threadgroup_position_in_grid.x) * 8;
+      const int row0 = int(threadgroup_position_in_grid.x) * (RPS * NSGQ);
       constexpr int WB = K * BITS / 8;
       constexpr int G = K / GS;
       const device uint8_t* w = (const device uint8_t*)w0;
@@ -463,11 +463,14 @@ private let glm5NextMultiQMVSource = """
     #if NP > 5
       if (row0 >= N0 + N1 + N2 + N3 + N4) { w = (const device uint8_t*)w5; sc = s5; bi = b5; y = y5; local = row0 - N0 - N1 - N2 - N3 - N4; }
     #endif
-      const int r0 = local + sg * 4;
-      float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-      glm_qmv_rows<T, K, GS, BITS, 4>(
+      const int r0 = local + sg * RPS;
+      float result[RPS];
+      for (int r = 0; r < RPS; r++) {
+        result[r] = 0.0f;
+      }
+      glm_qmv_rows<T, K, GS, BITS, RPS>(
           w + size_t(r0) * WB, sc + r0 * G, bi + r0 * G, x, lane, result);
-      for (int r = 0; r < 4; r++) {
+      for (int r = 0; r < RPS; r++) {
         float v = simd_sum(result[r]);
         if (lane == 0) {
           y[r0 + r] = static_cast<T>(v);
@@ -496,8 +499,12 @@ private final class GLM5NextMultiQMVKernels: @unchecked Sendable {
 }
 
 /// One-token outputs `[1, N_i]` of up to six projections sharing bits and
-/// group size, or `nil` when not covered.
-func glm5NextMultiQMV(_ x: MLXArray, _ parts: [GLM5NextAffine]) -> [MLXArray]? {
+/// group size, or `nil` when not covered. Each simdgroup reduces `rps` rows
+/// (every row's arithmetic is independent of the layout); a threadgroup has
+/// `nsg` simdgroups.
+func glm5NextMultiQMV(
+    _ x: MLXArray, _ parts: [GLM5NextAffine], rps: Int = 4, nsg: Int = 2
+) -> [MLXArray]? {
     guard x.ndim == 2, x.dim(0) == 1, [.bfloat16, .float16].contains(x.dtype),
         (1 ... 6).contains(parts.count)
     else { return nil }
@@ -507,12 +514,13 @@ func glm5NextMultiQMV(_ x: MLXArray, _ parts: [GLM5NextAffine]) -> [MLXArray]? {
     for p in parts {
         guard (p.bits, p.groupSize) == (bits, groupSize), p.weight.ndim == 2,
             p.weight.dim(1) * 32 / bits == K, p.scales.dtype == x.dtype, p.biases.dtype == x.dtype,
-            glm5NextQMVFastCovered(bits: bits, groupSize: groupSize, n: p.weight.dim(0), k: K)
+            glm5NextQMVFastCovered(bits: bits, groupSize: groupSize, n: p.weight.dim(0), k: K),
+            p.weight.dim(0) % (rps * nsg) == 0
         else { return nil }
         rows.append(p.weight.dim(0))
     }
     var template: [(String, any KernelTemplateArg)] = [
-        ("T", x.dtype), ("K", K), ("BITS", bits), ("GS", groupSize),
+        ("T", x.dtype), ("K", K), ("BITS", bits), ("GS", groupSize), ("RPS", rps), ("NSGQ", nsg),
     ]
     for i in 0 ..< 5 {
         template.append(("N\(i)", i < rows.count ? rows[i] : 0))
@@ -520,8 +528,8 @@ func glm5NextMultiQMV(_ x: MLXArray, _ parts: [GLM5NextAffine]) -> [MLXArray]? {
     return GLM5NextMultiQMVKernels.shared.kernel(parts: parts.count)(
         [x] + parts.flatMap { [$0.weight, $0.scales, $0.biases] },
         template: template,
-        grid: (64 * (rows.reduce(0, +) / 8), 1, 1),
-        threadGroup: (64, 1, 1),
+        grid: (32 * nsg * (rows.reduce(0, +) / (rps * nsg)), 1, 1),
+        threadGroup: (32 * nsg, 1, 1),
         outputShapes: rows.map { [1, $0] },
         outputDTypes: Array(repeating: x.dtype, count: rows.count))
 }
@@ -2010,10 +2018,9 @@ func glm5NextMoEExperts(
     _ x: MLXArray, sig: MLXArray, biased: MLXArray, topK: Int, scaling: Float,
     normalize: Bool, limit: Float,
     gate: GLM5NextAffine, up: GLM5NextAffine, down: GLM5NextAffine,
-    sharedGate: GLM5NextAffine, sharedUp: GLM5NextAffine, sharedDown: GLM5NextAffine
+    sharedGate: GLM5NextAffine, sharedUp: GLM5NextAffine, sharedDown: GLM5NextAffine,
+    rps: Int = 4, nsg: Int = 2
 ) -> MLXArray? {
-    let rps = 4
-    let nsg = 2
     guard x.ndim == 2, x.dim(0) == 1, [.bfloat16, .float16].contains(x.dtype),
         sig.dtype == .float32, biased.dtype == .float32, sig.ndim == 2, sig.dim(0) == 1,
         biased.shape == sig.shape, sig.dim(1) <= 1024, (1 ... 32).contains(topK),
