@@ -388,6 +388,79 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
+    /// The deferred one-token hyper-connection chain (`glm5NextHCPre` with
+    /// the previous expand folded in, `glm5NextHCPost` for post, comb and the
+    /// comb product) reproduces expand + `glm5NextHCMix` + `glm5NextHCNorm`
+    /// bit for bit where MLX computes the comb product without NAX; where it
+    /// uses NAX (TF32 GEMMs) the model keeps the non-deferred path.
+    func testDeferredHyperConnectionDecodeMatchesChainBitwise() throws {
+        let json = textConfigJSON().replacingOccurrences(
+            of: #""hidden_size": 64"#, with: #""hidden_size": 1024"#)
+        let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+
+        let model = GLM5NextTextModel(config)
+        randomize(model, seed: 61)
+        castToBFloat16(model)
+        model.train(false)
+        let input = tokens(18)
+        func decode(deferred: Bool) throws -> [MLXArray] {
+            model.model.deferredDecode = deferred
+            let cache = try model.newCache(parameters: nil)
+            var logits = [model(input[0..., ..<12], cache: cache)[0..., -1]]
+            for t in 12 ..< 18 {
+                logits.append(model(input[0..., t ..< (t + 1)], cache: cache)[0..., -1])
+            }
+            eval(logits)
+            return logits
+        }
+        let deferred = try decode(deferred: true)
+        let reference = try decode(deferred: false)
+        for (step, (a, b)) in zip(deferred, reference).enumerated() {
+            assertBitwiseEqual(a, b, "logits at step \(step)")
+        }
+        let layer = model.model.layers[0]
+        XCTAssertTrue(layer.deferredDecodeSupported(dtype: .bfloat16))
+        guard glm5NextHCDeferredExact else { return }
+
+        // Kernel level, one half-layer and its successor.
+        let connection = layer.attnHC
+        let norm = layer.inputLayerNorm
+        let (x, y) = withRandomState(MLXRandom.RandomState(seed: 62)) {
+            (
+                MLXRandom.normal([1, 1, 4, 1024]).asType(.bfloat16),
+                MLXRandom.normal([1, 1, 1024]).asType(.bfloat16)
+            )
+        }
+        let mixes = try XCTUnwrap(glm5NextHCMix(x, fn: connection.fn, eps: connection.normEps))
+        let chain = try XCTUnwrap(
+            glm5NextHCNorm(
+                x, mixes: mixes, scale: connection.scale, base: connection.base,
+                normWeight: norm.weight, sinkhornIterations: connection.sinkhornIterations,
+                hcEps: connection.hcEps, normEps: norm.eps))
+        let (normalized, h, post, comb, mm) = connection.deferredBranchInput(
+            .materialized(x), norm: norm)
+        assertBitwiseEqual(normalized, chain.0, "branch input")
+        assertBitwiseEqual(h, x, "residual")
+        assertBitwiseEqual(post, chain.1, "post")
+        assertBitwiseEqual(comb, chain.2, "comb")
+        assertBitwiseEqual(
+            mm.reshaped(1, 1, 4, 1024),
+            matmul(comb.swappedAxes(-1, -2), x.asType(.float32)), "comb product")
+
+        let next = glm5NextHCExpand(y, x, post, comb)
+        let (nextNormalized, nextH, _, _, _) = connection.deferredBranchInput(
+            .deferred(y: y, residual: x, post: post, comb: comb, mm: mm), norm: norm)
+        assertBitwiseEqual(nextH, next, "folded expand")
+        let nextMixes = try XCTUnwrap(
+            glm5NextHCMix(next, fn: connection.fn, eps: connection.normEps))
+        let nextChain = try XCTUnwrap(
+            glm5NextHCNorm(
+                next, mixes: nextMixes, scale: connection.scale, base: connection.base,
+                normWeight: norm.weight, sinkhornIterations: connection.sinkhornIterations,
+                hcEps: connection.hcEps, normEps: norm.eps))
+        assertBitwiseEqual(nextNormalized, nextChain.0, "branch input after a folded expand")
+    }
+
     /// `glm5NextMoERouter` reproduces the router op path bit for bit: the
     /// selected experts in argPartition's order (ties to the lower expert),
     /// and the normalized, scaled scores.

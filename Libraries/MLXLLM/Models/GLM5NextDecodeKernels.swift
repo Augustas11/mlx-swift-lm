@@ -22,7 +22,9 @@
 //  The KDA, router and `glm5NextHCMix` kernels replay the arithmetic of the op graphs
 //  they replace (rounding points, reduction order, MLX's Sigmoid functor);
 //  `glm5NextHCNorm` is the reference model's own decode kernel (fast exp,
-//  FMA collapse). `GLM5NextTests` checks each one.
+//  FMA collapse); the deferred `glm5NextHCPre` / `glm5NextHCPost` pair
+//  reproduces expand + hc_mix + hc_norm bit for bit. `GLM5NextTests` checks
+//  each one.
 //
 
 import Foundation
@@ -701,4 +703,417 @@ func glm5NextMoERouter(
         outputShapes: [[T, topK], [T, topK]],
         outputDTypes: [.uint32, .float32])
     return (selected[0], selected[1])
+}
+
+// MARK: - Deferred hyper-connection decode (one token)
+//
+// A half-layer's chain is expand (previous branch) -> hc_mix -> hc_norm ->
+// branch. `glm5NextHCPre` computes the mix GEMV (hc_mix's arithmetic), the
+// pre weights, the FMA collapse and the branch RMSNorm (hc_norm's) in one
+// dispatch, and in deferred form rebuilds h = bf16(post * y + mm) (the
+// expand's epilogue) as it loads it, storing h for the next half-layer.
+// `glm5NextHCPost` computes post, the Sinkhorn comb and the expand's comb
+// product mm = comb^T @ float(h), which only the next half-layer reads.
+// Sources adapted from oMLX `hc_pre_fused` / `hc_post_mm`; the comb product
+// replays MLX's non-NAX fp32 steel GEMM (simdgroup MMA) instead of oMLX's
+// NAX matmul2d, so these run where MLX runs that GEMM without NAX.
+
+private let glm5NextHCPreHeader = """
+    #include <metal_simdgroup>
+    #include <metal_stdlib>
+    using namespace metal;
+
+    // hc_expand_one's epilogue for element e = r * D + col of h.
+    template <typename T, int D, typename YPtr, typename MPtr, typename PPtr>
+    inline T glm_hc_expand_value(YPtr y, MPtr mm, PPtr post, int e) {
+      const int r = e / D;
+      const int col = e - r * D;
+      volatile float prod = post[r] * static_cast<float>(y[col]);
+      float sum = prod + mm[e];
+      return static_cast<T>(sum);
+    }
+    """
+
+private let glm5NextHCPreSource = """
+      const uint lid = thread_position_in_threadgroup.x;
+      const uint simd_lid = thread_index_in_simdgroup;
+      const uint simd_gid = simdgroup_index_in_threadgroup;
+      const int tile = int(threadgroup_position_in_grid.x);
+      constexpr int KSZ = HC * D;
+      constexpr int CH = KSZ / 4096;  // rms_looped reads per thread, 4 values each
+      constexpr int D4 = D / 4;
+      static_assert(KSZ % 4096 == 0 && D4 <= 1024 && D % 4 == 0, "hc_pre_fused shape");
+      constexpr float HC_EPS = HC_EPS_INT * 1e-9;
+      constexpr float NORM_EPS = NORM_EPS_INT * 1e-9;
+      using T4 = vec<T, 4>;
+    #if DEFERRED
+    #define HVAL(e) glm_hc_expand_value<T, D>(y, mm, post, (e))
+    #else
+    #define HVAL(e) x[(e)]
+    #endif
+
+      // This thread's h values in rms_looped order.
+      T hv[CH][4];
+      for (int c = 0; c < CH; c++) {
+        for (int i = 0; i < 4; i++) {
+          hv[c][i] = HVAL(c * 4096 + int(lid) * 4 + i);
+        }
+      }
+    #if DEFERRED
+      if (tile == 0) {
+        for (int c = 0; c < CH; c++) {
+          for (int i = 0; i < 4; i++) {
+            h_out[c * 4096 + int(lid) * 4 + i] = hv[c][i];
+          }
+        }
+      }
+    #endif
+
+      // --- hc_mix: rms_looped (lsize = 1024, N_READS = 4) ---
+      threadgroup float local_inv_mean[1];
+      threadgroup float local_sums[32];
+      float acc = 0;
+      for (int c = 0; c < CH; c++) {
+        for (int i = 0; i < 4; i++) {
+          float xi = static_cast<float>(hv[c][i]);
+          acc += xi * xi;
+        }
+      }
+      acc = simd_sum(acc);
+      if (simd_gid == 0) {
+        local_sums[simd_lid] = 0;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (simd_lid == 0) {
+        local_sums[simd_gid] = acc;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (simd_gid == 0) {
+        acc = simd_sum(local_sums[simd_lid]);
+        if (simd_lid == 0) {
+          local_inv_mean[0] = metal::precise::rsqrt(acc / KSZ + eps[0]);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const float inv = local_inv_mean[0];
+
+      // --- hc_mix gemv: 8 simdgroups per row, 4 rows per threadgroup ---
+      const int slot = int(simd_gid) / 8;
+      const int sgN = int(simd_gid) % 8;
+      const int row = tile * 4 + slot;
+      threadgroup float partial[4][8];
+      threadgroup float row_total[4];
+      float result = 0;
+      {
+        const device float* mrow = fn + size_t(row) * KSZ;
+        int bn = (32 * sgN + int(simd_lid)) * 4;
+        for (int i = 0; i < KSZ / 1024; ++i) {
+          float v_coeff[4];
+          float inter[4];
+          for (int tn = 0; tn < 4; tn++) {
+            v_coeff[tn] = static_cast<float>(HVAL(bn + tn)) * inv;
+          }
+          for (int tn = 0; tn < 4; tn++) {
+            inter[tn] = mrow[bn + tn];
+          }
+          for (int tn = 0; tn < 4; tn++) {
+            result += inter[tn] * v_coeff[tn];
+          }
+          bn += 1024;
+        }
+        for (ushort sn = 16; sn >= 1; sn >>= 1) {
+          result += simd_shuffle_down(result, sn);
+        }
+      }
+      if (simd_lid == 0) {
+        partial[slot][sgN] = result;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (sgN == 0 && simd_lid == 0) {
+        float total = partial[slot][0];
+        for (int s = 1; s < 8; s++) {
+          total += partial[slot][s];
+        }
+        mixes[row] = total;
+        row_total[slot] = total;
+      }
+      if (tile != 0) {
+        return;
+      }
+
+      // --- threadgroup 0 (the pre rows): exact_hc_norm's collapse + RMSNorm ---
+      threadgroup float pre_shared[HC];
+      threadgroup float norm_inv[1];
+      threadgroup float norm_sums[32];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (simd_gid == 0) {
+        const float pre_scale = scale[0];
+        const uint llane = metal::min(simd_lid, (uint)(HC - 1));
+        float pre_z = row_total[llane] * pre_scale + base[llane];
+        float pre_v = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + HC_EPS;
+        if (simd_lid < (uint)HC) {
+          pre_shared[simd_lid] = pre_v;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      T4 rounded = T4(0);
+      float accum = 0.0f;
+      if (int(lid) < D4) {
+        T4 xs[HC];
+        for (int r = 0; r < HC; r++) {
+          if (D == 4096) {
+            // Same elements as this thread's rms_looped reads.
+            xs[r] = T4(hv[r][0], hv[r][1], hv[r][2], hv[r][3]);
+          } else {
+            const int e = r * D + int(lid) * 4;
+            xs[r] = T4(HVAL(e), HVAL(e + 1), HVAL(e + 2), HVAL(e + 3));
+          }
+        }
+        float4 collapsed = fma(
+            float4(pre_shared[0]), float4(xs[0]),
+            fma(
+                float4(pre_shared[1]), float4(xs[1]),
+                fma(
+                    float4(pre_shared[2]), float4(xs[2]),
+                    float4(pre_shared[3]) * float4(xs[3]))));
+        rounded = T4(collapsed);
+        float4 rounded_float = float4(rounded);
+        accum += rounded_float.x * rounded_float.x;
+        accum += rounded_float.y * rounded_float.y;
+        accum += rounded_float.z * rounded_float.z;
+        accum += rounded_float.w * rounded_float.w;
+      }
+      accum = simd_sum(accum);
+      if (simd_lid == 0) {
+        norm_sums[simd_gid] = accum;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (simd_gid == 0) {
+        accum = simd_sum(norm_sums[simd_lid]);
+        if (simd_lid == 0) {
+          norm_inv[0] = metal::precise::rsqrt(accum / D + NORM_EPS);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (int(lid) < D4) {
+        float ninv = norm_inv[0];
+        const device T4* weights = (const device T4*)norm_weight;
+        T4 scaled = T4(float4(rounded) * ninv);
+        T4 weight = weights[lid];
+        ((device T4*)normalized)[lid] = T4(
+            weight.x * scaled.x,
+            weight.y * scaled.y,
+            weight.z * scaled.z,
+            weight.w * scaled.w);
+      }
+    #undef HVAL
+    """
+
+private let glm5NextHCPostHeader = """
+    #include <metal_simdgroup>
+    #include <metal_stdlib>
+    using namespace metal;
+
+    template <int HC, int ITERS, int HC_EPS_INT, typename MixPtr, typename BasePtr>
+    inline void glm_hc_post_comb(
+        MixPtr mix, const float post_scale, const float comb_scale, BasePtr base,
+        uint lane, thread float& post_v, thread float4& result) {
+      constexpr int BASE_OFF = 2 * HC;
+      constexpr float HC_EPS = HC_EPS_INT * 1e-9;
+      const float active = lane < (uint)HC ? 1.0f : 0.0f;
+      const uint llane = metal::min(lane, (uint)(HC - 1));
+
+      float post_z = mix[HC + llane] * post_scale + base[HC + llane];
+      post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
+
+      float4 value =
+          (float4(mix[BASE_OFF + llane * HC], mix[BASE_OFF + llane * HC + 1],
+                  mix[BASE_OFF + llane * HC + 2], mix[BASE_OFF + llane * HC + 3]) * comb_scale +
+           float4(base[BASE_OFF + llane * HC], base[BASE_OFF + llane * HC + 1],
+                  base[BASE_OFF + llane * HC + 2], base[BASE_OFF + llane * HC + 3])) * active;
+      float row_max = metal::max(
+          metal::max(value.x, value.y), metal::max(value.z, value.w));
+      float4 exponent = metal::fast::exp(value - row_max) * active;
+      result = exponent *
+              (1.0f /
+               (exponent.x + exponent.y + exponent.z + exponent.w + HC_EPS)) +
+          HC_EPS * active;
+      float4 column_inv = 1.0f /
+          (float4(
+               simd_sum(result.x), simd_sum(result.y),
+               simd_sum(result.z), simd_sum(result.w)) +
+           HC_EPS);
+      result *= column_inv;
+      for (int iter = 1; iter < ITERS; ++iter) {
+        result *=
+            (1.0f / (result.x + result.y + result.z + result.w + HC_EPS)) *
+            active;
+        column_inv = 1.0f /
+            (float4(
+                 simd_sum(result.x), simd_sum(result.y),
+                 simd_sum(result.z), simd_sum(result.w)) +
+             HC_EPS);
+        result *= column_inv;
+      }
+    }
+    """
+
+private let glm5NextHCPostSource = """
+      const ushort lane = thread_index_in_simdgroup;
+      const uint sg = simdgroup_index_in_threadgroup;
+      static_assert(HC == 4, "one float4 comb row per lane");
+      threadgroup float4 comb_rows[HC];
+      threadgroup float a_tile[64];
+      threadgroup float b_tiles[SIMDS * 64];
+      if (sg == 0) {
+        float post_v;
+        float4 res;
+        glm_hc_post_comb<HC, ITERS, HC_EPS_INT>(mixes, scale[1], scale[2], base, uint(lane), post_v, res);
+        if (lane < HC) {
+          comb_rows[lane] = res;
+          if (threadgroup_position_in_grid.x == 0) {
+            post_out[lane] = post_v;
+            *(device float4*)(comb_out + lane * HC) = res;
+          }
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      // comb^T @ float(residual) as MLX's non-NAX steel GEMM computes it: one
+      // 8x8x8 simdgroup MMA per 8 columns on zero-padded fragments
+      // (A[r][k] = comb[k][r], B[k][c] = residual[k][c], K = HC <= 8).
+      const threadgroup float* comb = (const threadgroup float*)comb_rows;
+      if (sg == 0) {
+        for (int e = lane; e < 64; e += 32) {
+          const int r = e / 8, k = e % 8;
+          a_tile[e] = (r < HC && k < HC) ? comb[k * HC + r] : 0.0f;
+        }
+      }
+      const int col0 = (int(threadgroup_position_in_grid.x) * SIMDS + int(sg)) * 8;
+      threadgroup float* bt = b_tiles + sg * 64;
+      for (int e = lane; e < 64; e += 32) {
+        const int k = e / 8, c = e % 8;
+        bt[e] = (k < HC && col0 + c < D) ? static_cast<float>(residual[k * D + col0 + c]) : 0.0f;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (col0 < D) {
+        simdgroup_matrix<float, 8, 8> A;
+        simdgroup_matrix<float, 8, 8> B;
+        simdgroup_matrix<float, 8, 8> C = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        simdgroup_load(A, a_tile, 8);
+        simdgroup_load(B, bt, 8);
+        simdgroup_multiply_accumulate(C, A, B, C);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_store(C, bt, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (int e = lane; e < HC * 8; e += 32) {
+          const int r = e / 8, c = e % 8;
+          if (col0 + c < D) {
+            mm[r * D + col0 + c] = bt[r * 8 + c];
+          }
+        }
+      }
+    """
+
+private final class GLM5NextHCDeferredKernels: Sendable {
+    static let shared = GLM5NextHCDeferredKernels()
+    let pre: MLXFast.MLXFastKernel
+    let preDeferred: MLXFast.MLXFastKernel
+    let post: MLXFast.MLXFastKernel
+
+    private init() {
+        let common = ["fn", "eps", "scale", "base", "norm_weight"]
+        pre = MLXFast.metalKernel(
+            name: "glm5next_hc_pre", inputNames: ["x"] + common,
+            outputNames: ["normalized", "mixes"],
+            source: "#define DEFERRED 0\n" + glm5NextHCPreSource + "\n#undef DEFERRED\n",
+            header: glm5NextHCPreHeader)
+        preDeferred = MLXFast.metalKernel(
+            name: "glm5next_hc_pre_deferred", inputNames: ["y", "mm", "post"] + common,
+            outputNames: ["normalized", "mixes", "h_out"],
+            source: "#define DEFERRED 1\n" + glm5NextHCPreSource + "\n#undef DEFERRED\n",
+            header: glm5NextHCPreHeader)
+        post = MLXFast.metalKernel(
+            name: "glm5next_hc_post", inputNames: ["mixes", "scale", "base", "residual"],
+            outputNames: ["post_out", "comb_out", "mm"],
+            source: glm5NextHCPostSource, header: glm5NextHCPostHeader)
+    }
+}
+
+/// Whether MLX computes the expand's fp32 comb product without NAX here
+/// (`metal::is_nax_available()` and `MLX_ENABLE_TF32`), the GEMM
+/// `glm5NextHCPost` replays. False on NAX GPUs with TF32 enabled.
+let glm5NextHCDeferredExact: Bool = {
+    let architecture = GPU.deviceInfo().architecture
+    guard let range = architecture.range(of: #"applegpu_g(\d+)"#, options: .regularExpression)
+    else { return true }
+    let gen = Int(architecture[range].dropFirst("applegpu_g".count)) ?? 0
+    let kind = architecture.last
+    var naxOS = false
+    if #available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *) { naxOS = true }
+    let nax = naxOS && gen >= (kind == "p" ? 18 : 17)
+    let tf32 = (ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"].flatMap { Int($0) } ?? 1) != 0
+    return !(nax && tf32)
+}()
+
+/// Shapes the deferred kernels cover: one token, HC = 4, mix = 24,
+/// HC * D a multiple of 4096 and D <= 4096, bf16/fp16 activations.
+func glm5NextHCDeferredSupported(
+    dtype: DType, width: Int, fn: MLXArray, scale: MLXArray, base: MLXArray, normWeight: MLXArray
+) -> Bool {
+    [.bfloat16, .float16].contains(dtype) && width % 4 == 0 && width <= 4096
+        && (4 * width) % 4096 == 0 && fn.dtype == .float32 && fn.shape == [24, 4 * width]
+        && scale.dtype == .float32 && scale.shape == [3] && base.dtype == .float32
+        && base.shape == [24] && normWeight.dtype == dtype && normWeight.shape == [width]
+}
+
+/// One-token branch input from `x: [1, 1, 4, D]` or from the previous
+/// half-layer `(y [1, 1, D], mm [4 * D] fp32, post [1, 1, 4] fp32)`.
+/// Returns `(normalized [1, 1, D], mixes [1, 1, 24], h [1, 1, 4, D])`.
+func glm5NextHCPre(
+    x: MLXArray?, deferred: (y: MLXArray, mm: MLXArray, post: MLXArray)?,
+    fn: MLXArray, scale: MLXArray, base: MLXArray, normWeight: MLXArray,
+    normEps: Float, hcEps: Float, branchNormEps: Float
+) -> (MLXArray, MLXArray, MLXArray) {
+    let kernels = GLM5NextHCDeferredKernels.shared
+    let dtype = x?.dtype ?? deferred!.y.dtype
+    let D = normWeight.dim(0)
+    let rest: [MLXArray] = [fn, MLXArray([normEps]), scale, base, normWeight]
+    let template: [(String, any KernelTemplateArg)] = [
+        ("T", dtype), ("HC", 4), ("D", D),
+        ("HC_EPS_INT", Int((Double(hcEps) / 1e-9).rounded())),
+        ("NORM_EPS_INT", Int((Double(branchNormEps) / 1e-9).rounded())),
+    ]
+    if let deferred {
+        let out = kernels.preDeferred(
+            [deferred.y, deferred.mm, deferred.post] + rest, template: template,
+            grid: (1024 * 6, 1, 1), threadGroup: (1024, 1, 1),
+            outputShapes: [[1, 1, D], [1, 1, 24], [1, 1, 4, D]],
+            outputDTypes: [dtype, .float32, dtype])
+        return (out[0], out[1], out[2])
+    }
+    let out = kernels.pre(
+        [x!] + rest, template: template,
+        grid: (1024 * 6, 1, 1), threadGroup: (1024, 1, 1),
+        outputShapes: [[1, 1, D], [1, 1, 24]], outputDTypes: [dtype, .float32])
+    return (out[0], out[1], x!)
+}
+
+/// `(post [1, 1, 4], comb [1, 1, 4, 4], mm [4 * D])` for one token.
+func glm5NextHCPost(
+    mixes: MLXArray, scale: MLXArray, base: MLXArray, residual: MLXArray,
+    sinkhornIterations: Int, hcEps: Float
+) -> (MLXArray, MLXArray, MLXArray) {
+    let D = residual.dim(-1)
+    let simds = 8
+    let groups = (D / 8 + simds - 1) / simds
+    let out = GLM5NextHCDeferredKernels.shared.post(
+        [mixes, scale, base, residual],
+        template: [
+            ("T", residual.dtype), ("HC", 4), ("D", D), ("ITERS", sinkhornIterations),
+            ("HC_EPS_INT", Int((Double(hcEps) / 1e-9).rounded())), ("SIMDS", simds),
+        ],
+        grid: (32 * simds * groups, 1, 1), threadGroup: (32 * simds, 1, 1),
+        outputShapes: [[1, 1, 4], [1, 1, 4, 4], [4 * D]],
+        outputDTypes: [.float32, .float32, .float32])
+    return (out[0], out[1], out[2])
 }

@@ -27,7 +27,7 @@ private func callMultiLinear(_ module: Module, _ x: MLXArray) -> MLXArray {
 }
 
 /// `post * x + comb^T @ residual`, the residual expansion of one mHC branch.
-private let glm5NextHCExpand: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray =
+let glm5NextHCExpand: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray =
     compile(shapeless: true) { x, residual, post, comb in
         let expanded =
             expandedDimensions(post, axis: -1) * expandedDimensions(x, axis: 2).asType(.float32)
@@ -43,6 +43,22 @@ private func makeLimitedSwiGLU(limit: Float?) -> @Sendable (MLXArray, MLXArray) 
 }
 
 // MARK: - Hyper-connections (mHC)
+
+/// A decoder input between half-layers during one-token decode: either h
+/// itself, or a branch output whose expand `h = expand(y, residual, post,
+/// comb)` is still pending (`mm = comb^T @ float(residual)`).
+enum GLM5NextHCState {
+    case materialized(MLXArray)
+    case deferred(y: MLXArray, residual: MLXArray, post: MLXArray, comb: MLXArray, mm: MLXArray)
+
+    func materialize() -> MLXArray {
+        switch self {
+        case .materialized(let h): h
+        case .deferred(let y, let residual, let post, let comb, _):
+            glm5NextHCExpand(y, residual, post, comb)
+        }
+    }
+}
 
 final class GLM5NextHyperConnection: Module {
     let hcMult: Int
@@ -121,6 +137,38 @@ final class GLM5NextHyperConnection: Module {
         }
         let (collapsed, post, comb) = self(x)
         return (norm(collapsed), post, comb)
+    }
+
+    func deferredDecodeSupported(dtype: DType, norm: RMSNorm) -> Bool {
+        fusedDecode && !training && hcMult == 4
+            && glm5NextHCDeferredSupported(
+                dtype: dtype, width: fn.dim(1) / hcMult, fn: fn, scale: scale, base: base,
+                normWeight: norm.weight)
+    }
+
+    /// One-token branch input as `glm5NextHCPre` + `glm5NextHCPost`:
+    /// `(normalized, h, post, comb, mm)`, the values of the expand, mix and
+    /// Sinkhorn + collapse + RMSNorm chain.
+    func deferredBranchInput(_ state: GLM5NextHCState, norm: RMSNorm) -> (
+        MLXArray, MLXArray, MLXArray, MLXArray, MLXArray
+    ) {
+        let (normalized, mixes, h): (MLXArray, MLXArray, MLXArray)
+        switch state {
+        case .materialized(let x):
+            (normalized, mixes, h) = glm5NextHCPre(
+                x: x, deferred: nil, fn: fn, scale: scale, base: base, normWeight: norm.weight,
+                normEps: normEps, hcEps: hcEps, branchNormEps: norm.eps)
+        case .deferred(let y, _, let post, _, let mm):
+            (normalized, mixes, h) = glm5NextHCPre(
+                x: nil, deferred: (y, mm, post), fn: fn, scale: scale, base: base,
+                normWeight: norm.weight, normEps: normEps, hcEps: hcEps,
+                branchNormEps: norm.eps)
+        }
+        let (post, comb, mm) = glm5NextHCPost(
+            mixes: mixes, scale: scale, base: base, residual: h,
+            sinkhornIterations: sinkhornIterations, hcEps: hcEps)
+        // Encode the post kernel before the branch so it runs beside it.
+        return (depends(input: normalized, dependencies: [post]), h, post, comb, mm)
     }
 }
 
@@ -759,6 +807,34 @@ final class GLM5NextDecoderLayer: Module {
         return (glm5NextHCExpand(ffnOut, h, ffnPost, ffnComb), topk)
     }
 
+    func deferredDecodeSupported(dtype: DType) -> Bool {
+        attnHC.deferredDecodeSupported(dtype: dtype, norm: inputLayerNorm)
+            && ffnHC.deferredDecodeSupported(dtype: dtype, norm: postAttentionLayerNorm)
+    }
+
+    /// One-token decode with both hyper-connection expands deferred into the
+    /// next half-layer's pre kernel.
+    func decodeDeferred(_ state: GLM5NextHCState, cache: KVCache?, previousTopk: MLXArray?)
+        -> (GLM5NextHCState, MLXArray?)
+    {
+        let (normed, h, post, comb, mm) = attnHC.deferredBranchInput(state, norm: inputLayerNorm)
+        let attention: MLXArray
+        var topk = previousTopk
+        if isLinear {
+            attention = (selfAttn as! GLM5NextLinearAttention)(normed, cache: linearCache(cache))
+        } else {
+            (attention, topk) = (selfAttn as! GLM5NextAttention)(
+                normed, cache: sparseCache(cache), previousTopk: previousTopk)
+        }
+        let (ffnNormed, ffnH, ffnPost, ffnComb, ffnMM) = ffnHC.deferredBranchInput(
+            .deferred(y: attention, residual: h, post: post, comb: comb, mm: mm),
+            norm: postAttentionLayerNorm)
+        let ffnOut = (mlp as! UnaryLayer)(ffnNormed)
+        return (
+            .deferred(y: ffnOut, residual: ffnH, post: ffnPost, comb: ffnComb, mm: ffnMM), topk
+        )
+    }
+
     private func linearCache(_ cache: KVCache?) -> MambaCache? {
         guard let cache else { return nil }
         guard let mamba = cache as? MambaCache else {
@@ -840,8 +916,25 @@ public final class GLM5NextModelInner: Module {
         super.init()
     }
 
+    /// One-token decode passes deferred hyper-connection state between
+    /// half-layers (`GLM5NextDecoderLayer.decodeDeferred`) where MLX computes
+    /// the expand's comb product without NAX (`glm5NextHCDeferredExact`).
+    var deferredDecode = true
+
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         var h = repeated(expandedDimensions(embedTokens(inputs), axis: 2), count: hcMult, axis: 2)
+
+        if deferredDecode, glm5NextHCDeferredExact, inputs.dim(0) == 1, inputs.dim(1) == 1,
+            layers.allSatisfy({ $0.deferredDecodeSupported(dtype: h.dtype) })
+        {
+            var state = GLM5NextHCState.materialized(h)
+            var topk: MLXArray?
+            for (index, layer) in layers.enumerated() {
+                (state, topk) = layer.decodeDeferred(
+                    state, cache: cache?[index], previousTopk: topk)
+            }
+            return norm(state.materialize().mean(axis: 2))
+        }
 
         var topk: MLXArray?
         for (index, layer) in layers.enumerated() {
