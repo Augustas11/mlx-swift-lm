@@ -613,7 +613,7 @@ final class GLM5NextIndexer: Module {
     }
 
     /// Fold this chunk's keys into the pooled-key cache; returns all pooled keys.
-    func updatePools(_ x: MLXArray, cache: GLM5NextAttentionCache) -> MLXArray? {
+    func updatePools(_ x: MLXArray, cache: any GLM5NextLatentCache) -> MLXArray? {
         let keys = kNorm(wk(x))
         let gates = matmul(x.asType(.float32), compressGate.asType(.float32).T).asType(keys.dtype)
         if let (readyKeys, readyGates) = cache.takeCompleteWindows(keys: keys, gates: gates) {
@@ -784,17 +784,64 @@ final class GLM5NextAttention: Module {
         super.init()
     }
 
-    /// Returns the projected output and the token selection (`nil` when dense) so
-    /// a following `shared` indexer layer can reuse it.
+    /// Returns the projected output and each row's token selection (`nil` when
+    /// dense) so a following `shared` indexer layer can reuse it.
+    ///
+    /// A `GLM5NextBatchedLatentCache` holds one cache per row of `x`: the
+    /// projections run on all rows at once, then each row attends against its
+    /// own cache with its own context length (dense/sparse choice, fused
+    /// selection, SDPA), exactly as a serial decode of that row. Any other
+    /// cache is one `GLM5NextLatentCache` for all of `x`.
     func callAsFunction(
-        _ x: MLXArray, cache: GLM5NextAttentionCache?, previousTopk: MLXArray?
-    ) -> (MLXArray, MLXArray?) {
+        _ x: MLXArray, cache: KVCache?, previousTopk: [MLXArray?]
+    ) -> (MLXArray, [MLXArray?]) {
         let (B, L) = (x.dim(0), x.dim(1))
-        let cache = cache ?? GLM5NextAttentionCache(kpool: indexer?.kpool ?? 1)
+        let rows: [any GLM5NextLatentCache]
+        switch cache {
+        case let batch as any GLM5NextBatchedLatentCache:
+            precondition(
+                batch.rowCaches.count == B,
+                "GLM5Next batched cache has \(batch.rowCaches.count) rows for a batch of \(B)")
+            rows = batch.rowCaches
+        case let serial as any GLM5NextLatentCache:
+            rows = [serial]
+        case nil:
+            rows = [GLM5NextAttentionCache(kpool: indexer?.kpool ?? 1)]
+        default:
+            fatalError(
+                "GLM5Next sparse layer needs a GLM5NextLatentCache, got \(type(of: cache!))")
+        }
 
         let qResid = qALayerNorm(qAProj(x))
         let q = qBProj(qResid).reshaped(B, L, numHeads, qHeadDim).transposed(0, 2, 1, 3)
-        let latent = cache.appendLatent(expandedDimensions(kvALayerNorm(kvAProj(x)), axis: 1))
+        let latentIn = expandedDimensions(kvALayerNorm(kvAProj(x)), axis: 1)
+        let qLatent = callMultiLinear(embedQ, q)
+
+        var attended = [MLXArray]()
+        var selections = [MLXArray?]()
+        for (index, rowCache) in rows.enumerated() {
+            func row(_ a: MLXArray) -> MLXArray { rows.count == 1 ? a : a[index ..< (index + 1)] }
+            let (out, topk) = attendRow(
+                x: row(x), qResid: row(qResid), qLatent: row(qLatent), latentIn: row(latentIn),
+                cache: rowCache, previousTopk: index < previousTopk.count ? previousTopk[index] : nil)
+            attended.append(out)
+            selections.append(topk)
+        }
+        let all = attended.count == 1 ? attended[0] : concatenated(attended, axis: 0)
+        let output = callMultiLinear(unembedOut, all)
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, numHeads * vHeadDim)
+        return (oProj(output), selections)
+    }
+
+    /// One cache's attention: append the latent, update the indexer's pools,
+    /// select (or attend densely while the context fits in `index_topk`).
+    private func attendRow(
+        x: MLXArray, qResid: MLXArray, qLatent: MLXArray, latentIn: MLXArray,
+        cache: any GLM5NextLatentCache, previousTopk: MLXArray?
+    ) -> (MLXArray, MLXArray?) {
+        let L = x.dim(1)
+        let latent = cache.appendLatent(latentIn)
         let kvLength = cache.offset
         let dense = denseBypass && kvLength <= indexTopk
 
@@ -811,20 +858,14 @@ final class GLM5NextAttention: Module {
             topk = previousTopk
         }
 
-        let qLatent = callMultiLinear(embedQ, q)
-        let attended: MLXArray
         if let topk {
-            attended = sparseAttention(qLatent, latent: latent, topk: topk)
-        } else {
-            let mask: MLXFast.ScaledDotProductAttentionMaskMode =
-                L == 1 ? .none : .array(createCausalMask(n: L, offset: kvLength - L))
-            attended = MLXFast.scaledDotProductAttention(
-                queries: qLatent, keys: latent, values: latent, scale: scale, mask: mask)
+            return (sparseAttention(qLatent, latent: latent, topk: topk), topk)
         }
-        let output = callMultiLinear(unembedOut, attended)
-            .transposed(0, 2, 1, 3)
-            .reshaped(B, L, numHeads * vHeadDim)
-        return (oProj(output), topk)
+        let mask: MLXFast.ScaledDotProductAttentionMaskMode =
+            L == 1 ? .none : .array(createCausalMask(n: L, offset: kvLength - L))
+        let out = MLXFast.scaledDotProductAttention(
+            queries: qLatent, keys: latent, values: latent, scale: scale, mask: mask)
+        return (out, nil)
     }
 
     /// Absorbed-MLA attention over each query's selected latent rows.
@@ -894,8 +935,8 @@ final class GLM5NextDecoderLayer: Module {
     }
 
     /// `x: [B, L, hc_mult, D]`.
-    func callAsFunction(_ x: MLXArray, cache: KVCache?, previousTopk: MLXArray?) -> (
-        MLXArray, MLXArray?
+    func callAsFunction(_ x: MLXArray, cache: KVCache?, previousTopk: [MLXArray?]) -> (
+        MLXArray, [MLXArray?]
     ) {
         let (normed, post, comb) = attnHC.normalizedBranchInput(x, norm: inputLayerNorm)
         let attention: MLXArray
@@ -905,7 +946,7 @@ final class GLM5NextDecoderLayer: Module {
                 normed, cache: linearCache(cache))
         } else {
             (attention, topk) = (selfAttn as! GLM5NextAttention)(
-                normed, cache: sparseCache(cache), previousTopk: previousTopk)
+                normed, cache: cache, previousTopk: previousTopk)
         }
         let h = glm5NextHCExpand(attention, x, post, comb)
 
@@ -922,8 +963,8 @@ final class GLM5NextDecoderLayer: Module {
 
     /// One-token decode with both hyper-connection expands deferred into the
     /// next half-layer's pre kernel.
-    func decodeDeferred(_ state: GLM5NextHCState, cache: KVCache?, previousTopk: MLXArray?)
-        -> (GLM5NextHCState, MLXArray?)
+    func decodeDeferred(_ state: GLM5NextHCState, cache: KVCache?, previousTopk: [MLXArray?])
+        -> (GLM5NextHCState, [MLXArray?])
     {
         let (normed, h, post, comb, mm) = attnHC.deferredBranchInput(state, norm: inputLayerNorm)
         let attention: MLXArray
@@ -932,7 +973,7 @@ final class GLM5NextDecoderLayer: Module {
             attention = (selfAttn as! GLM5NextLinearAttention)(normed, cache: linearCache(cache))
         } else {
             (attention, topk) = (selfAttn as! GLM5NextAttention)(
-                normed, cache: sparseCache(cache), previousTopk: previousTopk)
+                normed, cache: cache, previousTopk: previousTopk)
         }
         let (ffnNormed, ffnH, ffnPost, ffnComb, ffnMM) = ffnHC.deferredBranchInput(
             .deferred(y: attention, residual: h, post: post, comb: comb, mm: mm),
@@ -949,15 +990,6 @@ final class GLM5NextDecoderLayer: Module {
             fatalError("GLM5Next linear layer needs MambaCache, got \(type(of: cache))")
         }
         return mamba
-    }
-
-    private func sparseCache(_ cache: KVCache?) -> GLM5NextAttentionCache? {
-        guard let cache else { return nil }
-        guard let sparse = cache as? GLM5NextAttentionCache else {
-            fatalError(
-                "GLM5Next sparse layer needs GLM5NextAttentionCache, got \(type(of: cache))")
-        }
-        return sparse
     }
 }
 
@@ -1036,7 +1068,7 @@ public final class GLM5NextModelInner: Module {
             layers.allSatisfy({ $0.deferredDecodeSupported(dtype: h.dtype) })
         {
             var state = GLM5NextHCState.materialized(h)
-            var topk: MLXArray?
+            var topk = [MLXArray?]()
             for (index, layer) in layers.enumerated() {
                 (state, topk) = layer.decodeDeferred(
                     state, cache: cache?[index], previousTopk: topk)
@@ -1044,7 +1076,7 @@ public final class GLM5NextModelInner: Module {
             return norm(state.materialize().mean(axis: 2))
         }
 
-        var topk: MLXArray?
+        var topk = [MLXArray?]()
         for (index, layer) in layers.enumerated() {
             (h, topk) = layer(h, cache: cache?[index], previousTopk: topk)
         }

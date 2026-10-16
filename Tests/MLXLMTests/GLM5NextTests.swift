@@ -735,6 +735,68 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
+    // MARK: - Exact trim and batched rows
+
+    /// `GLM5NextAttentionCache.trim` restores the latent, the pooled keys and
+    /// the partial pool window of the shorter sequence bit for bit (pools
+    /// straddling the trim point rebuild from the kept raw keys), and the next
+    /// token's attention output and state equal the untrimmed run's.
+    func testLatentCacheTrimRoundTripIsBitEqual() throws {
+        let config = try configuration(indexTopk: 8)
+        let attention = GLM5NextAttention(config, sharedIndexer: false)
+        randomize(attention, seed: 121)
+        attention.train(false)
+        let x = withRandomState(MLXRandom.RandomState(seed: 122)) {
+            MLXRandom.normal([1, 48, config.hiddenSize])
+        }
+        let maxTrim = 6
+        let cache = GLM5NextAttentionCache(kpool: config.indexKpool, maxTrim: maxTrim)
+        var snapshots = [0: cache.copy() as! GLM5NextAttentionCache]
+        var start = 0
+        // Mixed widths so windows complete inside multi-token chunks too.
+        for width in [5, 1, 3, 1, 1, 2, 7, 1, 1, 1, 3, 1, 1, 2, 1, 1, 1, 1, 3, 1, 1, 1, 1, 1] {
+            _ = attention(x[0..., start ..< (start + width)], cache: cache, previousTopk: [])
+            start += width
+            eval(cache)
+            snapshots[start] = cache.copy() as? GLM5NextAttentionCache
+        }
+        XCTAssertEqual(start, 42)
+        func assertSame(_ a: GLM5NextAttentionCache, _ b: GLM5NextAttentionCache, _ what: String) {
+            XCTAssertEqual(a.offset, b.offset, what)
+            for (i, name) in ["latent", "pooled", "pending keys", "pending gates"].enumerated() {
+                assertBitwiseEqual(a.state[i], b.state[i], "\(what): \(name)")
+            }
+        }
+        // Trim every recorded state back to every earlier recorded state.
+        var checked = 0
+        for end in snapshots.keys.sorted() where end > 0 {
+            for n in 1 ... (maxTrim + 6) where n <= end {
+                let trimmed = snapshots[end]!.copy() as! GLM5NextAttentionCache
+                let removed = trimmed.trim(n)
+                if n <= maxTrim {
+                    XCTAssertEqual(removed, n, "trim(\(n)) at \(end) must be exact")
+                }
+                XCTAssertLessThanOrEqual(removed, n)
+                guard let reference = snapshots[end - removed] else { continue }
+                assertSame(trimmed, reference, "trim(\(n)) at \(end)")
+                // Continue both with the same token: outputs and states agree.
+                let next = x[0..., (end - removed) ..< (end - removed + 1)]
+                let continued = reference.copy() as! GLM5NextAttentionCache
+                let (a, _) = attention(next, cache: trimmed, previousTopk: [])
+                let (b, _) = attention(next, cache: continued, previousTopk: [])
+                assertBitwiseEqual(a, b, "output after trim(\(n)) at \(end)")
+                assertSame(trimmed, continued, "state after trim(\(n)) at \(end) and one token")
+                checked += 1
+            }
+        }
+        XCTAssertGreaterThan(checked, 100)
+        // A shared-indexer layer keeps only the latent and trims any amount.
+        let shared = GLM5NextAttentionCache(kpool: config.indexKpool, maxTrim: 0)
+        _ = shared.appendLatent(MLXArray.zeros([1, 1, 10, 32]))
+        XCTAssertEqual(shared.trim(9), 9)
+        XCTAssertEqual(shared.offset, 1)
+    }
+
     // MARK: - Weight names
 
     /// Tensor names of GLM-5.3-Flash-oQ4e-mtp (`model.safetensors.index.json`,
