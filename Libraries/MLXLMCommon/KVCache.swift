@@ -1643,6 +1643,12 @@ public class MambaCache: ArraysCache {
 
     private var speculativeCheckpoint: SpeculativeCheckpoint?
 
+    /// Depth-D verification: the state after keeping `k` of the last
+    /// verify's `speculativeWidth` columns, for every `k` in `1 ..< width`.
+    private var speculativePrefixes: [Int: [MLXArray]] = [:]
+    private var speculativeWidth = 0
+    private var speculativeBaseOffset = 0
+
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
     }
@@ -1654,6 +1660,8 @@ public class MambaCache: ArraysCache {
         recurrentState: MLXArray,
         advancedBy tokenCount: Int
     ) {
+        speculativePrefixes = [:]
+        speculativeWidth = 0
         speculativeCheckpoint = SpeculativeCheckpoint(
             state: [convState, recurrentState],
             offset: offset,
@@ -1661,13 +1669,17 @@ public class MambaCache: ArraysCache {
             lengths: lengths.map { $0 - tokenCount })
     }
 
+    package var speculativeCheckpointIsSingle: Bool { speculativeCheckpoint != nil }
+
     package var hasSpeculativeCheckpoint: Bool {
-        speculativeCheckpoint != nil
+        speculativeCheckpoint != nil || !speculativePrefixes.isEmpty
     }
 
     @discardableResult
     package func restoreSpeculativeCheckpoint() -> Bool {
-        guard let checkpoint = speculativeCheckpoint else { return false }
+        guard let checkpoint = speculativeCheckpoint else {
+            return restoreSpeculativeCheckpoint(rewinding: 1)
+        }
         cache = checkpoint.state
         offset = checkpoint.offset
         leftPadding = checkpoint.leftPadding
@@ -1678,6 +1690,41 @@ public class MambaCache: ArraysCache {
 
     package func discardSpeculativeCheckpoint() {
         speculativeCheckpoint = nil
+        speculativePrefixes = [:]
+        speculativeWidth = 0
+    }
+
+    /// Save the state after each kept prefix of a `width`-column verify that
+    /// already advanced this cache by `width`: `prefixes[k]` is the state
+    /// (`[conv, recurrent]`) after its first `k` columns, `1 <= k < width`.
+    /// The arrays may be lazy; only a restored one is ever evaluated.
+    package func saveSpeculativePrefixes(_ prefixes: [Int: [MLXArray]], width: Int) {
+        speculativeCheckpoint = nil
+        speculativePrefixes = prefixes
+        speculativeWidth = width
+        speculativeBaseOffset = offset - width
+    }
+
+    /// The saved prefixes, by kept column count.
+    package var speculativePrefixStates: [Int: [MLXArray]] { speculativePrefixes }
+
+    /// Whether the last verify can be rewound by `n` columns in place.
+    package func canRewindSpeculative(_ n: Int) -> Bool {
+        if n == 1, speculativeCheckpoint != nil { return true }
+        return n >= 1 && speculativePrefixes[speculativeWidth - n] != nil
+    }
+
+    /// Rewind the last depth-D verify by `n` columns: keep its first
+    /// `width - n`. Shorter prefixes stay available for a further rewind.
+    @discardableResult
+    package func restoreSpeculativeCheckpoint(rewinding n: Int) -> Bool {
+        let keep = speculativeWidth - n
+        guard n >= 1, let state = speculativePrefixes[keep] else { return false }
+        cache = state
+        offset = speculativeBaseOffset + keep
+        speculativePrefixes = speculativePrefixes.filter { $0.key < keep }
+        speculativeWidth = keep
+        return true
     }
 
     public override func copy() -> any KVCache {
@@ -2553,12 +2600,12 @@ public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
 package func rewindSpeculativePromptCache(
     _ cache: [KVCache], numTokens: Int
 ) -> Int {
-    guard numTokens == 1,
+    guard numTokens >= 1,
         cache.allSatisfy({ entry in
             if entry.isTrimmable {
                 return entry.offset >= numTokens
             }
-            return (entry as? MambaCache)?.hasSpeculativeCheckpoint == true
+            return (entry as? MambaCache)?.canRewindSpeculative(numTokens) == true
         })
     else { return 0 }
 
@@ -2568,7 +2615,12 @@ package func rewindSpeculativePromptCache(
                 preconditionFailure("Speculative cache validation and rewind diverged")
             }
         } else {
-            guard (entry as? MambaCache)?.restoreSpeculativeCheckpoint() == true else {
+            let mamba = entry as? MambaCache
+            let restored =
+                numTokens == 1 && mamba?.speculativeCheckpointIsSingle == true
+                ? mamba?.restoreSpeculativeCheckpoint() == true
+                : mamba?.restoreSpeculativeCheckpoint(rewinding: numTokens) == true
+            guard restored else {
                 preconditionFailure("Missing recurrent speculative checkpoint")
             }
         }

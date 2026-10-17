@@ -1011,10 +1011,10 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
-    /// `glm5NextKDAVerifyStep` (every verify column in one dispatch, with the
-    /// checkpoint and per-row valid counts inside) equals the per-column
-    /// reference (one-token gate-row steps, padded columns keeping the state)
-    /// bit for bit: outputs of valid columns, final and checkpoint states.
+    /// `glm5NextKDAVerifyStep` (every verify column in one dispatch, each row
+    /// stopping at its valid count) equals the per-column reference (one-token
+    /// gate-row steps) bit for bit: outputs of valid columns and final states;
+    /// replays over the first `k` columns give every kept prefix's state.
     func testKDAVerifyStepMatchesPerColumnStepsBitwise() throws {
         let (heads, dk) = (2, 128)
         let qkv = heads * dk
@@ -1029,7 +1029,7 @@ final class GLM5NextTests: XCTestCase {
         for bits in [8, 5, 4] {
             let fb = randomAffine([qkv, dk], bits: bits, seed: UInt64(410 + bits))
             let gb = randomAffine([qkv, dk], bits: bits, seed: UInt64(420 + bits))
-            for (T, validCounts, checkpoint) in [(2, [2, 1, 2], 1), (3, [3, 1, 2], 1), (3, [3, 2, 3], 2)] {
+            for (T, validCounts) in [(2, [2, 1, 2]), (4, [4, 1, 3]), (4, [4, 4, 2])] {
                 let B = validCounts.count
                 func rnd(_ shape: [Int], _ seed: Int, _ scale: Float = 1, _ dtype: DType = .bfloat16)
                     -> MLXArray
@@ -1042,39 +1042,40 @@ final class GLM5NextTests: XCTestCase {
                 let (fa, ga, bRaw) = (rnd([B, T, dk], 4), rnd([B, T, dk], 5), rnd([B, T, heads], 6))
                 let convState = rnd([B, 3, 3 * qkv], 7)
                 let state = rnd([B, heads, dk, dk], 8, 0.1, .float32)
-                let fused = try XCTUnwrap(
-                    glm5NextKDAVerifyStep(
-                        q: q, k: k, v: v, fa: fa, ga: ga, fb: fb, gb: gb, bRaw: bRaw,
-                        convState: convState, convWeight: convWeight, aLog: aLog, dtBias: dtBias,
-                        normWeight: normWeight, state: state, heads: heads, headDim: dk,
-                        lowerBound: -5, normEps: 1e-5, checkpointAfter: checkpoint,
-                        valid: MLXArray(validCounts.map(Int32.init))),
-                    "\(bits)-bit T=\(T)")
+                func verify(_ width: Int) -> (y: MLXArray, convState: MLXArray, state: MLXArray)? {
+                    func cols(_ a: MLXArray) -> MLXArray { a[0..., ..<width] }
+                    return glm5NextKDAVerifyStep(
+                        q: cols(q), k: cols(k), v: cols(v), fa: cols(fa), ga: cols(ga), fb: fb,
+                        gb: gb, bRaw: cols(bRaw), convState: convState, convWeight: convWeight,
+                        aLog: aLog, dtBias: dtBias, normWeight: normWeight, state: state,
+                        heads: heads, headDim: dk, lowerBound: -5, normEps: 1e-5,
+                        valid: MLXArray(validCounts.map { Int32(min($0, width)) }))
+                }
+                let fused = try XCTUnwrap(verify(T), "\(bits)-bit T=\(T)")
+                let prefixes = (1 ..< T).map { verify($0)! }
                 for r in 0 ..< B {
                     func row(_ a: MLXArray) -> MLXArray { a[r ..< (r + 1)] }
                     var (conv, st) = (row(convState), row(state))
                     for c in 0 ..< validCounts[r] {
                         func col(_ a: MLXArray) -> MLXArray { row(a)[0..., c ..< (c + 1)] }
-                        do {
-                            let step = try XCTUnwrap(
-                                glm5NextKDADecodeStep(
-                                    q: col(q), k: col(k), v: col(v), fa: col(fa), ga: col(ga),
-                                    fb: fb, gb: gb, bRaw: col(bRaw), convState: conv,
-                                    convWeight: convWeight, aLog: aLog, dtBias: dtBias,
-                                    normWeight: normWeight, state: st, heads: heads, headDim: dk,
-                                    lowerBound: -5, normEps: 1e-5))
+                        let step = try XCTUnwrap(
+                            glm5NextKDADecodeStep(
+                                q: col(q), k: col(k), v: col(v), fa: col(fa), ga: col(ga),
+                                fb: fb, gb: gb, bRaw: col(bRaw), convState: conv,
+                                convWeight: convWeight, aLog: aLog, dtBias: dtBias,
+                                normWeight: normWeight, state: st, heads: heads, headDim: dk,
+                                lowerBound: -5, normEps: 1e-5))
+                        assertBitwiseEqual(
+                            fused.y[r ..< (r + 1), c ..< (c + 1)], step.y,
+                            "\(bits)-bit T=\(T) row \(r) column \(c) output")
+                        (conv, st) = (step.convState, step.state)
+                        if c + 1 < T {
                             assertBitwiseEqual(
-                                fused.y[r ..< (r + 1), c ..< (c + 1)], step.y,
-                                "\(bits)-bit T=\(T) row \(r) column \(c) output")
-                            (conv, st) = (step.convState, step.state)
-                        }
-                        if c + 1 == checkpoint {
+                                prefixes[c].convState[r ..< (r + 1)], conv,
+                                "\(bits)-bit T=\(T) row \(r) prefix \(c + 1) conv")
                             assertBitwiseEqual(
-                                fused.convCheckpoint[r ..< (r + 1)], conv,
-                                "\(bits)-bit T=\(T) row \(r) checkpoint conv")
-                            assertBitwiseEqual(
-                                fused.stateCheckpoint[r ..< (r + 1)], st,
-                                "\(bits)-bit T=\(T) row \(r) checkpoint state")
+                                prefixes[c].state[r ..< (r + 1)], st,
+                                "\(bits)-bit T=\(T) row \(r) prefix \(c + 1) state")
                         }
                     }
                     assertBitwiseEqual(fused.convState[r ..< (r + 1)], conv, "\(bits)-bit T=\(T) row \(r) conv")
@@ -1427,7 +1428,7 @@ final class GLM5NextTests: XCTestCase {
                 "deferred=\(deferred) decode after rewind")
         }
         model.model.deferredDecode = true
-        XCTAssertEqual(model.maximumNativeTargetCacheRewind, 1)
+        XCTAssertEqual(model.maximumNativeTargetCacheRewind, 7)
     }
 
     /// Packed MTP verification inside continuous batching through the
@@ -1440,13 +1441,12 @@ final class GLM5NextTests: XCTestCase {
     /// bit, and the next batched step equals serial decode.
     private func assertPackedVerifyMatchesSerialRows(
         _ model: any LanguageModel, layers: [GLM5NextDecoderLayer], prompts: [MLXArray],
-        label: String
+        label: String, widths: [Int] = [2, 1, 2], retained: [Int] = [2, 1, 1]
     ) throws {
-        let widths = [2, 1, 2]
-        let retained = [2, 1, 1]
         let rows = prompts.count
+        let maxWidth = widths.max()!
         let verifyTokens = (0 ..< rows).map { r in
-            MLXArray([Int32(11 + r), Int32(29 + r)]).reshaped(1, 2)
+            MLXArray((0 ..< maxWidth).map { Int32(11 + r + 17 * $0) }).reshaped(1, maxWidth)
         }
         func prefilled(_ r: Int) throws -> [KVCache] {
             let cache = try model.newCache(parameters: nil)
@@ -1481,9 +1481,11 @@ final class GLM5NextTests: XCTestCase {
         }
         let tokens = concatenated(
             (0 ..< rows).map { r in
-                widths[r] == 2
+                widths[r] == maxWidth
                     ? verifyTokens[r]
-                    : concatenated([verifyTokens[r][0..., ..<1], MLXArray([Int32(0)]).reshaped(1, 1)], axis: 1)
+                    : concatenated(
+                        [verifyTokens[r][0..., ..<widths[r]],
+                         MLXArray.zeros([1, maxWidth - widths[r]], dtype: .int32)], axis: 1)
             }, axis: 0)
         let maps = (0 ..< rows).map { r in
             MTPPackedVerificationRowMap(
@@ -1509,7 +1511,7 @@ final class GLM5NextTests: XCTestCase {
         // A padded column never advanced a row's recurrent state.
         for (layer, cache) in batched.enumerated() {
             guard let mamba = cache as? MTPPackedMambaBatchCache else { continue }
-            for r in 0 ..< rows where widths[r] == 1 {
+            for r in 0 ..< rows where widths[r] < maxWidth && retained[r] == widths[r] {
                 let serial = serialCaches[r][layer] as! MambaCache
                 assertBitwiseEqual(
                     mamba[0]![r ..< (r + 1)], serial[0], "\(label) layer \(layer) padded conv")
@@ -1567,6 +1569,21 @@ final class GLM5NextTests: XCTestCase {
         model.model.deferredDecode = true
     }
 
+    /// Depth-D packed verification: rows of 4 and 2 columns (8 flattened
+    /// tokens) committed at every retained count.
+    func testPackedVerifyDepthThreeMatchesSerialRows() throws {
+        let model = try fusedShapesModel(seed: 281)
+        let prompts = [9, 14].enumerated().map { tokens($1, seed: UInt64(282 + $0)) }
+        for (retained, deferred) in [([4, 2], true), ([1, 1], true), ([2, 2], false), ([3, 1], false)] {
+            model.model.deferredDecode = deferred
+            try assertPackedVerifyMatchesSerialRows(
+                model, layers: model.model.layers, prompts: prompts,
+                label: "depth 3 retained \(retained) deferred=\(deferred)",
+                widths: [4, 2], retained: retained)
+        }
+        model.model.deferredDecode = true
+    }
+
     func testPackedVerifyWithMixedWidthsMatchesSerialRowsOnRealCut() throws {
         guard let path = ProcessInfo.processInfo.environment["GLM5NEXT_CUT_DIR"] else {
             throw XCTSkip("GLM5NEXT_CUT_DIR is not set")
@@ -1609,6 +1626,44 @@ final class GLM5NextTests: XCTestCase {
     /// (exact trim) leaves the state of a commit that never proposed, and a
     /// packed advance of rows with zero and one accepted proposals equals
     /// each row's serial commit bit for bit (6 flattened tokens).
+    /// A 4-column verify gives each column its serial decode logits, and a
+    /// rewind of every n = 1...3 leaves the caches of decoding 4 - n tokens.
+    func testMTPVerifyFourColumnsRewindsToEveryPrefix() throws {
+        let model = try fusedShapesModel(seed: 291)
+        let prompt = tokens(11, seed: 292)
+        let block = tokens(4, seed: 293)
+        for deferred in [true, false] {
+            model.model.deferredDecode = deferred
+            var serialLogits = [MLXArray]()
+            var after = [[KVCache]]()
+            let serial = try model.newCache(parameters: nil)
+            eval(model(prompt, cache: serial))
+            for c in 0 ..< 4 {
+                serialLogits.append(model(block[0..., c ..< (c + 1)], cache: serial))
+                eval(serialLogits.last!)
+                after.append(serial.map { $0.copy() })
+            }
+            for n in 1 ... 3 {
+                let cache = try model.newCache(parameters: nil)
+                eval(model(prompt, cache: cache))
+                let out = model(LMInput.Text(tokens: block), cache: cache, state: emitState(checkpoint: 1))
+                for c in 0 ..< 4 {
+                    assertBitwiseEqual(
+                        out.logits[0..., c ..< (c + 1)], serialLogits[c],
+                        "deferred=\(deferred) column \(c)")
+                }
+                XCTAssertEqual(rewindSpeculativePromptCache(cache, numTokens: n), n)
+                assertCachesEqual(cache, after[3 - n], "deferred=\(deferred) rewind \(n)")
+                if n == 1 {
+                    // A further rewind from the kept prefix.
+                    XCTAssertEqual(rewindSpeculativePromptCache(cache, numTokens: 2), 2)
+                    assertCachesEqual(cache, after[0], "deferred=\(deferred) rewind 1 then 2")
+                }
+            }
+        }
+        model.model.deferredDecode = true
+    }
+
     func testMTPDrafterRollbackAndPackedAdvanceMatchSerialCommit() throws {
         let model = try fusedShapesModel(seed: 201)
         let drafter = GLM5NextMTPDraftModel(model.configuration)
@@ -1693,6 +1748,19 @@ final class GLM5NextTests: XCTestCase {
         }
         // The packed advance never touches its input states.
         XCTAssertEqual(prepared[1].cache[0].offset, 11)
+
+        // Packed depth-3 chains equal each row's chained draftBlock.
+        let chained = try drafter.chainPacked(
+            target: model, states: packed.states, depth: 3, sampler: sampler)
+        for r in 0 ..< 3 {
+            var state = copyState(packed.states[r])
+            let drafts = drafter.draftBlock(
+                target: model, lastToken: MLXArray([Int32(0)]), lastHidden: targetHidden[r][0..., ..<1],
+                sharedKV: [:], positionDeltas: nil, queryOffset: 0, blockSize: 4, state: &state,
+                sampler: sampler)
+            assertBitwiseEqual(chained.proposals[r ..< (r + 1)], drafts, "chain row \(r)")
+            assertDrafterStatesEqual(chained.states[r], state, "chain row \(r) state")
+        }
     }
 
     /// Proposes the plain-greedy continuation, except a wrong token every
@@ -1744,6 +1812,62 @@ final class GLM5NextTests: XCTestCase {
         XCTAssertLessThan(speculative.acceptedCount, speculative.proposedCount)
     }
 
+    /// A depth-D oracle: the plain-greedy continuation with one wrong token
+    /// per round at a cycling position (none every D + 1 rounds), so every
+    /// accept count 0...D occurs.
+    private final class DepthOracleDrafter: Module, MTPDrafterModel {
+        let expected: [Int]
+        let promptLength: Int
+        let maximumBlockSize: Int? = 8
+        private var round = 0
+
+        init(expected: [Int], promptLength: Int) {
+            self.expected = expected
+            self.promptLength = promptLength
+            super.init()
+        }
+
+        func draftBlock(
+            target _: any LanguageModel, lastToken _: MLXArray, lastHidden _: MLXArray,
+            sharedKV _: [String: (MLXArray, MLXArray)], positionDeltas _: MLXArray?,
+            queryOffset: Int, blockSize: Int, sampler _: any LogitSampler
+        ) -> MLXArray {
+            let depth = blockSize - 1
+            let wrong = round % (depth + 1)
+            round += 1
+            let next = queryOffset - promptLength + 1
+            let drafts = (0 ..< depth).map { j -> Int32 in
+                let token = next + j < expected.count ? expected[next + j] : 0
+                return Int32(j == wrong ? (token + 1) % 64 : token)
+            }
+            return MLXArray(drafts).reshaped(1, depth)
+        }
+    }
+
+    func testMTPDepthOracleAcceptsEveryCountAndMatchesPlainGreedy() throws {
+        let model = try fusedShapesModel(seed: 301)
+        let prompt = tokens(13, seed: 302).reshaped(-1)
+        for deferred in [true, false] {
+            model.model.deferredDecode = deferred
+            let parameters = greedyParameters(maxTokens: 40)
+            var plain = try TokenIterator(prompt: prompt, model: model, parameters: parameters)
+            var expected = [Int]()
+            while let token = plain.next() { expected.append(token) }
+            for depth in [2, 3, 7] {
+                var speculative = try MTPSpeculativeTokenIterator(
+                    input: LMInput(tokens: prompt), mainModel: model,
+                    drafter: DepthOracleDrafter(expected: expected, promptLength: 13),
+                    parameters: parameters, blockSize: depth + 1)
+                var produced = [Int]()
+                while let token = speculative.next() { produced.append(token) }
+                XCTAssertNil(speculative.passthroughReason, "depth \(depth)")
+                XCTAssertEqual(produced, expected, "deferred=\(deferred) depth \(depth)")
+                XCTAssertGreaterThan(speculative.acceptedCount, 0)
+            }
+        }
+        model.model.deferredDecode = true
+    }
+
     private func greedyParameters(maxTokens: Int) -> GenerateParameters {
         var parameters = GenerateParameters(maxTokens: maxTokens, temperature: 0)
         // The MTP iterator prefills the prompt in one forward; match it.
@@ -1756,7 +1880,7 @@ final class GLM5NextTests: XCTestCase {
     /// drafter equals plain greedy generation token for token.
     private func assertMTPGreedyMatchesPlain(
         _ model: any LanguageModel, configuration: GLM5NextConfiguration, prompt: MLXArray,
-        count: Int, label: String
+        count: Int, label: String, depth: Int = 1
     ) throws -> (proposed: Int, accepted: Int) {
         let parameters = greedyParameters(maxTokens: count)
         var plain = try TokenIterator(prompt: prompt, model: model, parameters: parameters)
@@ -1765,7 +1889,8 @@ final class GLM5NextTests: XCTestCase {
 
         var speculative = try MTPSpeculativeTokenIterator(
             input: LMInput(tokens: prompt), mainModel: model,
-            drafter: GLM5NextMTPDraftModel(configuration), parameters: parameters, blockSize: 2)
+            drafter: GLM5NextMTPDraftModel(configuration), parameters: parameters,
+            blockSize: depth + 1)
         var produced = [Int]()
         while let token = speculative.next() { produced.append(token) }
         XCTAssertNil(speculative.passthroughReason, "\(label): stayed speculative")
@@ -1778,10 +1903,12 @@ final class GLM5NextTests: XCTestCase {
         let model = try fusedShapesModel(seed: 231)
         for deferred in [true, false] {
             model.model.deferredDecode = deferred
-            _ = try assertMTPGreedyMatchesPlain(
-                model, configuration: model.configuration,
-                prompt: tokens(13, seed: 232).reshaped(-1), count: 24,
-                label: "deferred=\(deferred)")
+            for depth in [1, 2, 3] {
+                _ = try assertMTPGreedyMatchesPlain(
+                    model, configuration: model.configuration,
+                    prompt: tokens(13, seed: 232).reshaped(-1), count: 24,
+                    label: "deferred=\(deferred) depth \(depth)", depth: depth)
+            }
         }
         model.model.deferredDecode = true
     }
@@ -1805,9 +1932,12 @@ final class GLM5NextTests: XCTestCase {
         let prompt = withRandomState(MLXRandom.RandomState(seed: 240)) {
             MLXRandom.randInt(0 ..< 150_000, [300]).asType(.int32)
         }
-        let (proposed, accepted) = try assertMTPGreedyMatchesPlain(
-            model, configuration: configuration, prompt: prompt, count: 64, label: "real cut")
-        print("glm5next_mtp_real_cut proposed=\(proposed) accepted=\(accepted)")
+        for depth in [1, 3] {
+            let (proposed, accepted) = try assertMTPGreedyMatchesPlain(
+                model, configuration: configuration, prompt: prompt, count: 64,
+                label: "real cut depth \(depth)", depth: depth)
+            print("glm5next_mtp_real_cut depth=\(depth) proposed=\(proposed) accepted=\(accepted)")
+        }
 
         // A verify pass past index_topk (sparse DSA) equals serial decode.
         let long = withRandomState(MLXRandom.RandomState(seed: 241)) {

@@ -537,27 +537,22 @@ final class GLM5NextLinearAttention: Module {
         return glm5NextProject(oProj, oNorm(out, gate: gate).reshaped(B, L, -1))
     }
 
-    /// MTP verification: every column as a one-token decode step, so each
-    /// verified column equals the serial decode of that token, with the
-    /// recurrent state after the first `checkpointAfter` columns saved as the
-    /// cache's speculative checkpoint. The fused path projects all columns in
-    /// one multi-qmv (row-independent) and runs the KDA kernel per column.
-    private func verifyColumns(_ x: MLXArray, cache: MambaCache, checkpointAfter split: Int)
+    /// MTP verification: every column computed as its one-token decode step
+    /// (so each verified column equals the serial decode of that token), and
+    /// the state after every kept prefix `k < L` saved for an in-place rewind
+    /// (`MambaCache.saveSpeculativePrefixes`). The fused path projects all
+    /// columns in one multi-qmv and runs every column in one KDA dispatch;
+    /// each prefix state is a lazy replay of that kernel over its first `k`
+    /// columns, evaluated only if a rewind restores it. A right-padded column
+    /// (prepared lengths) never advances a row's state.
+    private func verifyColumns(_ x: MLXArray, cache: MambaCache, checkpointAfter _: Int)
         -> MLXArray
     {
         let (B, L) = (x.dim(0), x.dim(1))
-        func save() {
-            cache.saveSpeculativeCheckpoint(
-                convState: cache[0]!, recurrentState: cache[1]!, advancedBy: split)
-        }
         // Valid columns per row of a right-padded packed verification (`nil`
-        // when every column is valid): a padded column keeps the row's state.
+        // when every column is valid).
         let valid = cache.makeMask(N: L)
-        func keep(_ c: Int, _ new: MLXArray, _ old: MLXArray?) -> MLXArray {
-            guard let valid, let old else { return new }
-            let shape = [B] + Array(repeating: 1, count: new.ndim - 1)
-            return MLX.where(valid[0..., c ..< (c + 1)].reshaped(shape), new, old)
-        }
+        let validCounts = valid.map { $0.asType(.int32).sum(axis: 1) }
         if fusedDecode, !training, let lowerBound = forgetGate.lowerBound, convKernelSize == 4,
             let fb = glm5NextAffine(forgetGate.fBProj), let gb = glm5NextAffine(gBProj),
             let projected = inputProjections(x.reshaped(B * L, 1, x.dim(-1)))
@@ -568,64 +563,46 @@ final class GLM5NextLinearAttention: Module {
                 ?? MLXArray.zeros([B, convKernelSize - 1, 3 * projectionDim], dtype: x.dtype)
             let stateBase =
                 cache[1] ?? MLXArray.zeros([B, numHeads, headDim, headDim], dtype: .float32)
-            // Every column in one dispatch, checkpoint and padding inside.
-            if let step = glm5NextKDAVerifyStep(
-                q: parts[0], k: parts[1], v: parts[2], fa: parts[3], ga: parts[4], fb: fb, gb: gb,
-                bRaw: parts[5], convState: convBase, convWeight: conv1d.weight,
-                aLog: forgetGate.aLog, dtBias: forgetGate.dtBias, normWeight: oNorm.weight,
-                state: stateBase, heads: numHeads, headDim: headDim, lowerBound: lowerBound,
-                normEps: oNorm.eps, checkpointAfter: split,
-                valid: valid.map { $0.asType(.int32).sum(axis: 1) })
-            {
+            func run(_ k: Int) -> (y: MLXArray, convState: MLXArray, state: MLXArray)? {
+                func cols(_ a: MLXArray) -> MLXArray { k == L ? a : a[0..., ..<k] }
+                return glm5NextKDAVerifyStep(
+                    q: cols(parts[0]), k: cols(parts[1]), v: cols(parts[2]), fa: cols(parts[3]),
+                    ga: cols(parts[4]), fb: fb, gb: gb, bRaw: cols(parts[5]),
+                    convState: convBase, convWeight: conv1d.weight, aLog: forgetGate.aLog,
+                    dtBias: forgetGate.dtBias, normWeight: oNorm.weight, state: stateBase,
+                    heads: numHeads, headDim: headDim, lowerBound: lowerBound,
+                    normEps: oNorm.eps,
+                    valid: validCounts.map { k == L ? $0 : minimum($0, Int32(k)) })
+            }
+            if let step = run(L) {
                 cache[0] = step.convState
                 cache[1] = step.state
-                cache.saveSpeculativeCheckpoint(
-                    convState: step.convCheckpoint, recurrentState: step.stateCheckpoint,
-                    advancedBy: split)
                 cache.advance(L)
+                var prefixes = [Int: [MLXArray]]()
+                for k in 1 ..< L {
+                    // Same shapes and widths as the full step, so covered too.
+                    let replay = run(k)!
+                    prefixes[k] = [replay.convState, replay.state]
+                }
+                cache.saveSpeculativePrefixes(prefixes, width: L)
                 return glm5NextProject(oProj, step.y)
             }
-            var convState =
-                cache[0]
-                ?? MLXArray.zeros([B, convKernelSize - 1, 3 * projectionDim], dtype: x.dtype)
-            var state =
-                cache[1] ?? MLXArray.zeros([B, numHeads, headDim, headDim], dtype: .float32)
-            var steps = [(y: MLXArray, convState: MLXArray, state: MLXArray)]()
-            for c in 0 ..< L {
-                let (convBefore, stateBefore) = (convState, state)
-                func col(_ a: MLXArray) -> MLXArray { a[0..., c ..< (c + 1)] }
-                guard
-                    let step = glm5NextKDADecodeStep(
-                        q: col(parts[0]), k: col(parts[1]), v: col(parts[2]), fa: col(parts[3]),
-                        ga: col(parts[4]), fb: fb, gb: gb, bRaw: col(parts[5]),
-                        convState: convState, convWeight: conv1d.weight,
-                        aLog: forgetGate.aLog, dtBias: forgetGate.dtBias,
-                        normWeight: oNorm.weight, state: state, heads: numHeads, headDim: headDim,
-                        lowerBound: lowerBound, normEps: oNorm.eps)
-                else { break }
-                (convState, state) = (
-                    keep(c, step.convState, convBefore), keep(c, step.state, stateBefore)
-                )
-                steps.append((step.y, convState, state))
-            }
-            if steps.count == L {
-                for (c, step) in steps.enumerated() {
-                    cache[0] = step.convState
-                    cache[1] = step.state
-                    cache.advance(1)
-                    if c + 1 == split { save() }
-                }
-                return glm5NextProject(oProj, concatenated(steps.map(\.y), axis: 1))
-            }
+        }
+        func keep(_ c: Int, _ new: MLXArray, _ old: MLXArray?) -> MLXArray {
+            guard let valid, let old else { return new }
+            let shape = [B] + Array(repeating: 1, count: new.ndim - 1)
+            return MLX.where(valid[0..., c ..< (c + 1)].reshaped(shape), new, old)
         }
         var outputs = [MLXArray]()
+        var prefixes = [Int: [MLXArray]]()
         for c in 0 ..< L {
             let (convBefore, stateBefore) = (cache[0], cache[1])
             outputs.append(self(x[0..., c ..< (c + 1)], cache: cache))
             cache[0] = keep(c, cache[0]!, convBefore)
             cache[1] = keep(c, cache[1]!, stateBefore)
-            if c + 1 == split { save() }
+            if c + 1 < L { prefixes[c + 1] = [cache[0]!, cache[1]!] }
         }
+        cache.saveSpeculativePrefixes(prefixes, width: L)
         return concatenated(outputs, axis: 1)
     }
 
@@ -1420,9 +1397,10 @@ func glm5NextSharedLatent(_ cache: KVCache) -> (MLXArray, Int)? {
 }
 
 extension GLM5NextTextModel: SpeculativeCacheRewindModel {
-    /// One verified token is rewound in place: sparse layers trim exactly,
-    /// KDA layers restore the checkpoint the verify pass saved.
-    public var maximumNativeTargetCacheRewind: Int { 1 }
+    /// Up to 7 verified tokens are rewound in place (a verify carries at most
+    /// 8 columns): sparse layers trim exactly, KDA layers restore the state
+    /// of the kept prefix the verify saved.
+    public var maximumNativeTargetCacheRewind: Int { 7 }
 }
 
 /// `glm5_next` checkpoints: the text model nested under `language_model`, with
@@ -1951,5 +1929,5 @@ extension GLM5NextModel {
 }
 
 extension GLM5NextModel: SpeculativeCacheRewindModel {
-    public var maximumNativeTargetCacheRewind: Int { 1 }
+    public var maximumNativeTargetCacheRewind: Int { 7 }
 }

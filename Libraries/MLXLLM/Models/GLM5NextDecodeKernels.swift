@@ -79,10 +79,8 @@ private let glm5NextKDASource = """
 
     #if VERIFY
       // MTP verification: this row's valid leading tokens (the rest are right
-      // padding and leave the state alone), and the state after CKPT tokens.
+      // padding and leave the state alone).
       const int nvalid = metal::clamp(int(valid_in[brow]), 1, TOK);
-      device T* cs_ckpt_r = conv_ckpt + size_t(brow) * (CK - 1) * NP;
-      device float* st_ckpt_r = state_ckpt + size_t(brow) * H * DK * DK;
     #else
       const int nvalid = TOK;
     #endif
@@ -134,9 +132,6 @@ private let glm5NextKDASource = """
         }
         for (int r = 0; r < CK - 1; r++) {
           cs_out_r[r * NP + gc] = win[nvalid + r];
-    #if VERIFY
-          cs_ckpt_r[r * NP + gc] = win[CKPT + r];
-    #endif
         }
       }
 
@@ -290,13 +285,6 @@ private let glm5NextKDASource = """
           if (thread_index_in_simdgroup == 0) {
             ys[t][dv_idx] = static_cast<T>(out);
           }
-    #if VERIFY
-          if (t + 1 == CKPT) {
-            for (int i = 0; i < NPL; ++i) {
-              st_ckpt_r[(size_t(h) * DK + dv_idx) * DK + NPL * dk_idx + i] = state[i];
-            }
-          }
-    #endif
         }
         for (int i = 0; i < NPL; ++i) {
           auto s_idx = NPL * dk_idx + i;
@@ -342,7 +330,7 @@ private final class GLM5NextKDAKernel: Sendable {
     let quadGates: MLXFast.MLXFastKernel
     let fiveBitGates: MLXFast.MLXFastKernel
     /// MTP verification variants of the gate-row kernels: per-row valid token
-    /// counts and the state after CKPT tokens as extra outputs.
+    /// counts (right-padded tokens leave the state alone).
     let verifyQuadGates: MLXFast.MLXFastKernel
     let verifyFiveBitGates: MLXFast.MLXFastKernel
 
@@ -358,8 +346,7 @@ private final class GLM5NextKDAKernel: Sendable {
         {
             MLXFast.metalKernel(
                 name: name, inputNames: inputs + (verify ? ["valid_in"] : []),
-                outputNames: ["y", "conv_state_out", "state_out"]
-                    + (verify ? ["conv_ckpt", "state_ckpt"] : []),
+                outputNames: ["y", "conv_state_out", "state_out"],
                 source: defines + "#define VERIFY \(verify ? 1 : 0)\n" + glm5NextKDASource,
                 header: glm5NextQMVHeader)
         }
@@ -489,26 +476,21 @@ func glm5NextKDADecodeStep(
     return (outputs[0], outputs[1], outputs[2])
 }
 
-/// MTP verification of `T <= 8` tokens per row in one dispatch: the
-/// gate-row KDA step over every row's first `valid[row]` tokens (`nil`: all
-/// `T`; the right-padded rest leaves the state alone), also returning the conv
-/// and recurrent state after `checkpointAfter` tokens. Each token is computed
-/// exactly as by `T` one-token calls. `nil` when not covered.
+/// MTP verification of `2...8` tokens per row in one dispatch: the gate-row
+/// KDA step over every row's first `valid[row]` tokens (`nil`: all `T`; the
+/// right-padded rest leaves the state alone). Each token is computed exactly
+/// as by `T` one-token calls. `nil` when not covered.
 func glm5NextKDAVerifyStep(
     q: MLXArray, k: MLXArray, v: MLXArray, fa: MLXArray, ga: MLXArray,
     fb: GLM5NextAffine, gb: GLM5NextAffine, bRaw: MLXArray,
     convState: MLXArray, convWeight: MLXArray,
     aLog: MLXArray, dtBias: MLXArray, normWeight: MLXArray, state: MLXArray,
-    heads: Int, headDim: Int, lowerBound: Float, normEps: Float, checkpointAfter: Int,
+    heads: Int, headDim: Int, lowerBound: Float, normEps: Float,
     valid: MLXArray?, l2Eps: Float = 1e-6
-) -> (
-    y: MLXArray, convState: MLXArray, state: MLXArray, convCheckpoint: MLXArray,
-    stateCheckpoint: MLXArray
-)? {
+) -> (y: MLXArray, convState: MLXArray, state: MLXArray)? {
     let dtype = q.dtype
     guard dtype == .bfloat16 || dtype == .float16, headDim == 128, heads >= 1,
-        q.ndim == 3, q.dim(0) >= 1, (2 ... 8).contains(q.dim(1)),
-        (1 ..< q.dim(1)).contains(checkpointAfter)
+        q.ndim == 3, q.dim(0) >= 1, (1 ... 8).contains(q.dim(1))
     else { return nil }
     let (B, T) = (q.dim(0), q.dim(1))
     let qkv = heads * headDim
@@ -544,16 +526,13 @@ func glm5NextKDAVerifyStep(
          (valid ?? MLXArray(Array(repeating: Int32(T), count: B))).asType(.int32)],
         template: [
             ("T", dtype), ("TOK", T), ("DK", headDim), ("QKV", qkv), ("H", heads),
-            ("BITS", fb.bits), ("GS", fb.groupSize), ("CKPT", checkpointAfter),
+            ("BITS", fb.bits), ("GS", fb.groupSize),
         ],
         grid: (1024 * heads, B, 1),
         threadGroup: (1024, 1, 1),
-        outputShapes: [
-            [B, T, qkv], [B, 3, 3 * qkv], [B, heads, headDim, headDim], [B, 3, 3 * qkv],
-            [B, heads, headDim, headDim],
-        ],
-        outputDTypes: [dtype, dtype, .float32, dtype, .float32])
-    return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4])
+        outputShapes: [[B, T, qkv], [B, 3, 3 * qkv], [B, heads, headDim, headDim]],
+        outputDTypes: [dtype, dtype, .float32])
+    return (outputs[0], outputs[1], outputs[2])
 }
 
 // MARK: - Multi-projection qmv (one token)

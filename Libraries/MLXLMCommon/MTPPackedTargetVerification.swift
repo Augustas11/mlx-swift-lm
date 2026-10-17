@@ -152,19 +152,24 @@ public final class MTPPackedMambaRowTransaction {
     private let rowCache: MambaCache
     private let baseState: [MLXArray]
     private let finalState: [MLXArray]
+    /// Depth-D verification: the row state after each kept prefix `k`
+    /// (`1 <= k < inputCount`), when the model saved them.
+    private let prefixStates: [Int: [MLXArray]]
 
     package init(
         rowCache: MambaCache,
         inputCount: Int,
         proposalCount: Int,
         baseState: [MLXArray],
-        finalState: [MLXArray]
+        finalState: [MLXArray],
+        prefixStates: [Int: [MLXArray]] = [:]
     ) {
         self.rowCache = rowCache
         self.inputCount = inputCount
         self.proposalCount = proposalCount
         self.baseState = baseState
         self.finalState = finalState
+        self.prefixStates = prefixStates
     }
 
     /// Commit an exact leading prefix of the packed verification input.
@@ -191,6 +196,8 @@ public final class MTPPackedMambaRowTransaction {
         let selected: [MLXArray]
         if retaining == inputCount {
             selected = finalState
+        } else if let prefix = prefixStates[retaining] {
+            selected = prefix
         } else if retaining == 1, proposalCount == 1 {
             selected = baseState
         } else {
@@ -241,7 +248,7 @@ public final class MTPPackedMambaBatchCache: MambaCache, MTPPackedVerificationCa
               rowMaps.allSatisfy({
                   $0.queryOffset >= 0
                       && $0.inputCount == $0.proposalCount + 1
-                      && (0 ... 1).contains($0.proposalCount)
+                      && (0 ... 7).contains($0.proposalCount)
               })
         else { throw MTPPackedMambaCacheError.invalidRowMaps }
         preparedRowMaps = rowMaps
@@ -257,6 +264,28 @@ public final class MTPPackedMambaBatchCache: MambaCache, MTPPackedVerificationCa
         else { throw MTPPackedMambaCacheError.missingForwardState }
 
         let completeState = state
+        let prefixes = speculativePrefixStates
+        if !prefixes.isEmpty {
+            // Depth-D verification: every kept prefix's state was saved.
+            let transactions = preparedRowMaps.enumerated().map { rowIndex, map in
+                func row(_ arrays: [MLXArray]) -> [MLXArray] {
+                    arrays.map { $0[rowIndex ..< rowIndex + 1, .ellipsis] }
+                }
+                // A right-padded row's complete state stopped at its valid
+                // columns (the model masks padded columns).
+                return MTPPackedMambaRowTransaction(
+                    rowCache: rowCaches[rowIndex],
+                    inputCount: map.inputCount,
+                    proposalCount: map.proposalCount,
+                    baseState: row(prefixes[1] ?? completeState),
+                    finalState: row(completeState),
+                    prefixStates: prefixes.filter { $0.key < map.inputCount }
+                        .mapValues(row))
+            }
+            discardSpeculativeCheckpoint()
+            pendingTransactions = transactions
+            return transactions
+        }
         let needsCheckpoint = preparedRowMaps.contains(where: { $0.proposalCount > 0 })
         let checkpointState: [MLXArray]
         if needsCheckpoint {

@@ -18,18 +18,25 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-/// MTP-1 drafter for GLM-5-Next. It owns no parameters: every call resolves
-/// the target's `mtp[0]` layer, embeddings and lm_head. Its per-stream state
-/// is one `GLM5NextAttentionCache` for the block's sparse attention.
+/// MTP drafter for GLM-5-Next, depth 1...7 (block size up to 8): the single
+/// nextn layer drafts recursively, as oMLX does. Each round folds the
+/// committed tokens (accepted drafts plus the final token) into the head's
+/// cache with the target's hidden states, takes the first draft from that
+/// forward, and chains the rest on the head's own output hidden; chained
+/// entries are tentative and every commit trims them all (exact trim), so the
+/// cache holds committed entries only. It owns no parameters: every call
+/// resolves the target's `mtp[0]` layer, embeddings and lm_head. Its
+/// per-stream state is one `GLM5NextAttentionCache`.
 public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel {
     public let configuration: GLM5NextConfiguration
-    public let maximumBlockSize: Int? = 2
+    /// A verify carries at most 8 columns (the batched-exactness cap).
+    public let maximumBlockSize: Int? = 8
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = true
 
-    /// Drafter-cache tokens a round can leave tentative: one proposal.
-    public static let maxTrim = 1
+    /// Drafter-cache tokens a round leaves tentative: the chained drafts.
+    public static let maxTrim = 7
 
     public init(_ configuration: GLM5NextConfiguration) {
         self.configuration = configuration
@@ -125,9 +132,11 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
             state: &state, sampler: sampler)
     }
 
-    /// The seed proposal computed while committing the previous round, or
-    /// `blockSize - 1` chained proposals (each feeding the head's own output
-    /// back), left tentative in the drafter cache until the commit.
+    /// `blockSize - 1` proposals: the seed computed while committing the
+    /// previous round (or a first chained step without one), then chained
+    /// steps each feeding the head's own output hidden and the previous draft
+    /// back; chained entries stay tentative in the drafter cache until the
+    /// commit trims them.
     public func draftBlock(
         target: any LanguageModel,
         lastToken: MLXArray,
@@ -139,29 +148,34 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
         state: inout MTPDrafterState,
         sampler: any LogitSampler
     ) -> MLXArray {
-        if let seed = state.seedToken {
-            state.seedToken = nil
-            state.seedHidden = nil
-            state.proposalAppended = 0
-            return seed
-        }
         let head = head(target)
-        var token = normalizedMTPColumn(lastToken)
-        var hidden = lastHidden
         var proposals = [MLXArray]()
-        for _ in 0 ..< (blockSize - 1) {
+        var token: MLXArray
+        var hidden: MLXArray
+        if let seed = state.seedToken, let seedHidden = state.seedHidden {
+            (token, hidden) = (seed, seedHidden)
+            proposals.append(seed)
+        } else {
+            (token, hidden) = (normalizedMTPColumn(lastToken), lastHidden)
+        }
+        state.seedToken = nil
+        state.seedHidden = nil
+        var appended = 0
+        while proposals.count < blockSize - 1 {
             hidden = head.forward(tokens: token, hidden: hidden, cache: state.cache[0])
+            appended += 1
             token = head.sample(hidden, sampler: sampler)
             proposals.append(token)
         }
-        state.proposalAppended = blockSize - 1
-        state.nextPosition += state.proposalAppended
+        state.proposalAppended = appended
+        state.nextPosition += appended
         return concatenated(proposals, axis: 1)
     }
 
-    /// Trim the rejected tentative proposals (exact), feed the accepted ones
-    /// not yet cached plus the final token, each with the target hidden of
-    /// the verification column before it, and seed the next proposal.
+    /// Trim every tentative chained entry (exact), then fold the accepted
+    /// proposals and the final token, each with the target hidden of the
+    /// verification column before it, and seed the next proposal from the
+    /// last (oMLX's committed-only head history).
     public func commitDrafterState(
         target: any LanguageModel,
         targetHidden: MLXArray,
@@ -172,8 +186,8 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
         state: inout MTPDrafterState,
         sampler: any LogitSampler
     ) {
-        let keepAppended = Swift.min(acceptedCount, state.proposalAppended)
-        let trim = state.proposalAppended - keepAppended
+        let keepAppended = 0
+        let trim = state.proposalAppended
         if trim > 0 {
             let trimmed = state.cache[0].trim(trim)
             precondition(trimmed == trim, "GLM5Next MTP cache trimmed \(trimmed) of \(trim)")
@@ -231,8 +245,8 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
                 throw MTPPackedDrafterError.positionMismatch(
                     row: index, nextPosition: row.state.nextPosition, cacheOffset: cache.offset)
             }
-            let keepAppended = Swift.min(acceptedCount, row.state.proposalAppended)
-            let trim = row.state.proposalAppended - keepAppended
+            let keepAppended = 0
+            let trim = row.state.proposalAppended
             let copy = cache.copy() as! GLM5NextAttentionCache
             guard copy.trim(trim) == trim else {
                 throw MTPPackedDrafterError.incompatibleState(row: index)
@@ -275,6 +289,46 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
                 proposalAppended: 0)
         }
         return MTPPackedDrafterAdvanceResult(states: states, proposals: proposals)
+    }
+
+    /// Continue every row's chain from its seed to `depth` proposals with one
+    /// head forward per step for all rows (each row attending its own copied
+    /// cache): the packed form of the chained `draftBlock`, bitwise equal to
+    /// it per row. Returns the advanced states (chained entries tentative) and
+    /// the proposals `[rows, depth]`. Input states are not mutated.
+    public func chainPacked(
+        target: any LanguageModel, states: [MTPDrafterState], depth: Int,
+        sampler: any LogitSampler
+    ) throws -> (states: [MTPDrafterState], proposals: MLXArray) {
+        precondition(depth >= 1 && depth <= Self.maxTrim + 1)
+        var caches = [GLM5NextAttentionCache]()
+        var tokens = [MLXArray]()
+        var hidden = [MLXArray]()
+        for (index, state) in states.enumerated() {
+            guard state.cache.count == 1, let cache = state.cache[0] as? GLM5NextAttentionCache,
+                let seed = state.seedToken, let seedHidden = state.seedHidden,
+                state.proposalAppended == 0
+            else { throw MTPPackedDrafterError.incompatibleState(row: index) }
+            caches.append(cache.copy() as! GLM5NextAttentionCache)
+            tokens.append(seed)
+            hidden.append(seedHidden)
+        }
+        let head = head(target)
+        var token = concatenated(tokens, axis: 0)
+        var h = concatenated(hidden, axis: 0)
+        var proposals = [token]
+        for _ in 1 ..< depth {
+            h = head.forward(
+                tokens: token, hidden: h, cache: GLM5NextLatentCacheBatch(rowCaches: caches))
+            token = head.sample(h, sampler: sampler)
+            proposals.append(token)
+        }
+        let advanced = states.indices.map { row in
+            MTPDrafterState(
+                cache: [caches[row]], nextPosition: caches[row].offset, seedToken: nil,
+                seedHidden: nil, proposalAppended: depth - 1)
+        }
+        return (advanced, concatenated(proposals, axis: 1))
     }
 
     /// The head's weights load with the target (`mtp.*`); the drafter keeps none.
