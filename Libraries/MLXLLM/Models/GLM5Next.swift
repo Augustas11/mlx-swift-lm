@@ -1242,6 +1242,12 @@ public final class GLM5NextModelInner: Module {
     /// comb product without NAX (`glm5NextHCDeferredExact`).
     var deferredDecode = true
 
+    /// Lab knob (0 = off): during decode and verify forwards (up to 8 tokens
+    /// per row), start evaluating the hidden state every this many layers
+    /// while the rest of the graph is built (oMLX's staged eval). Scheduling
+    /// only; values are unchanged.
+    var stagedEvalLayers = 0
+
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         norm(hidden(inputs, cache: cache))
     }
@@ -1262,6 +1268,11 @@ public final class GLM5NextModelInner: Module {
                 (state, topk) = layer.decodeDeferred(
                     state, cache: cache?[index], previousTopk: topk,
                     checkpointAfter: checkpointAfter)
+                if stagedEvalLayers > 0, (index + 1) % stagedEvalLayers == 0,
+                    index + 1 < layers.count, case .deferred(let y, _, _, _, let mm) = state
+                {
+                    asyncEval(y, mm)
+                }
             }
             return state.materialize().mean(axis: 2)
         }
@@ -1270,6 +1281,11 @@ public final class GLM5NextModelInner: Module {
         for (index, layer) in layers.enumerated() {
             (h, topk) = layer(
                 h, cache: cache?[index], previousTopk: topk, checkpointAfter: checkpointAfter)
+            if stagedEvalLayers > 0, inputs.dim(1) <= 8, (index + 1) % stagedEvalLayers == 0,
+                index + 1 < layers.count
+            {
+                asyncEval(h)
+            }
         }
         return h.mean(axis: 2)
     }
