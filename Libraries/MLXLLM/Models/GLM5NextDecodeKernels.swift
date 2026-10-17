@@ -569,8 +569,27 @@ private let glm5NextMultiQMVSource = """
     #if NP > 5
       if (row0 >= N0 + N1 + N2 + N3 + N4) { w = (const device uint8_t*)w5; sc = s5; bi = b5; y = y5; local = row0 - N0 - N1 - N2 - N3 - N4; n = N5; }
     #endif
-      y += size_t(vec) * n;
       const int r0 = local + sg * RPS;
+    #if NVI > 1
+      // Every vector in this threadgroup, each weight tile read once for all.
+      float result[NVI][RPS];
+      for (int v = 0; v < NVI; v++) {
+        for (int r = 0; r < RPS; r++) {
+          result[v][r] = 0.0f;
+        }
+      }
+      glm_qmv_rows_nv<T, K, GS, BITS, RPS, NVI>(
+          w + size_t(r0) * WB, sc + r0 * G, bi + r0 * G, x, lane, result);
+      for (int v = 0; v < NVI; v++) {
+        for (int r = 0; r < RPS; r++) {
+          float o = simd_sum(result[v][r]);
+          if (lane == 0) {
+            y[size_t(v) * n + r0 + r] = static_cast<T>(o);
+          }
+        }
+      }
+    #else
+      y += size_t(vec) * n;
       float result[RPS];
       for (int r = 0; r < RPS; r++) {
         result[r] = 0.0f;
@@ -583,6 +602,7 @@ private let glm5NextMultiQMVSource = """
           y[r0 + r] = static_cast<T>(v);
         }
       }
+    #endif
     """
 
 private final class GLM5NextMultiQMVKernels: @unchecked Sendable {
@@ -590,17 +610,21 @@ private final class GLM5NextMultiQMVKernels: @unchecked Sendable {
     private let lock = NSLock()
     private var kernels: [Int: MLXFast.MLXFastKernel] = [:]
 
-    func kernel(parts: Int) -> MLXFast.MLXFastKernel {
+    /// `vectors > 1`: all vectors in each threadgroup (one weight read).
+    func kernel(parts: Int, vectors: Int = 1) -> MLXFast.MLXFastKernel {
+        let key = parts * 16 + vectors
         lock.lock()
         defer { lock.unlock() }
-        if let kernel = kernels[parts] { return kernel }
+        if let kernel = kernels[key] { return kernel }
         let inputs = ["x"] + (0 ..< parts).flatMap { ["w\($0)", "s\($0)", "b\($0)"] }
         let kernel = MLXFast.metalKernel(
-            name: "glm5next_multi_qmv_p\(parts)", inputNames: inputs,
+            name: "glm5next_multi_qmv_p\(parts)" + (vectors > 1 ? "_v\(vectors)" : ""),
+            inputNames: inputs,
             outputNames: (0 ..< parts).map { "y\($0)" },
-            source: "#define NP \(parts)\n" + glm5NextMultiQMVSource + "\n#undef NP\n",
+            source: "#define NP \(parts)\n#define NVI \(vectors)\n" + glm5NextMultiQMVSource
+                + "\n#undef NP\n#undef NVI\n",
             header: glm5NextQMVHeader)
-        kernels[parts] = kernel
+        kernels[key] = kernel
         return kernel
     }
 }
@@ -633,10 +657,12 @@ func glm5NextMultiQMV(
         template.append(("N\(i)", i < rows.count ? rows[i] : 0))
     }
     let V = x.dim(0)
-    return GLM5NextMultiQMVKernels.shared.kernel(parts: parts.count)(
+    // Up to 8 vectors share each weight tile in one threadgroup.
+    let inner = (2 ... 8).contains(V) ? V : 1
+    return GLM5NextMultiQMVKernels.shared.kernel(parts: parts.count, vectors: inner)(
         [x] + parts.flatMap { [$0.weight, $0.scales, $0.biases] },
         template: template,
-        grid: (32 * nsg * (rows.reduce(0, +) / (rps * nsg)), V, 1),
+        grid: (32 * nsg * (rows.reduce(0, +) / (rps * nsg)), inner > 1 ? 1 : V, 1),
         threadGroup: (32 * nsg, 1, 1),
         outputShapes: rows.map { [V, $0] },
         outputDTypes: Array(repeating: x.dtype, count: rows.count))
@@ -2142,7 +2168,47 @@ private let glm5NextMoEGateUpSource = """
             (const device uint8_t*)up_w + urow0 * WB, up_s + urow0 * G,
             up_b + urow0 * G, xr, simd_lid, u_res);
       } else {
-    #if HAS_SHARED
+    #if HAS_SHARED && SHARED_ALL
+        // The shared expert of every token, each weight tile read once:
+        // token 0's threadgroup computes them all, the others' exit.
+        if (token != 0) {
+          return;
+        }
+        {
+          constexpr int WB = K * SBITS / 8;
+          constexpr int G = K / SGS;
+          const size_t row0 = size_t(out_row);
+          int xoff[NTOK];
+          for (int u = 0; u < NTOK; u++) {
+            xoff[u] = u * K;
+          }
+          float gs_[NTOK][RPS];
+          float us_[NTOK][RPS];
+          for (int u = 0; u < NTOK; u++) {
+            for (int row = 0; row < RPS; row++) {
+              gs_[u][row] = 0.0f;
+              us_[u][row] = 0.0f;
+            }
+          }
+          glm_qmv_rows_set<T, K, SGS, SBITS, RPS, NTOK>(
+              (const device uint8_t*)sh_gate_w + row0 * WB, sh_gate_s + row0 * G,
+              sh_gate_b + row0 * G, x, xoff, NTOK, simd_lid, gs_);
+          glm_qmv_rows_set<T, K, SGS, SBITS, RPS, NTOK>(
+              (const device uint8_t*)sh_up_w + row0 * WB, sh_up_s + row0 * G,
+              sh_up_b + row0 * G, x, xoff, NTOK, simd_lid, us_);
+          for (int u = 0; u < NTOK; u++) {
+            device T* o = out + size_t(u * RT + TOPK) * N + out_row;
+            for (int row = 0; row < RPS; row++) {
+              float gv = simd_sum(gs_[u][row]);
+              float uv = simd_sum(us_[u][row]);
+              if (simd_lid == 0) {
+                o[row] = glm_clamped_swiglu<T>(static_cast<T>(gv), static_cast<T>(uv), lim, neg_lim);
+              }
+            }
+          }
+        }
+        return;
+    #elif HAS_SHARED
         constexpr int WB = K * SBITS / 8;
         constexpr int G = K / SGS;
         const size_t row0 = size_t(out_row);
@@ -2176,7 +2242,10 @@ private let glm5NextMoEDownSource = """
       const int token = int(threadgroup_position_in_grid.z);
     #endif
       // Activation slots per token: the routed ones, then the shared expert's.
-      constexpr int RT = TOPK + HAS_SHARED;
+    #ifndef ACT_SLOTS
+    #define ACT_SLOTS (TOPK + HAS_SHARED)
+    #endif
+      constexpr int RT = ACT_SLOTS;
       const int out_row = (tile * NSG + int(simd_gid)) * RPS;
 
       float acc[RPS] = {0};
@@ -2488,6 +2557,10 @@ private final class GLM5NextMoEKernels: Sendable {
     static let shared = GLM5NextMoEKernels()
     let gateUp: MLXFast.MLXFastKernel
     let down: MLXFast.MLXFastKernel
+    /// Several tokens: the shared expert's gate/up for every token in token
+    /// 0's threadgroup; the down kernel adds a precomputed shared output.
+    let gateUpSharedAll: MLXFast.MLXFastKernel
+    let downAddShared: MLXFast.MLXFastKernel
 
     private init() {
         gateUp = MLXFast.metalKernel(
@@ -2498,7 +2571,7 @@ private final class GLM5NextMoEKernels: Sendable {
                 "sh_up_w", "sh_up_s", "sh_up_b",
             ],
             outputNames: ["out", "sel_indices", "sel_scores"],
-            source: "#define HAS_SHARED 1\n#define SHARED_WIDE 0\n#define SLOT_MAJOR 0\n#define SELECT 1\n" + glm5NextMoEGateUpSource,
+            source: "#define HAS_SHARED 1\n#define SHARED_ALL 0\n#define SHARED_WIDE 0\n#define SLOT_MAJOR 0\n#define SELECT 1\n" + glm5NextMoEGateUpSource,
             header: glm5NextQMVHeader)
         down = MLXFast.metalKernel(
             name: "glm5next_moe_down_combine",
@@ -2508,6 +2581,22 @@ private final class GLM5NextMoEKernels: Sendable {
             ],
             outputNames: ["out"],
             source: "#define HAS_SHARED 1\n#define ADD_SHARED_Y 0\n#define SLOT_MAJOR 0\n#define SHARED_WIDE_DOWN 0\n" + glm5NextMoEDownSource,
+            header: glm5NextQMVHeader)
+        gateUpSharedAll = MLXFast.metalKernel(
+            name: "glm5next_moe_gate_up_select_shared_all",
+            inputNames: [
+                "x", "sel_sig", "sel_biased", "sel_scaling", "limit", "gate_w", "gate_s",
+                "gate_b", "up_w", "up_s", "up_b", "sh_gate_w", "sh_gate_s", "sh_gate_b",
+                "sh_up_w", "sh_up_s", "sh_up_b",
+            ],
+            outputNames: ["out", "sel_indices", "sel_scores"],
+            source: "#define HAS_SHARED 1\n#define SHARED_ALL 1\n#define SHARED_WIDE 0\n#define SLOT_MAJOR 0\n#define SELECT 1\n" + glm5NextMoEGateUpSource,
+            header: glm5NextQMVHeader)
+        downAddShared = MLXFast.metalKernel(
+            name: "glm5next_moe_down_add_shared",
+            inputNames: ["act", "indices", "scores", "down_w", "down_s", "down_b", "shared_y"],
+            outputNames: ["out"],
+            source: "#define HAS_SHARED 0\n#define ADD_SHARED_Y 1\n#define ACT_SLOTS (TOPK + 1)\n#define SLOT_MAJOR 0\n#define SHARED_WIDE_DOWN 0\n" + glm5NextMoEDownSource,
             header: glm5NextQMVHeader)
     }
 }
@@ -2600,6 +2689,50 @@ func glm5NextMoEExperts(
             outputDTypes: [dtype])[0]
     }
     let kernels = GLM5NextMoEKernels.shared
+    if T > 1, T <= 8 {
+        let selected = kernels.gateUpSharedAll(
+            [x, sig, biased, MLXArray([scaling]), MLXArray([limit]),
+             gate.weight, gate.scales, gate.biases, up.weight, up.scales, up.biases,
+             sharedGate.weight, sharedGate.scales, sharedGate.biases,
+             sharedUp.weight, sharedUp.scales, sharedUp.biases],
+            template: [
+                ("T", dtype), ("K", K), ("N", N), ("TOPK", topK), ("RBITS", gate.bits),
+                ("RGS", gate.groupSize), ("RPS", rps), ("NSG", nsg), ("ESTRIDE", N),
+                ("UP_OFF", 0), ("NE", experts), ("SEL_NORM", normalize && topK > 1),
+                ("SBITS", sharedGate.bits), ("SGS", sharedGate.groupSize), ("NTOK", T),
+            ],
+            grid: (32, (N / (rps * nsg)) * nsg, T * slots),
+            threadGroup: (32, nsg, 1),
+            outputShapes: [[T, slots, N], [T, topK], [T, topK]],
+            outputDTypes: [dtype, .uint32, .float32])
+        // The shared expert's down rows once for every token, then the routed
+        // combine adds them as it added its own.
+        if let sharedY = glm5NextQMVBatch(selected[0][0..., topK], sharedDown, rps: rps, nsg: nsg) {
+            return kernels.downAddShared(
+                [selected[0], selected[1], selected[2], down.weight, down.scales, down.biases,
+                 sharedY],
+                template: [
+                    ("T", dtype), ("K", N), ("N", K), ("TOPK", topK), ("RBITS", down.bits),
+                    ("RGS", down.groupSize), ("RPS", rps), ("NSG", nsg),
+                ],
+                grid: (32, (K / (rps * nsg)) * nsg, T),
+                threadGroup: (32, nsg, 1),
+                outputShapes: [[T, K]],
+                outputDTypes: [dtype])[0]
+        }
+        return kernels.down(
+            [selected[0], selected[1], selected[2], down.weight, down.scales, down.biases,
+             sharedDown.weight, sharedDown.scales, sharedDown.biases],
+            template: [
+                ("T", dtype), ("K", N), ("N", K), ("TOPK", topK), ("RBITS", down.bits),
+                ("RGS", down.groupSize), ("RPS", rps), ("NSG", nsg),
+                ("SBITS", sharedDown.bits), ("SGS", sharedDown.groupSize),
+            ],
+            grid: (32, (K / (rps * nsg)) * nsg, T),
+            threadGroup: (32, nsg, 1),
+            outputShapes: [[T, K]],
+            outputDTypes: [dtype])[0]
+    }
     let selected = kernels.gateUp(
         [x, sig, biased, MLXArray([scaling]), MLXArray([limit]),
          gate.weight, gate.scales, gate.biases, up.weight, up.scales, up.biases,
