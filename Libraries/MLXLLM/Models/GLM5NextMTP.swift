@@ -29,8 +29,11 @@ import MLXNN
 /// per-stream state is one `GLM5NextAttentionCache`.
 public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel {
     public let configuration: GLM5NextConfiguration
-    /// A verify carries at most 8 columns (the batched-exactness cap).
-    public let maximumBlockSize: Int? = 8
+    /// Drafts per round at most: 1 by default, the depth measured to pay on
+    /// the M3 Ultra (+18% at 1k, +5% at 8k; depth 2 lost to plain). Deeper
+    /// (up to 7, a verify of at most 8 columns) only when asked.
+    public let maximumDepth: Int
+    public var maximumBlockSize: Int? { maximumDepth + 1 }
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = true
@@ -38,8 +41,10 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
     /// Drafter-cache tokens a round leaves tentative: the chained drafts.
     public static let maxTrim = 7
 
-    public init(_ configuration: GLM5NextConfiguration) {
+    public init(_ configuration: GLM5NextConfiguration, maximumDepth: Int = 1) {
+        precondition((1 ... Self.maxTrim).contains(maximumDepth))
         self.configuration = configuration
+        self.maximumDepth = maximumDepth
         super.init()
     }
 

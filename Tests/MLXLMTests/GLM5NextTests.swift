@@ -1868,35 +1868,78 @@ final class GLM5NextTests: XCTestCase {
         model.model.deferredDecode = true
     }
 
-    /// The depth controller picks argmax E(d)/t(d) from measured acceptance
-    /// and round times, explores one deeper, and parks when plain decoding
-    /// beats every depth.
+    /// Drive the controller with rounds drawn from per-position acceptance and
+    /// per-depth round times (a fixed pseudo-random sequence), the first round
+    /// of each depth carrying a compile-time outlier.
+    private func simulateController(
+        _ controller: inout MTPAdaptiveDepth, acceptance: [Int: [Double]], seconds: [Int: Double],
+        rounds: Int
+    ) -> [Int] {
+        var state: UInt64 = 0x9E37_79B9_7F4A_7C15
+        func uniform() -> Double {
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Double(state >> 11) / Double(1 << 53)
+        }
+        var chosen = [Int]()
+        var compiled = Set<Int>()
+        for _ in 0 ..< rounds {
+            let d = controller.depth()
+            chosen.append(d)
+            var accepted = 0
+            while accepted < d, uniform() < acceptance[d]![accepted] { accepted += 1 }
+            let outlier = compiled.insert(d).inserted ? 0.4 : 0
+            controller.record(drafted: d, accepted: accepted, seconds: seconds[d]! + outlier)
+        }
+        return chosen
+    }
+
+    /// The controller with the M3 Ultra window numbers (bbdabc4 / 423aa6c,
+    /// varied corpus): depth 1 wins at 1k (48.3 vs 42.3 vs 35.6 tok/s) and at
+    /// 8k (36.3 vs 30.4), so it must settle on depth 1 despite compile-time
+    /// outliers, while still probing the others now and then; with cheap
+    /// columns and high acceptance it goes deep; it parks against a faster
+    /// measured plain step.
     func testAdaptiveDepthControllerFollowsMeasuredRates() {
+        // Round seconds = E(d) / measured tok/s.
+        var controller1k = controllerFor(3)
+        let oneK = simulateController(
+            &controller1k,
+            acceptance: [1: [0.789], 2: [0.784, 0.516], 3: [0.739, 0.573, 0.298]],
+            seconds: [1: 1.789 / 48.26, 2: 2.189 / 42.28, 3: 2.288 / 35.6], rounds: 300)
+        XCTAssertEqual(Set(oneK), [1, 2, 3], "every depth measured")
+        let settled1k = oneK.suffix(200)
+        XCTAssertGreaterThan(
+            Double(settled1k.filter { $0 == 1 }.count) / 200, 0.9, "1k settles on depth 1")
+        var controller8k = controllerFor(2)
+        let eightK = simulateController(
+            &controller8k, acceptance: [1: [0.716], 2: [0.744, 0.316]],
+            seconds: [1: 1.716 / 36.33, 2: 1.979 / 30.40], rounds: 300)
+        XCTAssertGreaterThan(
+            Double(eightK.suffix(200).filter { $0 == 1 }.count) / 200, 0.9, "8k settles on depth 1")
         // Cheap columns, high acceptance: deeper is better.
-        var deep = MTPAdaptiveDepth(maxDepth: 3, columnCostPrior: 0.004)
-        for _ in 0 ..< 40 {
-            deep.record(drafted: 1, accepted: 1, seconds: 0.030)
-            deep.record(drafted: 2, accepted: 2, seconds: 0.034)
-            deep.record(drafted: 3, accepted: 3, seconds: 0.038)
-        }
-        XCTAssertEqual(deep.depth(), 3)
-        XCTAssertFalse(deep.shouldPark)
-        // Expensive columns, second draft usually rejected: depth 1.
-        var shallow = MTPAdaptiveDepth(maxDepth: 3)
-        for i in 0 ..< 40 {
-            shallow.record(drafted: 1, accepted: 1, seconds: 0.044)
-            shallow.record(drafted: 2, accepted: i % 4 == 0 ? 2 : 1, seconds: 0.058)
-            shallow.record(drafted: 3, accepted: 1, seconds: 0.072)
-        }
-        XCTAssertEqual(shallow.depth(), 1)
-        XCTAssertEqual(shallow.expectedTokens(1), 2, accuracy: 1e-9)
-        // Rare acceptance against a measured fast plain step: park.
+        var deep = MTPAdaptiveDepth(maxDepth: 3)
+        let deepChoice = simulateController(
+            &deep, acceptance: [1: [0.95], 2: [0.95, 0.95], 3: [0.95, 0.95, 0.95]],
+            seconds: [1: 0.030, 2: 0.033, 3: 0.036], rounds: 200)
+        XCTAssertEqual(deep.bestDepth(), 3)
+        XCTAssertGreaterThan(deepChoice.suffix(100).filter { $0 == 3 }.count, 90)
+        // Rare acceptance against a faster measured plain step: park.
         var park = MTPAdaptiveDepth(maxDepth: 2)
-        park.plainStepTime = 0.025
-        for _ in 0 ..< 30 {
-            park.record(drafted: 1, accepted: 0, seconds: 0.044)
-        }
+        park.plainStepTime = 0.0255
+        _ = simulateController(
+            &park, acceptance: [1: [0.1], 2: [0.1, 0.1]],
+            seconds: [1: 0.037, 2: 0.047], rounds: 60)
         XCTAssertTrue(park.shouldPark)
+        // The measured M3 depth-1 rate beats its measured plain step: no park.
+        var keep = controllerFor(1)
+        keep.plainStepTime = 1 / 41.02
+        _ = simulateController(
+            &keep, acceptance: [1: [0.789]], seconds: [1: 1.789 / 48.26], rounds: 60)
+        XCTAssertFalse(keep.shouldPark)
+    }
+
+    private func controllerFor(_ maxDepth: Int) -> MTPAdaptiveDepth {
+        MTPAdaptiveDepth(maxDepth: maxDepth)
     }
 
     /// With the adaptive controller (depths 1...3, oracle drafts) MTP greedy
@@ -1908,8 +1951,8 @@ final class GLM5NextTests: XCTestCase {
         var plain = try TokenIterator(prompt: prompt, model: model, parameters: parameters)
         var expected = [Int]()
         while let token = plain.next() { expected.append(token) }
-        var controller = MTPAdaptiveDepth(maxDepth: 3, columnCostPrior: 0.0001)
-        controller.exploreInterval = 3
+        var controller = MTPAdaptiveDepth(maxDepth: 3)
+        controller.probeInterval = 3
         var speculative = try MTPSpeculativeTokenIterator(
             input: LMInput(tokens: prompt), mainModel: model,
             drafter: DepthOracleDrafter(expected: expected, promptLength: 13),
@@ -1941,8 +1984,8 @@ final class GLM5NextTests: XCTestCase {
 
         var speculative = try MTPSpeculativeTokenIterator(
             input: LMInput(tokens: prompt), mainModel: model,
-            drafter: GLM5NextMTPDraftModel(configuration), parameters: parameters,
-            blockSize: depth + 1)
+            drafter: GLM5NextMTPDraftModel(configuration, maximumDepth: depth),
+            parameters: parameters, blockSize: depth + 1)
         var produced = [Int]()
         while let token = speculative.next() { produced.append(token) }
         XCTAssertNil(speculative.passthroughReason, "\(label): stayed speculative")
