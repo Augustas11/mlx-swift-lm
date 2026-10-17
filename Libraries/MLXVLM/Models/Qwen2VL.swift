@@ -508,6 +508,35 @@ private enum Language {
 
 // MARK: - Vision
 
+/// Qwen2-VL vision self-attention restricted to each image (or video temporal slice).
+///
+/// `queries`, `keys` and `values` are `[rows, heads, headDim]` for the patch rows of every
+/// image concatenated in prompt order; `cuSeqlens` are the block boundaries from
+/// ``visionCuSeqlens(_:)``. Each block attends only to itself, matching `cu_seqlens` in
+/// mlx-vlm / transformers. Attending across the whole concatenation lets one image's
+/// patches mix into another's features, scrambling multi-image answers. Returns
+/// `[rows, heads * headDim]`.
+func qwen2VLSegmentedVisionAttention(
+    queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, cuSeqlens: [Int]
+) -> MLXArray {
+    let rows = queries.dim(0)
+    precondition(
+        cuSeqlens.first == 0 && cuSeqlens.last == rows,
+        "vision cu_seqlens \(cuSeqlens) do not cover \(rows) patch rows")
+    var outputs = [MLXArray]()
+    outputs.reserveCapacity(cuSeqlens.count - 1)
+    for i in 1 ..< cuSeqlens.count {
+        let range = cuSeqlens[i - 1] ..< cuSeqlens[i]
+        let q = queries[range][.newAxis].transposed(0, 2, 1, 3)
+        let k = keys[range][.newAxis].transposed(0, 2, 1, 3)
+        let v = values[range][.newAxis].transposed(0, 2, 1, 3)
+        let o = MLXFast.scaledDotProductAttention(
+            queries: q, keys: k, values: v, scale: scale, mask: .none)
+        outputs.append(o.transposed(0, 2, 1, 3).reshaped(range.count, -1))
+    }
+    return concatenated(outputs, axis: 0)
+}
+
 private enum Vision {
 
     static fileprivate func applyMultimodalRotaryPositionEmbedding(
@@ -573,8 +602,6 @@ private enum Vision {
             _ x: MLXArray, frames: [THW], rotaryPositionEmbedding: MLXArray
         ) -> MLXArray {
             let sequenceLength = x.dim(0)
-            let B = frames[0].t
-            let L = sequenceLength / B
 
             let qkv = qkv(x)
             let s = split(qkv, parts: 3, axis: -1)
@@ -587,19 +614,9 @@ private enum Vision {
             q = applyMultimodalRotaryPositionEmbedding(q, freqs: rotaryPositionEmbedding)
             k = applyMultimodalRotaryPositionEmbedding(k, freqs: rotaryPositionEmbedding)
 
-            q = q.reshaped(B, L, numHeads, -1).transposed(0, 2, 1, 3)
-            k = k.reshaped(B, L, numHeads, -1).transposed(0, 2, 1, 3)
-            v = v.reshaped(B, L, numHeads, -1).transposed(0, 2, 1, 3)
-
-            let output = MLXFast.scaledDotProductAttention(
-                queries: q,
-                keys: k,
-                values: v,
-                scale: scale,
-                mask: .none
-            )
-            .transposed(0, 2, 1, 3)
-            .reshaped(sequenceLength, -1)
+            let output = qwen2VLSegmentedVisionAttention(
+                queries: q, keys: k, values: v, scale: scale,
+                cuSeqlens: visionCuSeqlens(frames))
 
             return proj(output)
         }
