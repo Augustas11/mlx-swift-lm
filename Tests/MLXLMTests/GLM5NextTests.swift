@@ -110,6 +110,91 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
+    /// Code r1: the sparse-indexer sizes and every per-layer type are
+    /// validated before a model is built; a typo or an out-of-range size is a
+    /// thrown configuration error, never a silently different model.
+    func testConfigurationRejectsInvalidIndexerSizesAndUnknownLayerTypes() throws {
+        func rejects(
+            _ edits: (String, String)..., file: StaticString = #filePath, line: UInt = #line
+        ) {
+            var json = textConfigJSON()
+            for (from, to) in edits {
+                XCTAssertTrue(json.contains(from), "fixture lacks \(from)", file: file, line: line)
+                json = json.replacingOccurrences(of: from, with: to)
+            }
+            XCTAssertThrowsError(
+                try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+                    .validateModelConfiguration(),
+                "\(edits)", file: file, line: line)
+        }
+        XCTAssertNoThrow(try configuration())
+        // index_topk: positive, at least one pool, bounded, whole pools.
+        rejects((#""index_topk": 8"#, #""index_topk": 0"#))
+        rejects((#""index_topk": 8"#, #""index_topk": -8"#))
+        rejects((#""index_topk": 8"#, #""index_topk": 2"#))
+        rejects((#""index_topk": 8"#, #""index_topk": 10"#))
+        rejects((#""index_topk": 8"#, #""index_topk": 131072"#))
+        // index_kpool: positive and bounded by the select kernel's tail.
+        rejects((#""index_kpool": 4"#, #""index_kpool": 0"#))
+        rejects((#""index_kpool": 4"#, #""index_kpool": -4"#))
+        rejects(
+            (#""index_topk": 8"#, #""index_topk": 4096"#),
+            (#""index_kpool": 4"#, #""index_kpool": 2048"#))
+        // Unknown per-layer spellings.
+        rejects((#""mlp_layer_types": ["dense", "dense", "dense", "sparse""#, #""mlp_layer_types": ["dense", "dense", "dense", "moe""#))
+        rejects((#""indexer_types": ["full", "full", "full", "full", "full", "shared"]"#, #""indexer_types": ["full", "full", "full", "full", "full", "Shared"]"#))
+        // Cross-layer: the first sparse-attention layer (3) cannot share.
+        rejects((#""indexer_types": ["full", "full", "full", "full", "full", "shared"]"#, #""indexer_types": ["full", "full", "full", "shared", "full", "shared"]"#))
+        // Sparse MLP layers need a routable expert count.
+        rejects((#""num_experts_per_tok": 2"#, #""num_experts_per_tok": 0"#))
+        rejects((#""num_experts_per_tok": 2"#, #""num_experts_per_tok": 5"#))
+        rejects((#""n_routed_experts": 4"#, #""n_routed_experts": 0"#))
+        // The edges stay valid: one pool, and index_topk at the bound.
+        for (from, to) in [
+            (#""index_topk": 8"#, #""index_topk": 4"#),
+            (#""index_topk": 8"#, #""index_topk": 65536"#),
+        ] {
+            let json = textConfigJSON().replacingOccurrences(of: from, with: to)
+            XCTAssertNoThrow(
+                try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+                    .validateModelConfiguration(), to)
+        }
+    }
+
+    /// The GLM-5.3-Flash artifact's own text config (45 layers, index_topk
+    /// 2048, index_kpool 4, explicit per-layer types) validates.
+    func testGLM53FlashArtifactConfigurationValidates() throws {
+        let layers = (0 ..< 45).map { $0 % 4 == 3 ? "deepseek_sparse_attention" : "linear_attention" }
+        let mlp = (0 ..< 45).map { $0 < 3 ? "dense" : "sparse" }
+        let json = """
+            {
+                "model_type": "glm5_next",
+                "text_config": {
+                    "model_type": "glm5_next_text", "num_hidden_layers": 45,
+                    "num_nextn_predict_layers": 1, "first_k_dense_replace": 3,
+                    "index_topk": 2048, "index_kpool": 4, "index_head_dim": 128,
+                    "index_n_heads": 32, "index_kpool_always_select_tail": true,
+                    "layer_types": \(layers), "mlp_layer_types": \(mlp),
+                    "indexer_types": \(Array(repeating: "full", count: 45))
+                }
+            }
+            """
+        let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+        try config.validateModelConfiguration()
+        XCTAssertEqual(config.indexTopk, 2048)
+        XCTAssertEqual(config.indexKpool, 4)
+
+        // The artifact's config.json itself, when the host has it.
+        if let path = ProcessInfo.processInfo.environment["GLM5NEXT_CONFIG_JSON"] {
+            let artifact = try JSONDecoder().decode(
+                GLM5NextConfiguration.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+            try artifact.validateModelConfiguration()
+            XCTAssertEqual(artifact.hiddenLayers, 45)
+            XCTAssertEqual(artifact.indexTopk, 2048)
+            XCTAssertEqual(artifact.indexKpool, 4)
+        }
+    }
+
     func testConfigurationDerivesLayerPatternFromLinearAttentionConfig() throws {
         let kda = (0 ..< 45).filter { $0 % 4 != 3 }
         let full = (0 ..< 45).filter { $0 % 4 == 3 }

@@ -1917,7 +1917,17 @@ extension GLM5NextConfiguration: ModelConfigurationValidating {
         guard qkRopeHeadDim == 0, mlaUseNope else {
             throw fail("GLM-5-Next requires NoPE sparse attention (qk_rope_head_dim == 0)")
         }
-        guard indexKpool >= 1, indexTopk % indexKpool == 0 else {
+        // The indexer keeps `index_topk / index_kpool` whole pools
+        // (`selectK - 1` is an argPartition kth), pads to `index_topk`, and
+        // the DSA select kernel takes both as template sizes and writes the
+        // `index_kpool - 1` tail from one 1024-thread threadgroup.
+        guard indexKpool >= 1, indexKpool <= Self.maximumIndexKpool else {
+            throw fail("index_kpool must be in 1...\(Self.maximumIndexKpool)")
+        }
+        guard indexTopk >= indexKpool, indexTopk <= Self.maximumIndexTopk else {
+            throw fail("index_topk must be in index_kpool...\(Self.maximumIndexTopk)")
+        }
+        guard indexTopk % indexKpool == 0 else {
             throw fail("index_topk must be divisible by index_kpool")
         }
         guard scoringFunc == "sigmoid", topkMethod == "noaux_tc" else {
@@ -1927,12 +1937,32 @@ extension GLM5NextConfiguration: ModelConfigurationValidating {
         guard layerTypes.allSatisfy(supported.contains) else {
             throw fail("unsupported layer type in \(layerTypes)")
         }
+        // Any other spelling would silently pick the dense MLP or a full
+        // indexer.
+        guard mlpLayerTypes.allSatisfy(["dense", "sparse"].contains) else {
+            throw fail("unsupported mlp layer type in \(mlpLayerTypes)")
+        }
+        guard indexerTypes.allSatisfy(["full", "shared"].contains) else {
+            throw fail("unsupported indexer type in \(indexerTypes)")
+        }
+        // A shared indexer reuses the selection of the nearest earlier
+        // sparse-attention layer, so the first one must index for itself.
         if let first = layerTypes.indices.first(where: { layerTypes[$0] != "linear_attention" }),
             indexerTypes[first] == "shared"
         {
             throw fail("the first sparse-attention layer cannot use a shared indexer")
         }
+        if mlpLayerTypes.contains("sparse") {
+            guard nRoutedExperts >= 1, numExpertsPerTok >= 1, numExpertsPerTok <= nRoutedExperts
+            else {
+                throw fail("sparse MLP layers need 1 <= num_experts_per_tok <= n_routed_experts")
+            }
+        }
     }
+
+    /// Upper bounds for the sparse indexer. GLM-5.3-Flash uses 2048 / 4.
+    static let maximumIndexTopk = 65_536
+    static let maximumIndexKpool = 1_024
 }
 
 // MARK: - Chat conventions
