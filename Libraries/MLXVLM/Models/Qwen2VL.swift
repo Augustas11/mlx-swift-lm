@@ -519,12 +519,32 @@ private enum Language {
 func qwen2VLSegmentedVisionAttention(
     queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float, cuSeqlens: [Int]
 ) -> MLXArray {
+    // Accept the leading singleton batch axis the rotary embedding broadcasts in.
+    func rows3(_ x: MLXArray) -> MLXArray {
+        x.ndim == 4 && x.dim(0) == 1 ? x.squeezed(axis: 0) : x
+    }
+    let queries = rows3(queries)
+    let keys = rows3(keys)
+    let values = rows3(values)
     let rows = queries.dim(0)
     precondition(
         cuSeqlens.first == 0 && cuSeqlens.last == rows,
         "vision cu_seqlens \(cuSeqlens) do not cover \(rows) patch rows")
+    let lengths = zip(cuSeqlens.dropFirst(), cuSeqlens).map { $0 - $1 }
+    // Equal-length blocks (one image, several same-size images, or one video's
+    // temporal slices) run as one batched SDPA call, as the pre-fix code did for
+    // a single video; only mixed sizes fall back to one call per block.
+    if let first = lengths.first, lengths.allSatisfy({ $0 == first }) {
+        let n = lengths.count
+        let q = queries.reshaped(n, first, queries.dim(1), -1).transposed(0, 2, 1, 3)
+        let k = keys.reshaped(n, first, keys.dim(1), -1).transposed(0, 2, 1, 3)
+        let v = values.reshaped(n, first, values.dim(1), -1).transposed(0, 2, 1, 3)
+        let o = MLXFast.scaledDotProductAttention(
+            queries: q, keys: k, values: v, scale: scale, mask: .none)
+        return o.transposed(0, 2, 1, 3).reshaped(rows, -1)
+    }
     var outputs = [MLXArray]()
-    outputs.reserveCapacity(cuSeqlens.count - 1)
+    outputs.reserveCapacity(lengths.count)
     for i in 1 ..< cuSeqlens.count {
         let range = cuSeqlens[i - 1] ..< cuSeqlens[i]
         let q = queries[range][.newAxis].transposed(0, 2, 1, 3)
