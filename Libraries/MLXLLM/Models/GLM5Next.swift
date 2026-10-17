@@ -313,6 +313,11 @@ final class GLM5NextMoE: Module, UnaryLayer {
     @ModuleInfo(key: "shared_experts") var sharedExperts: GLM5NextMLP?
     let limit: Float?
 
+    /// Lab knob (off): several-token decode reads each routed expert's
+    /// weights once for every token routed to it (bitwise equal to the
+    /// per-token kernels). Slower than per-token on the M5 4-layer cut.
+    var shareExpertLoads = false
+
     init(_ config: GLM5NextConfiguration) {
         _gate.wrappedValue = GLM5NextMoEGate(config)
         self.limit = config.swigluLimit
@@ -364,7 +369,8 @@ final class GLM5NextMoE: Module, UnaryLayer {
             x2, sig: sig, biased: biased, topK: gate.topK, scaling: gate.scaling,
             normalize: gate.normalize, limit: limit,
             gate: gateParts, up: upParts, down: downParts,
-            sharedGate: sharedGate, sharedUp: sharedUp, sharedDown: sharedDown
+            sharedGate: sharedGate, sharedUp: sharedUp, sharedDown: sharedDown,
+            shareExpertLoads: shareExpertLoads
         )?.reshaped(x.shape)
     }
 
@@ -732,8 +738,11 @@ final class GLM5NextIndexer: Module {
     }
 
     /// Fold this chunk's keys into the pooled-key cache; returns all pooled keys.
-    func updatePools(_ x: MLXArray, cache: any GLM5NextLatentCache) -> MLXArray? {
-        let keys = kNorm(wk(x))
+    /// `keys`: `kNorm(wk(x))` when the caller computed it for more columns.
+    func updatePools(_ x: MLXArray, cache: any GLM5NextLatentCache, keys: MLXArray? = nil)
+        -> MLXArray?
+    {
+        let keys = keys ?? kNorm(wk(x))
         let gates = matmul(x.asType(.float32), compressGate.asType(.float32).T).asType(keys.dtype)
         if let (readyKeys, readyGates) = cache.takeCompleteWindows(keys: keys, gates: gates) {
             cache.appendPooled(compress(keys: readyKeys, gates: readyGates))
@@ -754,13 +763,16 @@ final class GLM5NextIndexer: Module {
     /// One decode token selects with `glm5NextDSASelect` (two kernels).
     var fusedDecode = true
 
+    /// `q`, `weights`: `wq_b(qResid)` and `weights_proj(x)` when the caller
+    /// computed them for more columns.
     func select(
-        _ x: MLXArray, qResid: MLXArray, pooledKeys: MLXArray?, kvLength: Int
+        _ x: MLXArray, qResid: MLXArray, pooledKeys: MLXArray?, kvLength: Int,
+        q precomputedQ: MLXArray? = nil, weights precomputedWeights: MLXArray? = nil
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
         if fusedDecode, !training, B == 1, L == 1, let pooledKeys,
             let fused = glm5NextDSASelect(
-                q: wqB(qResid), weights: weightsProj(x),
+                q: precomputedQ ?? wqB(qResid), weights: precomputedWeights ?? weightsProj(x),
                 weightScale: pow(Float(numHeads), -0.5) * softmaxScale, pooledKeys: pooledKeys,
                 kvLength: kvLength, heads: numHeads, dim: headDim, indexTopk: indexTopk,
                 kpool: kpool, tail: alwaysSelectTail)
@@ -788,9 +800,11 @@ final class GLM5NextIndexer: Module {
                     MLXArray(Int32(0) ..< Int32(poolCount)).reshaped(1, 1, poolCount),
                     to: [B, L, poolCount])
             } else {
-                let q = wqB(qResid).reshaped(B, L, numHeads, headDim).asType(.float32)
+                let q = (precomputedQ ?? wqB(qResid)).reshaped(B, L, numHeads, headDim)
+                    .asType(.float32)
                 let weights =
-                    weightsProj(x).asType(.float32) * (pow(Float(numHeads), -0.5) * softmaxScale)
+                    (precomputedWeights ?? weightsProj(x)).asType(.float32)
+                    * (pow(Float(numHeads), -0.5) * softmaxScale)
                 let poolT = expandedDimensions(pooledKeys.asType(.float32), axis: 1)
                     .swappedAxes(-1, -2)
                 var chunks = [MLXArray]()
@@ -963,6 +977,11 @@ final class GLM5NextAttention: Module {
             let rqLatent = row(qLatent)
             if perColumn {
                 let valid = rowLengths?[index] ?? L
+                // The indexer's projections for every column at once (row-
+                // independent); the gates, selection and attention per column.
+                let indexerKeys = indexer.map { $0.kNorm(glm5NextProject($0.wk, rx)) }
+                let indexerQ = indexer.map { glm5NextProject($0.wqB, rq) }
+                let indexerWeights = indexer.map { glm5NextProject($0.weightsProj, rx) }
                 var columns = [MLXArray]()
                 for c in 0 ..< L {
                     let slot = index * L + c
@@ -972,11 +991,13 @@ final class GLM5NextAttention: Module {
                         selections.append(nil)
                         continue
                     }
+                    func col(_ a: MLXArray?) -> MLXArray? { a?[0..., c ..< (c + 1)] }
                     let (out, topk) = attendRow(
                         x: rx[0..., c ..< (c + 1)], qResid: rq[0..., c ..< (c + 1)],
                         qLatent: rqLatent[0..., 0..., c ..< (c + 1)],
                         latentIn: rl[0..., 0..., c ..< (c + 1)], cache: rowCache,
-                        previousTopk: slot < previousTopk.count ? previousTopk[slot] : nil)
+                        previousTopk: slot < previousTopk.count ? previousTopk[slot] : nil,
+                        indexerInputs: (col(indexerKeys), col(indexerQ), col(indexerWeights)))
                     columns.append(out)
                     selections.append(topk)
                 }
@@ -1011,7 +1032,8 @@ final class GLM5NextAttention: Module {
     /// select (or attend densely while the context fits in `index_topk`).
     private func attendRow(
         x: MLXArray, qResid: MLXArray, qLatent: MLXArray, latentIn: MLXArray,
-        cache: any GLM5NextLatentCache, previousTopk: MLXArray?
+        cache: any GLM5NextLatentCache, previousTopk: MLXArray?,
+        indexerInputs: (keys: MLXArray?, q: MLXArray?, weights: MLXArray?) = (nil, nil, nil)
     ) -> (MLXArray, MLXArray?) {
         let L = x.dim(1)
         let latent = cache.appendLatent(latentIn)
@@ -1020,9 +1042,11 @@ final class GLM5NextAttention: Module {
 
         var topk: MLXArray?
         if let indexer {
-            let pooled = indexer.updatePools(x, cache: cache)
+            let pooled = indexer.updatePools(x, cache: cache, keys: indexerInputs.keys)
             if !dense {
-                topk = indexer.select(x, qResid: qResid, pooledKeys: pooled, kvLength: kvLength)
+                topk = indexer.select(
+                    x, qResid: qResid, pooledKeys: pooled, kvLength: kvLength,
+                    q: indexerInputs.q, weights: indexerInputs.weights)
             }
         } else if !dense {
             guard let previousTopk else {

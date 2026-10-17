@@ -1846,6 +1846,55 @@ private let glm5NextQMVHeader = """
       }
     }
 
+    // glm_qmv_rows for `nv <= NVMAX` vectors at `x0 + xoff[v]` sharing each
+    // weight load; every vector's partial sums follow qmv_fast's order.
+    template <typename T, int K, int group_size, int bits, int RPS, int NVMAX>
+    inline void glm_qmv_rows_set(
+        const device uint8_t* ws,
+        const device T* scales,
+        const device T* biases,
+        const device T* x0,
+        const thread int* xoff,
+        int nv,
+        uint simd_lid,
+        thread float (*result)[RPS]) {
+      constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+      constexpr int pack_factor = glm_pack_factor<bits>();
+      constexpr int bytes_per_pack = glm_bytes_per_pack<bits>();
+      constexpr int values_per_thread = pack_factor * packs_per_thread;
+      constexpr int block_size = values_per_thread * 32;
+      constexpr int scale_step_per_thread = group_size / values_per_thread;
+      constexpr int in_vec_size_w = K * bytes_per_pack / pack_factor;
+      constexpr int in_vec_size_g = K / group_size;
+
+      thread float x_thread[NVMAX][values_per_thread];
+      float sum[NVMAX];
+      ws += simd_lid * packs_per_thread * bytes_per_pack;
+      scales += simd_lid / scale_step_per_thread;
+      biases += simd_lid / scale_step_per_thread;
+      const int lane_off = simd_lid * values_per_thread;
+
+      for (int k = 0; k < K; k += block_size) {
+        for (int v = 0; v < nv; v++) {
+          sum[v] = glm_load_vector<T, values_per_thread, bits>(
+              x0 + xoff[v] + lane_off + k, x_thread[v]);
+        }
+        for (int row = 0; row < RPS; row++) {
+          const device uint8_t* wl = ws + row * in_vec_size_w;
+          const device T* sl = scales + row * in_vec_size_g;
+          const device T* bl = biases + row * in_vec_size_g;
+          float s = sl[0];
+          float b = bl[0];
+          for (int v = 0; v < nv; v++) {
+            result[v][row] += glm_qdot<values_per_thread, bits>(wl, x_thread[v], s, b, sum[v]);
+          }
+        }
+        ws += block_size * bytes_per_pack / pack_factor;
+        scales += block_size / group_size;
+        biases += block_size / group_size;
+      }
+    }
+
     // Verbatim copy of MLX quantized.h dequantize (U = float) for 4/5/6/8 bits.
     template <int N, int bits>
     inline void glm_dequantize(const device uint8_t* w, float scale, float bias, thread float* w_local) {
@@ -2227,6 +2276,235 @@ private let glm5NextMoEDownSource = """
       }
     """
 
+// Several tokens: each expert's weights are read once for every token routed
+// to it. A gate/up threadgroup computes its expert for every token that
+// picked it if its token is the first to; the others skip. The down kernel
+// computes each distinct expert once per tile, keeps every (token, slot)
+// result and sums each token's in its route order. Every token's arithmetic
+// is the one-token kernels'.
+private let glm5NextMoEGateUpSharedSource = """
+      const uint simd_lid = thread_index_in_simdgroup;
+      const uint simd_gid = simdgroup_index_in_threadgroup;
+      const int tile = int(threadgroup_position_in_grid.y);
+      const int z = int(threadgroup_position_in_grid.z);
+      const T lim = T(limit[0]);
+      const T neg_lim = T(-limit[0]);
+      constexpr int RT = TOPK + 1;
+      const int token = z / RT;
+      const int r = z - token * RT;
+      const int out_row = (tile * NSG + int(simd_gid)) * RPS;
+
+      int picks[NTOK][TOPK];
+      for (int u = 0; u < NTOK; u++) {
+        glm_router_topk<NE, TOPK>(sel_biased + size_t(u) * NE, simd_lid, picks[u]);
+      }
+      if (r == 0 && tile == 0 && simd_gid == 0 && simd_lid == 0) {
+        const device float* sig_t = sel_sig + size_t(token) * NE;
+        float total = 0.0f;
+        float gathered[TOPK];
+        for (int q = 0; q < TOPK; q++) {
+          gathered[q] = sig_t[picks[token][q]];
+          total = gathered[q] + total;
+        }
+        for (int q = 0; q < TOPK; q++) {
+          float qv = SEL_NORM ? gathered[q] / (total + 1e-20f) : gathered[q];
+          float sv = qv * sel_scaling[0];
+          sel_indices[token * TOPK + q] = uint(picks[token][q]);
+          sel_scores[token * TOPK + q] = sv;
+        }
+      }
+
+      int xoff[NTOK];
+      int dest[NTOK];
+      int nv = 0;
+      float g_res[NTOK][RPS];
+      float u_res[NTOK][RPS];
+      for (int v = 0; v < NTOK; v++) {
+        for (int row = 0; row < RPS; row++) {
+          g_res[v][row] = 0.0f;
+          u_res[v][row] = 0.0f;
+        }
+      }
+      if (r < TOPK) {
+        const int expert = picks[token][r];
+        for (int u = 0; u < token; u++) {
+          for (int q = 0; q < TOPK; q++) {
+            if (picks[u][q] == expert) {
+              return;  // an earlier token's threadgroup computes this expert
+            }
+          }
+        }
+        for (int u = token; u < NTOK; u++) {
+          for (int q = 0; q < TOPK; q++) {
+            if (picks[u][q] == expert) {
+              xoff[nv] = u * K;
+              dest[nv] = u * RT + q;
+              nv++;
+            }
+          }
+        }
+        constexpr int WB = K * RBITS / 8;
+        constexpr int G = K / RGS;
+        const size_t row0 = size_t(expert) * ESTRIDE + out_row;
+        const size_t urow0 = row0 + UP_OFF;
+        glm_qmv_rows_set<T, K, RGS, RBITS, RPS, NTOK>(
+            (const device uint8_t*)gate_w + row0 * WB, gate_s + row0 * G, gate_b + row0 * G,
+            x, xoff, nv, simd_lid, g_res);
+        glm_qmv_rows_set<T, K, RGS, RBITS, RPS, NTOK>(
+            (const device uint8_t*)up_w + urow0 * WB, up_s + urow0 * G, up_b + urow0 * G,
+            x, xoff, nv, simd_lid, u_res);
+      } else {
+        if (token != 0) {
+          return;  // token 0's threadgroup computes the shared expert for all
+        }
+        for (int u = 0; u < NTOK; u++) {
+          xoff[u] = u * K;
+          dest[u] = u * RT + TOPK;
+        }
+        nv = NTOK;
+        constexpr int WB = K * SBITS / 8;
+        constexpr int G = K / SGS;
+        const size_t row0 = size_t(out_row);
+        glm_qmv_rows_set<T, K, SGS, SBITS, RPS, NTOK>(
+            (const device uint8_t*)sh_gate_w + row0 * WB, sh_gate_s + row0 * G,
+            sh_gate_b + row0 * G, x, xoff, nv, simd_lid, g_res);
+        glm_qmv_rows_set<T, K, SGS, SBITS, RPS, NTOK>(
+            (const device uint8_t*)sh_up_w + row0 * WB, sh_up_s + row0 * G,
+            sh_up_b + row0 * G, x, xoff, nv, simd_lid, u_res);
+      }
+      for (int v = 0; v < nv; v++) {
+        device T* o = out + size_t(dest[v]) * N + out_row;
+        for (int row = 0; row < RPS; row++) {
+          float gv = simd_sum(g_res[v][row]);
+          float uv = simd_sum(u_res[v][row]);
+          if (simd_lid == 0) {
+            o[row] = glm_clamped_swiglu<T>(static_cast<T>(gv), static_cast<T>(uv), lim, neg_lim);
+          }
+        }
+      }
+    """
+
+private let glm5NextMoEDownSharedSource = """
+      const uint simd_lid = thread_index_in_simdgroup;
+      const uint simd_gid = simdgroup_index_in_threadgroup;
+      const int tile = int(threadgroup_position_in_grid.y);
+      constexpr int RT = TOPK + 1;
+      const int out_row = (tile * NSG + int(simd_gid)) * RPS;
+      threadgroup float slot_res[NSG][NTOK][TOPK][RPS];
+      constexpr int WB = K * RBITS / 8;
+      constexpr int G = K / RGS;
+
+      for (int t = 0; t < NTOK; t++) {
+        for (int r = 0; r < TOPK; r++) {
+          const int expert = int(indices[t * TOPK + r]);
+          bool seen = false;
+          for (int u = 0; u < t && !seen; u++) {
+            for (int q = 0; q < TOPK; q++) {
+              seen = seen || int(indices[u * TOPK + q]) == expert;
+            }
+          }
+          if (seen) {
+            continue;
+          }
+          int xoff[NTOK];
+          int dt[NTOK];
+          int dq[NTOK];
+          int nv = 0;
+          for (int u = t; u < NTOK; u++) {
+            for (int q = 0; q < TOPK; q++) {
+              if (int(indices[u * TOPK + q]) == expert) {
+                xoff[nv] = (u * RT + q) * K;
+                dt[nv] = u;
+                dq[nv] = q;
+                nv++;
+              }
+            }
+          }
+          float res[NTOK][RPS];
+          for (int v = 0; v < NTOK; v++) {
+            for (int row = 0; row < RPS; row++) {
+              res[v][row] = 0.0f;
+            }
+          }
+          const size_t row0 = size_t(expert) * N + out_row;
+          glm_qmv_rows_set<T, K, RGS, RBITS, RPS, NTOK>(
+              (const device uint8_t*)down_w + row0 * WB, down_s + row0 * G, down_b + row0 * G,
+              act, xoff, nv, simd_lid, res);
+          for (int v = 0; v < nv; v++) {
+            for (int row = 0; row < RPS; row++) {
+              float sv = simd_sum(res[v][row]);
+              if (simd_lid == 0) {
+                slot_res[simd_gid][dt[v]][dq[v]][row] = sv;
+              }
+            }
+          }
+        }
+      }
+
+      int sxoff[NTOK];
+      for (int u = 0; u < NTOK; u++) {
+        sxoff[u] = (u * RT + TOPK) * K;
+      }
+      float sres[NTOK][RPS];
+      for (int v = 0; v < NTOK; v++) {
+        for (int row = 0; row < RPS; row++) {
+          sres[v][row] = 0.0f;
+        }
+      }
+      {
+        constexpr int SWB = K * SBITS / 8;
+        constexpr int SG = K / SGS;
+        const size_t row0 = size_t(out_row);
+        glm_qmv_rows_set<T, K, SGS, SBITS, RPS, NTOK>(
+            (const device uint8_t*)sh_down_w + row0 * SWB, sh_down_s + row0 * SG,
+            sh_down_b + row0 * SG, act, sxoff, NTOK, simd_lid, sres);
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (int u = 0; u < NTOK; u++) {
+        device T* o = out + size_t(u) * N + out_row;
+        for (int row = 0; row < RPS; row++) {
+          float sv = simd_sum(sres[u][row]);
+          if (simd_lid == 0) {
+            float acc = 0;
+            for (int r = 0; r < TOPK; r++) {
+              const float score = scores[u * TOPK + r];
+              // As the one-token kernel: bf16-rounded expert output times the
+              // fp32 score, unfused, summed in route order.
+              volatile float weighted =
+                  static_cast<float>(static_cast<T>(slot_res[simd_gid][u][r][row])) * score;
+              acc += weighted;
+            }
+            o[row] = static_cast<T>(acc) + static_cast<T>(sv);
+          }
+        }
+      }
+    """
+
+private final class GLM5NextMoESharedKernels: @unchecked Sendable {
+    static let shared = GLM5NextMoESharedKernels()
+    let gateUp: MLXFast.MLXFastKernel
+    let down: MLXFast.MLXFastKernel
+
+    private init() {
+        gateUp = MLXFast.metalKernel(
+            name: "glm5next_moe_gate_up_shared",
+            inputNames: [
+                "x", "sel_sig", "sel_biased", "sel_scaling", "limit", "gate_w", "gate_s",
+                "gate_b", "up_w", "up_s", "up_b", "sh_gate_w", "sh_gate_s", "sh_gate_b",
+                "sh_up_w", "sh_up_s", "sh_up_b",
+            ],
+            outputNames: ["out", "sel_indices", "sel_scores"],
+            source: glm5NextMoEGateUpSharedSource, header: glm5NextQMVHeader)
+        down = MLXFast.metalKernel(
+            name: "glm5next_moe_down_shared",
+            inputNames: [
+                "act", "indices", "scores", "down_w", "down_s", "down_b", "sh_down_w",
+                "sh_down_s", "sh_down_b",
+            ],
+            outputNames: ["out"], source: glm5NextMoEDownSharedSource, header: glm5NextQMVHeader)
+    }
+}
+
 private final class GLM5NextMoEKernels: Sendable {
     static let shared = GLM5NextMoEKernels()
     let gateUp: MLXFast.MLXFastKernel
@@ -2282,7 +2560,7 @@ func glm5NextMoEExperts(
     normalize: Bool, limit: Float,
     gate: GLM5NextAffine, up: GLM5NextAffine, down: GLM5NextAffine,
     sharedGate: GLM5NextAffine, sharedUp: GLM5NextAffine, sharedDown: GLM5NextAffine,
-    rps: Int = 4, nsg: Int = 2
+    rps: Int = 4, nsg: Int = 2, shareExpertLoads: Bool = false
 ) -> MLXArray? {
     guard x.ndim == 2, x.dim(0) >= 1, [.bfloat16, .float16].contains(x.dtype),
         sig.dtype == .float32, biased.dtype == .float32, sig.ndim == 2, sig.dim(0) == x.dim(0),
@@ -2311,8 +2589,38 @@ func glm5NextMoEExperts(
         N % (rps * nsg) == 0, K % (rps * nsg) == 0
     else { return nil }
 
-    let kernels = GLM5NextMoEKernels.shared
     let slots = topK + 1
+    if T > 1, T <= 8, shareExpertLoads {
+        let shared = GLM5NextMoESharedKernels.shared
+        let selected = shared.gateUp(
+            [x, sig, biased, MLXArray([scaling]), MLXArray([limit]),
+             gate.weight, gate.scales, gate.biases, up.weight, up.scales, up.biases,
+             sharedGate.weight, sharedGate.scales, sharedGate.biases,
+             sharedUp.weight, sharedUp.scales, sharedUp.biases],
+            template: [
+                ("T", dtype), ("K", K), ("N", N), ("TOPK", topK), ("RBITS", gate.bits),
+                ("RGS", gate.groupSize), ("RPS", rps), ("NSG", nsg), ("ESTRIDE", N),
+                ("UP_OFF", 0), ("NE", experts), ("SEL_NORM", normalize && topK > 1),
+                ("SBITS", sharedGate.bits), ("SGS", sharedGate.groupSize), ("NTOK", T),
+            ],
+            grid: (32, (N / (rps * nsg)) * nsg, T * slots),
+            threadGroup: (32, nsg, 1),
+            outputShapes: [[T, slots, N], [T, topK], [T, topK]],
+            outputDTypes: [dtype, .uint32, .float32])
+        return shared.down(
+            [selected[0], selected[1], selected[2], down.weight, down.scales, down.biases,
+             sharedDown.weight, sharedDown.scales, sharedDown.biases],
+            template: [
+                ("T", dtype), ("K", N), ("N", K), ("TOPK", topK), ("RBITS", down.bits),
+                ("RGS", down.groupSize), ("RPS", rps), ("NSG", nsg),
+                ("SBITS", sharedDown.bits), ("SGS", sharedDown.groupSize), ("NTOK", T),
+            ],
+            grid: (32, (K / (rps * nsg)) * nsg, 1),
+            threadGroup: (32, nsg, 1),
+            outputShapes: [[T, K]],
+            outputDTypes: [dtype])[0]
+    }
+    let kernels = GLM5NextMoEKernels.shared
     let selected = kernels.gateUp(
         [x, sig, biased, MLXArray([scaling]), MLXArray([limit]),
          gate.weight, gate.scales, gate.biases, up.weight, up.scales, up.biases,

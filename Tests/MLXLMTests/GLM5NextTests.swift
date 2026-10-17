@@ -1084,6 +1084,49 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
+    /// The several-token MoE kernels that read each expert's weights once for
+    /// every token routed to it equal the per-token kernels bit for bit:
+    /// identical tokens (every expert shared), near tokens (most shared) and
+    /// independent tokens, T = 2...8, with the shared expert.
+    func testMoESharedExpertLoadsMatchPerTokenKernelsBitwise() throws {
+        let (experts, topK, hidden, inter) = (64, 8, 512, 512)
+        let gate = randomAffine([experts, inter, hidden], bits: 4, seed: 601)
+        let up = randomAffine([experts, inter, hidden], bits: 4, seed: 602)
+        let down = randomAffine([experts, hidden, inter], bits: 4, seed: 603)
+        let sharedGate = randomAffine([inter, hidden], bits: 8, seed: 604)
+        let sharedUp = randomAffine([inter, hidden], bits: 8, seed: 605)
+        let sharedDown = randomAffine([hidden, inter], bits: 8, seed: 606)
+        let (weight, bias) = withRandomState(MLXRandom.RandomState(seed: 607)) {
+            (0.05 * MLXRandom.normal([experts, hidden]), 0.01 * MLXRandom.normal([experts]))
+        }
+        let base = withRandomState(MLXRandom.RandomState(seed: 608)) {
+            MLXRandom.normal([1, hidden])
+        }
+        for T in [2, 3, 4, 8] {
+            let cases: [(String, MLXArray)] = [
+                ("identical", broadcast(base, to: [T, hidden])),
+                ("near", base + 0.05 * withRandomState(MLXRandom.RandomState(seed: UInt64(610 + T))) {
+                    MLXRandom.normal([T, hidden])
+                }),
+                ("independent", withRandomState(MLXRandom.RandomState(seed: UInt64(620 + T))) {
+                    MLXRandom.normal([T, hidden])
+                }),
+            ]
+            for (name, xf) in cases {
+                let x = xf.asType(.bfloat16)
+                let (sig, biased) = glm5NextRouterLogits(x, weight: weight, bias: bias)
+                func run(_ share: Bool) -> MLXArray? {
+                    glm5NextMoEExperts(
+                        x, sig: sig, biased: biased, topK: topK, scaling: 2.5, normalize: true,
+                        limit: 10, gate: gate, up: up, down: down, sharedGate: sharedGate,
+                        sharedUp: sharedUp, sharedDown: sharedDown, shareExpertLoads: share)
+                }
+                let shared = try XCTUnwrap(run(true))
+                assertBitwiseEqual(shared, try XCTUnwrap(run(false)), "MoE T=\(T) \(name)")
+            }
+        }
+    }
+
     /// `glm5NextQMVBatch` (V vectors sharing each weight load) equals MLX's
     /// one-vector quantized matmul row for row, bit for bit: 4/5/6/8 bits,
     /// group sizes 32/64/128, N below and at least 4096 (MLX's narrow qmv on M5).
