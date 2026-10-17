@@ -200,6 +200,17 @@ func glm5NextDecodeRowLength(_ x: MLXArray) -> Int {
     x.ndim >= 3 ? x.dim(-2) : 1
 }
 
+/// `linear(x)` with `glm5NextQMVBatch` when `x` carries 2...8 tokens and the
+/// projection is a covered affine one (each weight tile read once for every
+/// token; every row bitwise equal to MLX's qmv of that token), else `linear(x)`.
+func glm5NextProject(_ linear: Linear, _ x: MLXArray) -> MLXArray {
+    let tokens = x.size / x.dim(-1)
+    guard (2 ... 8).contains(tokens), let parts = glm5NextAffine(linear),
+        let y = glm5NextQMVBatch(x.reshaped(tokens, x.dim(-1)), parts)
+    else { return linear(x) }
+    return y.reshaped(Array(x.shape.dropLast()) + [y.dim(-1)])
+}
+
 // MARK: - Feed-forward
 
 final class GLM5NextMLP: Module, UnaryLayer {
@@ -219,7 +230,8 @@ final class GLM5NextMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(activation(gateProj(x), upProj(x)))
+        glm5NextProject(
+            downProj, activation(glm5NextProject(gateProj, x), glm5NextProject(upProj, x)))
     }
 }
 
@@ -516,7 +528,7 @@ final class GLM5NextLinearAttention: Module {
         }
 
         let gate = gBProj(gAProj(x)).reshaped(shape)
-        return oProj(oNorm(out, gate: gate).reshaped(B, L, -1))
+        return glm5NextProject(oProj, oNorm(out, gate: gate).reshaped(B, L, -1))
     }
 
     /// MTP verification: every column as a one-token decode step, so each
@@ -545,6 +557,28 @@ final class GLM5NextLinearAttention: Module {
             let projected = inputProjections(x.reshaped(B * L, 1, x.dim(-1)))
         {
             let parts = projected.map { $0.reshaped(B, L, -1) }
+            let convBase =
+                cache[0]
+                ?? MLXArray.zeros([B, convKernelSize - 1, 3 * projectionDim], dtype: x.dtype)
+            let stateBase =
+                cache[1] ?? MLXArray.zeros([B, numHeads, headDim, headDim], dtype: .float32)
+            // Every column in one dispatch, checkpoint and padding inside.
+            if let step = glm5NextKDAVerifyStep(
+                q: parts[0], k: parts[1], v: parts[2], fa: parts[3], ga: parts[4], fb: fb, gb: gb,
+                bRaw: parts[5], convState: convBase, convWeight: conv1d.weight,
+                aLog: forgetGate.aLog, dtBias: forgetGate.dtBias, normWeight: oNorm.weight,
+                state: stateBase, heads: numHeads, headDim: headDim, lowerBound: lowerBound,
+                normEps: oNorm.eps, checkpointAfter: split,
+                valid: valid.map { $0.asType(.int32).sum(axis: 1) })
+            {
+                cache[0] = step.convState
+                cache[1] = step.state
+                cache.saveSpeculativeCheckpoint(
+                    convState: step.convCheckpoint, recurrentState: step.stateCheckpoint,
+                    advancedBy: split)
+                cache.advance(L)
+                return glm5NextProject(oProj, step.y)
+            }
             var convState =
                 cache[0]
                 ?? MLXArray.zeros([B, convKernelSize - 1, 3 * projectionDim], dtype: x.dtype)
@@ -575,7 +609,7 @@ final class GLM5NextLinearAttention: Module {
                     cache.advance(1)
                     if c + 1 == split { save() }
                 }
-                return oProj(concatenated(steps.map(\.y), axis: 1))
+                return glm5NextProject(oProj, concatenated(steps.map(\.y), axis: 1))
             }
         }
         var outputs = [MLXArray]()
@@ -653,7 +687,7 @@ final class GLM5NextLinearAttention: Module {
         cache[0] = fused.convState
         cache[1] = fused.state
         cache.advance(L)
-        return oProj(fused.y)
+        return glm5NextProject(oProj, fused.y)
     }
 }
 
@@ -914,9 +948,10 @@ final class GLM5NextAttention: Module {
                 "GLM5Next sparse layer needs a GLM5NextLatentCache, got \(type(of: cache!))")
         }
 
-        let qResid = qALayerNorm(qAProj(x))
-        let q = qBProj(qResid).reshaped(B, L, numHeads, qHeadDim).transposed(0, 2, 1, 3)
-        let latentIn = expandedDimensions(kvALayerNorm(kvAProj(x)), axis: 1)
+        let qResid = qALayerNorm(glm5NextProject(qAProj, x))
+        let q = glm5NextProject(qBProj, qResid).reshaped(B, L, numHeads, qHeadDim)
+            .transposed(0, 2, 1, 3)
+        let latentIn = expandedDimensions(kvALayerNorm(glm5NextProject(kvAProj, x)), axis: 1)
         let qLatent = callMultiLinear(embedQ, q)
 
         precondition(rowLengths == nil || rowLengths!.count == rows.count)
@@ -969,7 +1004,7 @@ final class GLM5NextAttention: Module {
         let output = callMultiLinear(unembedOut, all)
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, numHeads * vHeadDim)
-        return (oProj(output), selections)
+        return (glm5NextProject(oProj, output), selections)
     }
 
     /// One cache's attention: append the latent, update the indexer's pools,
@@ -1271,7 +1306,7 @@ public final class GLM5NextTextModel: Module, LLMModel {
 
     func logits(_ normalized: MLXArray) -> MLXArray {
         if let lmHead {
-            return lmHead(normalized)
+            return glm5NextProject(lmHead, normalized)
         }
         return model.embedTokens.asLinear(normalized)
     }

@@ -1011,6 +1011,103 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
+    /// `glm5NextKDAVerifyStep` (every verify column in one dispatch, with the
+    /// checkpoint and per-row valid counts inside) equals the per-column
+    /// reference (one-token gate-row steps, padded columns keeping the state)
+    /// bit for bit: outputs of valid columns, final and checkpoint states.
+    func testKDAVerifyStepMatchesPerColumnStepsBitwise() throws {
+        let (heads, dk) = (2, 128)
+        let qkv = heads * dk
+        let convWeight = withRandomState(MLXRandom.RandomState(seed: 401)) {
+            (0.3 * MLXRandom.normal([3 * qkv, 4, 1])).asType(.bfloat16)
+        }
+        let aLog = withRandomState(MLXRandom.RandomState(seed: 402)) { MLXRandom.normal([heads]) * 0.5 }
+        let dtBias = withRandomState(MLXRandom.RandomState(seed: 403)) { MLXRandom.normal([qkv]) * 0.5 }
+        let normWeight = withRandomState(MLXRandom.RandomState(seed: 404)) {
+            (1 + 0.1 * MLXRandom.normal([dk])).asType(.bfloat16)
+        }
+        for bits in [8, 5, 4] {
+            let fb = randomAffine([qkv, dk], bits: bits, seed: UInt64(410 + bits))
+            let gb = randomAffine([qkv, dk], bits: bits, seed: UInt64(420 + bits))
+            for (T, validCounts, checkpoint) in [(2, [2, 1, 2], 1), (3, [3, 1, 2], 1), (3, [3, 2, 3], 2)] {
+                let B = validCounts.count
+                func rnd(_ shape: [Int], _ seed: Int, _ scale: Float = 1, _ dtype: DType = .bfloat16)
+                    -> MLXArray
+                {
+                    withRandomState(MLXRandom.RandomState(seed: UInt64(500 + 10 * T + seed + bits))) {
+                        (scale * MLXRandom.normal(shape)).asType(dtype)
+                    }
+                }
+                let (q, k, v) = (rnd([B, T, qkv], 1), rnd([B, T, qkv], 2), rnd([B, T, qkv], 3))
+                let (fa, ga, bRaw) = (rnd([B, T, dk], 4), rnd([B, T, dk], 5), rnd([B, T, heads], 6))
+                let convState = rnd([B, 3, 3 * qkv], 7)
+                let state = rnd([B, heads, dk, dk], 8, 0.1, .float32)
+                let fused = try XCTUnwrap(
+                    glm5NextKDAVerifyStep(
+                        q: q, k: k, v: v, fa: fa, ga: ga, fb: fb, gb: gb, bRaw: bRaw,
+                        convState: convState, convWeight: convWeight, aLog: aLog, dtBias: dtBias,
+                        normWeight: normWeight, state: state, heads: heads, headDim: dk,
+                        lowerBound: -5, normEps: 1e-5, checkpointAfter: checkpoint,
+                        valid: MLXArray(validCounts.map(Int32.init))),
+                    "\(bits)-bit T=\(T)")
+                for r in 0 ..< B {
+                    func row(_ a: MLXArray) -> MLXArray { a[r ..< (r + 1)] }
+                    var (conv, st) = (row(convState), row(state))
+                    for c in 0 ..< validCounts[r] {
+                        func col(_ a: MLXArray) -> MLXArray { row(a)[0..., c ..< (c + 1)] }
+                        do {
+                            let step = try XCTUnwrap(
+                                glm5NextKDADecodeStep(
+                                    q: col(q), k: col(k), v: col(v), fa: col(fa), ga: col(ga),
+                                    fb: fb, gb: gb, bRaw: col(bRaw), convState: conv,
+                                    convWeight: convWeight, aLog: aLog, dtBias: dtBias,
+                                    normWeight: normWeight, state: st, heads: heads, headDim: dk,
+                                    lowerBound: -5, normEps: 1e-5))
+                            assertBitwiseEqual(
+                                fused.y[r ..< (r + 1), c ..< (c + 1)], step.y,
+                                "\(bits)-bit T=\(T) row \(r) column \(c) output")
+                            (conv, st) = (step.convState, step.state)
+                        }
+                        if c + 1 == checkpoint {
+                            assertBitwiseEqual(
+                                fused.convCheckpoint[r ..< (r + 1)], conv,
+                                "\(bits)-bit T=\(T) row \(r) checkpoint conv")
+                            assertBitwiseEqual(
+                                fused.stateCheckpoint[r ..< (r + 1)], st,
+                                "\(bits)-bit T=\(T) row \(r) checkpoint state")
+                        }
+                    }
+                    assertBitwiseEqual(fused.convState[r ..< (r + 1)], conv, "\(bits)-bit T=\(T) row \(r) conv")
+                    assertBitwiseEqual(fused.state[r ..< (r + 1)], st, "\(bits)-bit T=\(T) row \(r) state")
+                }
+            }
+        }
+    }
+
+    /// `glm5NextQMVBatch` (V vectors sharing each weight load) equals MLX's
+    /// one-vector quantized matmul row for row, bit for bit: 4/5/6/8 bits,
+    /// group sizes 32/64/128, N below and at least 4096 (MLX's narrow qmv on M5).
+    func testQMVBatchMatchesOneVectorProjectionBitwise() throws {
+        for (bits, groupSize, n, k) in [
+            (4, 64, 4096, 4096), (8, 64, 2048, 4096), (5, 64, 8192, 4096), (6, 32, 1024, 2048),
+            (4, 128, 16384, 512), (8, 32, 64, 1024),
+        ] {
+            let p = randomAffine([n, k], bits: bits, groupSize: groupSize, seed: UInt64(300 + bits + n))
+            for V in [2, 3, 4, 8] {
+                let x = withRandomState(MLXRandom.RandomState(seed: UInt64(310 + V))) {
+                    MLXRandom.normal([V, k]).asType(.bfloat16)
+                }
+                let batched = try XCTUnwrap(glm5NextQMVBatch(x, p), "covered \(bits)b n=\(n)")
+                let rows = (0 ..< V).map { v in
+                    quantizedMatmul(
+                        x[v ..< (v + 1)], p.weight, scales: p.scales, biases: p.biases,
+                        transpose: true, groupSize: groupSize, bits: bits)
+                }
+                assertRowsEqual(batched, rows, "qmv batch \(bits)b gs\(groupSize) n=\(n) V=\(V)")
+            }
+        }
+    }
+
     /// A model whose every decode kernel engages: hidden 1024 (deferred HC),
     /// head_dim-128 KDA with 8 heads, 32 indexer heads, 128 experts of 512,
     /// affine-quantized as the artifact (4-bit experts, 8-bit elsewhere).

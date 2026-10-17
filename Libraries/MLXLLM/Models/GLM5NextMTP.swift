@@ -53,7 +53,8 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
             tokens: MLXArray, hidden: MLXArray, cache: KVCache, rowLengths: [Int]? = nil
         ) -> MLXArray {
             let embedded = layer.enorm(text.model.embedTokens(tokens))
-            var x = layer.ehProj(concatenated([embedded, layer.hnorm(hidden)], axis: -1))
+            var x = glm5NextProject(
+                layer.ehProj, concatenated([embedded, layer.hnorm(hidden)], axis: -1))
             let block = layer.block
             let (attention, _) = block.selfAttn(
                 block.inputLayerNorm(x), cache: cache, previousTopk: [], rowLengths: rowLengths)

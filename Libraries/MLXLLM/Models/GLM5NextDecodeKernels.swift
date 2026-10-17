@@ -77,6 +77,15 @@ private let glm5NextKDASource = """
       const float lower = consts[3];
       const float inv_n = consts[4];
 
+    #if VERIFY
+      // MTP verification: this row's valid leading tokens (the rest are right
+      // padding and leave the state alone), and the state after CKPT tokens.
+      const int nvalid = metal::clamp(int(valid_in[brow]), 1, TOK);
+      device T* cs_ckpt_r = conv_ckpt + size_t(brow) * (CK - 1) * NP;
+      device float* st_ckpt_r = state_ckpt + size_t(brow) * H * DK * DK;
+    #else
+      const int nvalid = TOK;
+    #endif
       threadgroup T qs[TOK][DK];
       threadgroup T ks[TOK][DK];
       threadgroup T vs[TOK][DK];
@@ -124,15 +133,18 @@ private let glm5NextKDASource = """
           }
         }
         for (int r = 0; r < CK - 1; r++) {
-          cs_out_r[r * NP + gc] = win[TOK + r];
+          cs_out_r[r * NP + gc] = win[nvalid + r];
+    #if VERIFY
+          cs_ckpt_r[r * NP + gc] = win[CKPT + r];
+    #endif
         }
       }
 
     #if GATE_ROWS && GATE5
-      // One token, 5-bit K = 128 gate rows: MLX's qmv (qmv_impl): lanes 0..15
-      // load 8 values each, lanes 16..31 add nothing, one simd_sum per row.
-      {
-        static_assert(TOK == 1 && DK == 128, "5-bit gate rows: one token");
+      // 5-bit K = 128 gate rows, token by token: MLX's qmv (qmv_impl): lanes
+      // 0..15 load 8 values each, lanes 16..31 add nothing, one simd_sum per row.
+      for (int t = 0; t < TOK; t++) {
+        static_assert(DK == 128, "5-bit gate rows: K = 128");
         constexpr int WBYTES = 128 * 5 / 8;
         constexpr int G = 128 / GS;
         for (int rr = 0; rr < (2 * DK) / 32; rr++) {
@@ -142,7 +154,7 @@ private let glm5NextKDASource = """
           const int row = h * DK + i;
           float result = 0;
           if (lane < 16u) {
-            const auto xin = (which == 0 ? fa_r : ga_r) + int(lane) * 8;
+            const auto xin = (which == 0 ? fa_r : ga_r) + t * DK + int(lane) * 8;
             float x_thread[8];
             float sum = glm_load_vector<T, 8, 5>(xin, x_thread);
             const device uint8_t* wl = (const device uint8_t*)(which == 0 ? fb_w : gb_w)
@@ -156,9 +168,9 @@ private let glm5NextKDASource = """
           result = simd_sum(result);
           if (lane == 0) {
             if (which == 0) {
-              as_[0][i] = static_cast<T>(result);
+              as_[t][i] = static_cast<T>(result);
             } else {
-              gates[0][i] = static_cast<T>(result);
+              gates[t][i] = static_cast<T>(result);
             }
           }
         }
@@ -252,6 +264,12 @@ private let glm5NextKDASource = """
           state[i] = static_cast<float>(st_r[(size_t(h) * DK + dv_idx) * DK + s_idx]);
         }
         for (int t = 0; t < TOK; ++t) {
+          if (t >= nvalid) {
+            if (thread_index_in_simdgroup == 0) {
+              ys[t][dv_idx] = static_cast<T>(0);
+            }
+            continue;
+          }
           float kv_mem = 0.0f;
           for (int i = 0; i < NPL; ++i) {
             auto s_idx = NPL * dk_idx + i;
@@ -272,6 +290,13 @@ private let glm5NextKDASource = """
           if (thread_index_in_simdgroup == 0) {
             ys[t][dv_idx] = static_cast<T>(out);
           }
+    #if VERIFY
+          if (t + 1 == CKPT) {
+            for (int i = 0; i < NPL; ++i) {
+              st_ckpt_r[(size_t(h) * DK + dv_idx) * DK + NPL * dk_idx + i] = state[i];
+            }
+          }
+    #endif
         }
         for (int i = 0; i < NPL; ++i) {
           auto s_idx = NPL * dk_idx + i;
@@ -316,6 +341,10 @@ private final class GLM5NextKDAKernel: Sendable {
     /// Gate rows computed in the kernel: 4/8-bit (qmv_quad) and 5-bit (qmv).
     let quadGates: MLXFast.MLXFastKernel
     let fiveBitGates: MLXFast.MLXFastKernel
+    /// MTP verification variants of the gate-row kernels: per-row valid token
+    /// counts and the state after CKPT tokens as extra outputs.
+    let verifyQuadGates: MLXFast.MLXFastKernel
+    let verifyFiveBitGates: MLXFast.MLXFastKernel
 
     private static let common = [
         "q_in", "k_in", "v_in", "b_in", "conv_state", "conv_w", "a_log", "dt_bias", "norm_w",
@@ -324,11 +353,14 @@ private final class GLM5NextKDAKernel: Sendable {
     private static let gateRows = ["fa_in", "ga_in", "fb_w", "fb_s", "fb_b", "gb_w", "gb_s", "gb_b"]
 
     private init() {
-        func make(_ name: String, _ inputs: [String], _ defines: String) -> MLXFast.MLXFastKernel {
+        func make(_ name: String, _ inputs: [String], _ defines: String, verify: Bool = false)
+            -> MLXFast.MLXFastKernel
+        {
             MLXFast.metalKernel(
-                name: name, inputNames: inputs,
-                outputNames: ["y", "conv_state_out", "state_out"],
-                source: defines + glm5NextKDASource,
+                name: name, inputNames: inputs + (verify ? ["valid_in"] : []),
+                outputNames: ["y", "conv_state_out", "state_out"]
+                    + (verify ? ["conv_ckpt", "state_ckpt"] : []),
+                source: defines + "#define VERIFY \(verify ? 1 : 0)\n" + glm5NextKDASource,
                 header: glm5NextQMVHeader)
         }
         precomputed = make(
@@ -340,6 +372,12 @@ private final class GLM5NextKDAKernel: Sendable {
         fiveBitGates = make(
             "glm5next_kda_decode_gates5", Self.common + Self.gateRows,
             "#define GATE_ROWS 1\n#define GATE5 1\n")
+        verifyQuadGates = make(
+            "glm5next_kda_verify_gates", Self.common + Self.gateRows,
+            "#define GATE_ROWS 1\n#define GATE5 0\n", verify: true)
+        verifyFiveBitGates = make(
+            "glm5next_kda_verify_gates5", Self.common + Self.gateRows,
+            "#define GATE_ROWS 1\n#define GATE5 1\n", verify: true)
     }
 }
 
@@ -451,6 +489,73 @@ func glm5NextKDADecodeStep(
     return (outputs[0], outputs[1], outputs[2])
 }
 
+/// MTP verification of `T <= 8` tokens per row in one dispatch: the
+/// gate-row KDA step over every row's first `valid[row]` tokens (`nil`: all
+/// `T`; the right-padded rest leaves the state alone), also returning the conv
+/// and recurrent state after `checkpointAfter` tokens. Each token is computed
+/// exactly as by `T` one-token calls. `nil` when not covered.
+func glm5NextKDAVerifyStep(
+    q: MLXArray, k: MLXArray, v: MLXArray, fa: MLXArray, ga: MLXArray,
+    fb: GLM5NextAffine, gb: GLM5NextAffine, bRaw: MLXArray,
+    convState: MLXArray, convWeight: MLXArray,
+    aLog: MLXArray, dtBias: MLXArray, normWeight: MLXArray, state: MLXArray,
+    heads: Int, headDim: Int, lowerBound: Float, normEps: Float, checkpointAfter: Int,
+    valid: MLXArray?, l2Eps: Float = 1e-6
+) -> (
+    y: MLXArray, convState: MLXArray, state: MLXArray, convCheckpoint: MLXArray,
+    stateCheckpoint: MLXArray
+)? {
+    let dtype = q.dtype
+    guard dtype == .bfloat16 || dtype == .float16, headDim == 128, heads >= 1,
+        q.ndim == 3, q.dim(0) >= 1, (2 ... 8).contains(q.dim(1)),
+        (1 ..< q.dim(1)).contains(checkpointAfter)
+    else { return nil }
+    let (B, T) = (q.dim(0), q.dim(1))
+    let qkv = heads * headDim
+    for part in [q, k, v] where part.shape != [B, T, qkv] || part.dtype != dtype {
+        return nil
+    }
+    for part in [fa, ga] where part.shape != [B, T, headDim] || part.dtype != dtype {
+        return nil
+    }
+    guard (fb.bits, fb.groupSize) == (gb.bits, gb.groupSize), [32, 64, 128].contains(fb.groupSize),
+        [4, 5, 8].contains(fb.bits),
+        fb.weight.shape == [qkv, 128 * fb.bits / 32], gb.weight.shape == fb.weight.shape,
+        fb.scales.dtype == dtype, gb.scales.dtype == dtype,
+        fb.biases.dtype == dtype, gb.biases.dtype == dtype,
+        bRaw.shape == [B, T, heads], bRaw.dtype == dtype,
+        convState.shape == [B, 3, 3 * qkv], convState.dtype == dtype,
+        convWeight.shape == [3 * qkv, 4, 1], convWeight.dtype == dtype,
+        aLog.size == heads, aLog.dtype == .float32,
+        dtBias.size == qkv, dtBias.dtype == .float32,
+        normWeight.shape == [headDim],
+        state.shape == [B, heads, headDim, headDim], state.dtype == .float32,
+        valid == nil || valid!.shape == [B]
+    else { return nil }
+    let consts = MLXArray(
+        [Float(pow(Double(headDim), -0.5)), l2Eps, normEps, lowerBound,
+         Float(1.0 / Double(headDim))])
+    let kernels = GLM5NextKDAKernel.shared
+    let kernel = fb.bits == 5 ? kernels.verifyFiveBitGates : kernels.verifyQuadGates
+    let outputs = kernel(
+        [q, k, v, bRaw, convState, convWeight, aLog.reshaped(-1), dtBias.reshaped(-1),
+         normWeight, state, consts, fa, ga, fb.weight, fb.scales, fb.biases,
+         gb.weight, gb.scales, gb.biases,
+         (valid ?? MLXArray(Array(repeating: Int32(T), count: B))).asType(.int32)],
+        template: [
+            ("T", dtype), ("TOK", T), ("DK", headDim), ("QKV", qkv), ("H", heads),
+            ("BITS", fb.bits), ("GS", fb.groupSize), ("CKPT", checkpointAfter),
+        ],
+        grid: (1024 * heads, B, 1),
+        threadGroup: (1024, 1, 1),
+        outputShapes: [
+            [B, T, qkv], [B, 3, 3 * qkv], [B, heads, headDim, headDim], [B, 3, 3 * qkv],
+            [B, heads, headDim, headDim],
+        ],
+        outputDTypes: [dtype, dtype, .float32, dtype, .float32])
+    return (outputs[0], outputs[1], outputs[2], outputs[3], outputs[4])
+}
+
 // MARK: - Multi-projection qmv (one token)
 
 /// `[linear(x) for linear in parts]` for up to six affine projections with
@@ -556,6 +661,72 @@ func glm5NextMultiQMV(
         threadGroup: (32 * nsg, 1, 1),
         outputShapes: rows.map { [V, $0] },
         outputDTypes: Array(repeating: x.dtype, count: rows.count))
+}
+
+// MARK: - Several-vector qmv (one projection)
+
+/// `linear(x)` for `NV <= 8` vectors `x: [NV, K]`: each threadgroup reads its
+/// weight rows once for every vector; each output with MLX's qmv_fast
+/// arithmetic, so every row equals the projection of that vector alone.
+private let glm5NextQMVBatchSource = """
+      const uint lane = thread_index_in_simdgroup;
+      const int sg = int(simdgroup_index_in_threadgroup);
+      const int r0 = (int(threadgroup_position_in_grid.x) * NSGQ + sg) * RPS;
+      constexpr int WB = K * BITS / 8;
+      constexpr int G = K / GS;
+      float result[NV][RPS];
+      for (int v = 0; v < NV; v++) {
+        for (int r = 0; r < RPS; r++) {
+          result[v][r] = 0.0f;
+        }
+      }
+      glm_qmv_rows_nv<T, K, GS, BITS, RPS, NV>(
+          (const device uint8_t*)w + size_t(r0) * WB, s + r0 * G, b + r0 * G, x, lane, result);
+      for (int v = 0; v < NV; v++) {
+        for (int r = 0; r < RPS; r++) {
+          float o = simd_sum(result[v][r]);
+          if (lane == 0) {
+            y[size_t(v) * N + r0 + r] = static_cast<T>(o);
+          }
+        }
+      }
+    """
+
+private final class GLM5NextQMVBatchKernel: Sendable {
+    static let shared = GLM5NextQMVBatchKernel()
+    let kernel: MLXFast.MLXFastKernel
+
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "glm5next_qmv_batch", inputNames: ["x", "w", "s", "b"], outputNames: ["y"],
+            source: glm5NextQMVBatchSource, header: glm5NextQMVHeader)
+    }
+}
+
+/// `[V, N]` outputs of one affine projection for `x: [V, K]`, `2 <= V <= 8`,
+/// each row bitwise equal to the one-vector projection; `nil` when the shape
+/// is not covered.
+func glm5NextQMVBatch(_ x: MLXArray, _ p: GLM5NextAffine, rps: Int = 4, nsg: Int = 2)
+    -> MLXArray?
+{
+    guard x.ndim == 2, (2 ... 8).contains(x.dim(0)), [.bfloat16, .float16].contains(x.dtype),
+        p.weight.ndim == 2, p.scales.dtype == x.dtype, p.biases.dtype == x.dtype
+    else { return nil }
+    let (V, K) = (x.dim(0), x.dim(1))
+    let N = p.weight.dim(0)
+    guard p.weight.dim(1) * 32 / p.bits == K,
+        glm5NextQMVFastCovered(bits: p.bits, groupSize: p.groupSize, n: N, k: K),
+        N % (rps * nsg) == 0
+    else { return nil }
+    return GLM5NextQMVBatchKernel.shared.kernel(
+        [x, p.weight, p.scales, p.biases],
+        template: [
+            ("T", x.dtype), ("K", K), ("N", N), ("BITS", p.bits), ("GS", p.groupSize),
+            ("RPS", rps), ("NSGQ", nsg), ("NV", V),
+        ],
+        grid: (32 * nsg * (N / (rps * nsg)), 1, 1),
+        threadGroup: (32 * nsg, 1, 1),
+        outputShapes: [[V, N]], outputDTypes: [x.dtype])[0]
 }
 
 // MARK: - Hyper-connection decode (mix GEMV, Sinkhorn + collapse + RMSNorm)
@@ -1619,6 +1790,53 @@ private let glm5NextQMVHeader = """
           float s = sl[0];
           float b = bl[0];
           result[row] += glm_qdot<values_per_thread, bits>(wl, x_thread, s, b, sum);
+        }
+        ws += block_size * bytes_per_pack / pack_factor;
+        scales += block_size / group_size;
+        biases += block_size / group_size;
+        x += block_size;
+      }
+    }
+
+    // glm_qmv_rows for NV input vectors (stride K) sharing each weight load:
+    // every vector's partial sums follow qmv_fast's order exactly.
+    template <typename T, int K, int group_size, int bits, int RPS, int NV>
+    inline void glm_qmv_rows_nv(
+        const device uint8_t* ws,
+        const device T* scales,
+        const device T* biases,
+        const device T* x,
+        uint simd_lid,
+        thread float (*result)[RPS]) {
+      constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+      constexpr int pack_factor = glm_pack_factor<bits>();
+      constexpr int bytes_per_pack = glm_bytes_per_pack<bits>();
+      constexpr int values_per_thread = pack_factor * packs_per_thread;
+      constexpr int block_size = values_per_thread * 32;
+      constexpr int scale_step_per_thread = group_size / values_per_thread;
+      constexpr int in_vec_size_w = K * bytes_per_pack / pack_factor;
+      constexpr int in_vec_size_g = K / group_size;
+
+      thread float x_thread[NV][values_per_thread];
+      float sum[NV];
+      ws += simd_lid * packs_per_thread * bytes_per_pack;
+      scales += simd_lid / scale_step_per_thread;
+      biases += simd_lid / scale_step_per_thread;
+      x += simd_lid * values_per_thread;
+
+      for (int k = 0; k < K; k += block_size) {
+        for (int v = 0; v < NV; v++) {
+          sum[v] = glm_load_vector<T, values_per_thread, bits>(x + v * K, x_thread[v]);
+        }
+        for (int row = 0; row < RPS; row++) {
+          const device uint8_t* wl = ws + row * in_vec_size_w;
+          const device T* sl = scales + row * in_vec_size_g;
+          const device T* bl = biases + row * in_vec_size_g;
+          float s = sl[0];
+          float b = bl[0];
+          for (int v = 0; v < NV; v++) {
+            result[v][row] += glm_qdot<values_per_thread, bits>(wl, x_thread[v], s, b, sum[v]);
+          }
         }
         ws += block_size * bytes_per_pack / pack_factor;
         scales += block_size / group_size;
