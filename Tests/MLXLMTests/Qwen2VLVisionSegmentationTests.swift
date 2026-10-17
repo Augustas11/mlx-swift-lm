@@ -75,4 +75,60 @@ final class Qwen2VLVisionSegmentationTests: XCTestCase {
                 allClose(a[second], b[second], rtol: 1e-5, atol: 1e-5).item(Bool.self))
         }
     }
+
+    /// Reference: each block attended alone with one SDPA call.
+    private func perBlock(_ q: MLXArray, _ k: MLXArray, _ v: MLXArray, _ cu: [Int], _ scale: Float) -> MLXArray {
+        var outs = [MLXArray]()
+        for i in 1 ..< cu.count {
+            let r = cu[i - 1] ..< cu[i]
+            let o = MLXFast.scaledDotProductAttention(
+                queries: q[r][.newAxis].transposed(0, 2, 1, 3),
+                keys: k[r][.newAxis].transposed(0, 2, 1, 3),
+                values: v[r][.newAxis].transposed(0, 2, 1, 3),
+                scale: scale, mask: .none)
+            outs.append(o.transposed(0, 2, 1, 3).reshaped(r.count, -1))
+        }
+        return concatenated(outs, axis: 0)
+    }
+
+    /// A video (t > 1) splits into per-frame blocks, and the batched equal-length
+    /// path equals per-block attention.
+    func testVideoFramesAttendPerFrameThroughTheBatchedPath() {
+        Device.withDefaultDevice(.cpu) {
+            let cu = visionCuSeqlens([THW(3, 2, 2)])
+            XCTAssertEqual(cu, [0, 4, 8, 12])
+            let (q, k, v) = qkv(rows: 12, seed: 11)
+            let out = qwen2VLSegmentedVisionAttention(
+                queries: q, keys: k, values: v, scale: 0.3, cuSeqlens: cu)
+            XCTAssertTrue(allClose(out, perBlock(q, k, v, cu, 0.3), rtol: 1e-5, atol: 1e-5).item(Bool.self))
+        }
+    }
+
+    /// The production call passes q/k with the leading batch axis the rotary
+    /// embedding broadcasts in; the result must equal the 3-D input.
+    func testLeadingRotaryBatchAxisIsAccepted() {
+        Device.withDefaultDevice(.cpu) {
+            let cu = visionCuSeqlens([THW(1, 4, 4), THW(1, 2, 4)])
+            let (q, k, v) = qkv(rows: cu.last!, seed: 5)
+            let flat = qwen2VLSegmentedVisionAttention(
+                queries: q, keys: k, values: v, scale: 0.25, cuSeqlens: cu)
+            let batched = qwen2VLSegmentedVisionAttention(
+                queries: q[.newAxis], keys: k[.newAxis], values: v, scale: 0.25, cuSeqlens: cu)
+            XCTAssertTrue(allClose(flat, batched, rtol: 1e-6, atol: 1e-6).item(Bool.self))
+        }
+    }
+
+    /// Half precision stays close to the float32 per-block reference.
+    func testFloat16MatchesFloat32Reference() {
+        Device.withDefaultDevice(.cpu) {
+            let cu = visionCuSeqlens([THW(1, 4, 4), THW(1, 4, 4)])
+            let (q, k, v) = qkv(rows: 32, seed: 9)
+            let half = qwen2VLSegmentedVisionAttention(
+                queries: q.asType(.float16), keys: k.asType(.float16), values: v.asType(.float16),
+                scale: 0.25, cuSeqlens: cu)
+            XCTAssertEqual(half.dtype, .float16)
+            XCTAssertTrue(
+                allClose(half.asType(.float32), perBlock(q, k, v, cu, 0.25), rtol: 1e-2, atol: 1e-2).item(Bool.self))
+        }
+    }
 }
