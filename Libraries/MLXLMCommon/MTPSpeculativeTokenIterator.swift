@@ -498,12 +498,32 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let mainLogits = mainResult.logits
         mainState = mainResult.state
 
-        eval(flatDraftTokens)
-        let draftTokensList = flatDraftTokens.asArray(Int.self)
-
         var accepted = 0
         var finalToken: MLXArray?
-        for i in 0 ..< numDraft {
+        if processor == nil, sampler is ArgMaxSampler {
+            // Greedy without a logit processor: the drafts and every verify
+            // column's target token come back in one host sync per round.
+            // The tokens equal the per-column path's (argmax of the same rows).
+            let targetTokens = argMax(
+                mainLogits[0, verifyStart ..< (verifyStart + numDraft + 1), 0...], axis: -1)
+            eval(flatDraftTokens, targetTokens)
+            let drafts = flatDraftTokens.asArray(Int.self)
+            let targets = targetTokens.asArray(Int.self)
+            while accepted < numDraft, targets[accepted] == drafts[accepted] {
+                pendingTokens.append(targets[accepted])
+                accepted += 1
+            }
+            pendingTokens.append(targets[accepted])
+            finalToken = targetTokens[accepted ..< (accepted + 1)]
+        }
+
+        var draftTokensList = [Int]()
+        if finalToken == nil {
+            eval(flatDraftTokens)
+            draftTokensList = flatDraftTokens.asArray(Int.self)
+        }
+
+        for i in 0 ..< numDraft where finalToken == nil {
             var logits = mainLogits[0..., verifyStart + i, 0...]
             logits = processor?.process(logits: logits) ?? logits
             let targetToken = sampler.sample(logits: logits)
