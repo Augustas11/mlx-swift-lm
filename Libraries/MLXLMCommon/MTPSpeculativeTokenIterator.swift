@@ -83,6 +83,10 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
     public var promptPrefillTime: TimeInterval = 0.0
     private var telemetry = SpeculativeDecodingTelemetry()
+
+    /// Optional per-stream depth controller; `nil` keeps `blockSize - 1`
+    /// drafts every round.
+    public private(set) var adaptiveDepth: MTPAdaptiveDepth?
     public var speculativeDecodingTelemetry: SpeculativeDecodingTelemetry? {
         telemetry.roundCount > 0 ? telemetry : nil
     }
@@ -110,7 +114,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         mainCache: [KVCache]? = nil,
         parameters: GenerateParameters,
         blockSize: Int,
-        components: GenerationComponents = .init()
+        components: GenerationComponents = .init(),
+        adaptiveDepth: MTPAdaptiveDepth? = nil
     ) throws {
         precondition(
             blockSize >= 2,
@@ -142,6 +147,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let effectiveBlockSize = Swift.min(
             drafterBlockSize, Self.maximumBlockSize(for: mainCache))
         self.blockSize = effectiveBlockSize
+        self.adaptiveDepth = adaptiveDepth
 
         // Probe by opening a round at the width rounds will actually use and discarding it,
         // rather than duplicating the leaf classification as a predicate that could drift from
@@ -369,12 +375,14 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // A speculative round can emit up to `numDraft + 1` tokens: the
         // accepted draft prefix plus the verifier's correction/bonus token.
         // Keep the whole pending buffer within the remaining output budget.
+        let roundStart = Date.timeIntervalSinceReferenceDate
+        let depthLimit = Swift.min(adaptiveDepth?.depth() ?? (blockSize - 1), blockSize - 1)
         let numDraft: Int
         if let maxTokens {
             let remaining = maxTokens - tokenCount
             guard remaining > 0 else { return }
 
-            let draftBudget = Swift.min(remaining - 1, blockSize - 1)
+            let draftBudget = Swift.min(remaining - 1, depthLimit)
             guard draftBudget > 0 else {
                 if let token = passthroughStep() {
                     pendingTokens.append(token)
@@ -383,7 +391,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             }
             numDraft = draftBudget
         } else {
-            numDraft = blockSize - 1
+            numDraft = depthLimit
         }
 
         guard let state = mainState,
@@ -555,6 +563,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         proposedCount += numDraft
         acceptedCount += accepted
         lastRoundAccepted = accepted
+        roundDraftCounts.append(numDraft)
+        roundAcceptedCounts.append(accepted)
         telemetry.recordRound(
             drafted: numDraft,
             accepted: accepted,
@@ -618,7 +628,21 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         kvCachePlan.apply(to: mainCacheStorage)
 
         y = .init(tokens: emittedFinalToken)
+
+        if adaptiveDepth != nil {
+            adaptiveDepth!.record(
+                drafted: numDraft, accepted: accepted,
+                seconds: Date.timeIntervalSinceReferenceDate - roundStart)
+            if adaptiveDepth!.shouldPark {
+                switchToPassthrough(
+                    reason: "adaptive depth: plain decoding is faster for this stream")
+            }
+        }
     }
+
+    /// Drafts proposed and accepted per round, in round order.
+    public private(set) var roundDraftCounts: [Int] = []
+    public private(set) var roundAcceptedCounts: [Int] = []
 
     /// Switch to single-token generation for the remainder of the stream.
     /// Sticky — once flipped, `next()` never returns to speculation.

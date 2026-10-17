@@ -1868,6 +1868,58 @@ final class GLM5NextTests: XCTestCase {
         model.model.deferredDecode = true
     }
 
+    /// The depth controller picks argmax E(d)/t(d) from measured acceptance
+    /// and round times, explores one deeper, and parks when plain decoding
+    /// beats every depth.
+    func testAdaptiveDepthControllerFollowsMeasuredRates() {
+        // Cheap columns, high acceptance: deeper is better.
+        var deep = MTPAdaptiveDepth(maxDepth: 3, columnCostPrior: 0.004)
+        for _ in 0 ..< 40 {
+            deep.record(drafted: 1, accepted: 1, seconds: 0.030)
+            deep.record(drafted: 2, accepted: 2, seconds: 0.034)
+            deep.record(drafted: 3, accepted: 3, seconds: 0.038)
+        }
+        XCTAssertEqual(deep.depth(), 3)
+        XCTAssertFalse(deep.shouldPark)
+        // Expensive columns, second draft usually rejected: depth 1.
+        var shallow = MTPAdaptiveDepth(maxDepth: 3)
+        for i in 0 ..< 40 {
+            shallow.record(drafted: 1, accepted: 1, seconds: 0.044)
+            shallow.record(drafted: 2, accepted: i % 4 == 0 ? 2 : 1, seconds: 0.058)
+            shallow.record(drafted: 3, accepted: 1, seconds: 0.072)
+        }
+        XCTAssertEqual(shallow.depth(), 1)
+        XCTAssertEqual(shallow.expectedTokens(1), 2, accuracy: 1e-9)
+        // Rare acceptance against a measured fast plain step: park.
+        var park = MTPAdaptiveDepth(maxDepth: 2)
+        park.plainStepTime = 0.025
+        for _ in 0 ..< 30 {
+            park.record(drafted: 1, accepted: 0, seconds: 0.044)
+        }
+        XCTAssertTrue(park.shouldPark)
+    }
+
+    /// With the adaptive controller (depths 1...3, oracle drafts) MTP greedy
+    /// still equals plain greedy.
+    func testAdaptiveDepthMTPMatchesPlainGreedy() throws {
+        let model = try fusedShapesModel(seed: 311)
+        let prompt = tokens(13, seed: 312).reshaped(-1)
+        let parameters = greedyParameters(maxTokens: 48)
+        var plain = try TokenIterator(prompt: prompt, model: model, parameters: parameters)
+        var expected = [Int]()
+        while let token = plain.next() { expected.append(token) }
+        var controller = MTPAdaptiveDepth(maxDepth: 3, columnCostPrior: 0.0001)
+        controller.exploreInterval = 3
+        var speculative = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: prompt), mainModel: model,
+            drafter: DepthOracleDrafter(expected: expected, promptLength: 13),
+            parameters: parameters, blockSize: 4, adaptiveDepth: controller)
+        var produced = [Int]()
+        while let token = speculative.next() { produced.append(token) }
+        XCTAssertEqual(produced, expected)
+        XCTAssertGreaterThan(Set(speculative.roundDraftCounts).count, 1, "depth adapted")
+    }
+
     private func greedyParameters(maxTokens: Int) -> GenerateParameters {
         var parameters = GenerateParameters(maxTokens: maxTokens, temperature: 0)
         // The MTP iterator prefills the prompt in one forward; match it.
