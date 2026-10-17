@@ -1545,9 +1545,10 @@ func glm5NextHCDeferredSupported(
         && base.shape == [24] && normWeight.dtype == dtype && normWeight.shape == [width]
 }
 
-/// One-token-per-row branch input from `x: [B, 1, 4, D]` or from the previous
-/// half-layer `(y [B, 1, D], mm [B, 4 * D] fp32, post [B, 1, 4] fp32)`.
-/// Returns `(normalized [B, 1, D], mixes [B, 1, 24], h [B, 1, 4, D])`.
+/// Branch input for `L` tokens per row (every token on its own) from
+/// `x: [B, L, 4, D]` or from the previous half-layer `(y [B, L, D],
+/// mm [B * L, 4 * D] fp32, post [B, L, 4] fp32)`. Returns
+/// `(normalized [B, L, D], mixes [B, L, 24], h [B, L, 4, D])`.
 func glm5NextHCPre(
     x: MLXArray?, deferred: (y: MLXArray, mm: MLXArray, post: MLXArray)?,
     fn: MLXArray, scale: MLXArray, base: MLXArray, normWeight: MLXArray,
@@ -1555,7 +1556,7 @@ func glm5NextHCPre(
 ) -> (MLXArray, MLXArray, MLXArray) {
     let kernels = GLM5NextHCDeferredKernels.shared
     let dtype = x?.dtype ?? deferred!.y.dtype
-    let B = x?.dim(0) ?? deferred!.y.dim(0)
+    let (B, L) = x.map { ($0.dim(0), $0.dim(1)) } ?? (deferred!.y.dim(0), deferred!.y.dim(1))
     let D = normWeight.dim(0)
     let rest: [MLXArray] = [fn, MLXArray([normEps]), scale, base, normWeight]
     let template: [(String, any KernelTemplateArg)] = [
@@ -1566,25 +1567,25 @@ func glm5NextHCPre(
     if let deferred {
         let out = kernels.preDeferred(
             [deferred.y, deferred.mm, deferred.post] + rest, template: template,
-            grid: (1024 * 6, B, 1), threadGroup: (1024, 1, 1),
-            outputShapes: [[B, 1, D], [B, 1, 24], [B, 1, 4, D]],
+            grid: (1024 * 6, B * L, 1), threadGroup: (1024, 1, 1),
+            outputShapes: [[B, L, D], [B, L, 24], [B, L, 4, D]],
             outputDTypes: [dtype, .float32, dtype])
         return (out[0], out[1], out[2])
     }
     let out = kernels.pre(
         [x!] + rest, template: template,
-        grid: (1024 * 6, B, 1), threadGroup: (1024, 1, 1),
-        outputShapes: [[B, 1, D], [B, 1, 24]], outputDTypes: [dtype, .float32])
+        grid: (1024 * 6, B * L, 1), threadGroup: (1024, 1, 1),
+        outputShapes: [[B, L, D], [B, L, 24]], outputDTypes: [dtype, .float32])
     return (out[0], out[1], x!)
 }
 
-/// `(post [B, 1, 4], comb [B, 1, 4, 4], mm [B, 4 * D])` for one token per row
-/// (`mixes: [B, 1, 24]`, `residual: [B, 1, 4, D]`).
+/// `(post [B, L, 4], comb [B, L, 4, 4], mm [B * L, 4 * D])`, every token on its
+/// own (`mixes: [B, L, 24]`, `residual: [B, L, 4, D]`).
 func glm5NextHCPost(
     mixes: MLXArray, scale: MLXArray, base: MLXArray, residual: MLXArray,
     sinkhornIterations: Int, hcEps: Float
 ) -> (MLXArray, MLXArray, MLXArray) {
-    let B = residual.dim(0)
+    let (B, L) = (residual.dim(0), residual.dim(1))
     let D = residual.dim(-1)
     let simds = 8
     let groups = (D / 8 + simds - 1) / simds
@@ -1594,8 +1595,8 @@ func glm5NextHCPost(
             ("T", residual.dtype), ("HC", 4), ("D", D), ("ITERS", sinkhornIterations),
             ("HC_EPS_INT", Int((Double(hcEps) / 1e-9).rounded())), ("SIMDS", simds),
         ],
-        grid: (32 * simds * groups, B, 1), threadGroup: (32 * simds, 1, 1),
-        outputShapes: [[B, 1, 4], [B, 1, 4, 4], [B, 4 * D]],
+        grid: (32 * simds * groups, B * L, 1), threadGroup: (32 * simds, 1, 1),
+        outputShapes: [[B, L, 4], [B, L, 4, 4], [B * L, 4 * D]],
         outputDTypes: [.float32, .float32, .float32])
     return (out[0], out[1], out[2])
 }

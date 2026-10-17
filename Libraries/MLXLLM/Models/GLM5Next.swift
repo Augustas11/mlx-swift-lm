@@ -1139,17 +1139,20 @@ final class GLM5NextDecoderLayer: Module {
 
     /// One-token decode with both hyper-connection expands deferred into the
     /// next half-layer's pre kernel.
-    func decodeDeferred(_ state: GLM5NextHCState, cache: KVCache?, previousTopk: [MLXArray?])
-        -> (GLM5NextHCState, [MLXArray?])
-    {
+    func decodeDeferred(
+        _ state: GLM5NextHCState, cache: KVCache?, previousTopk: [MLXArray?],
+        checkpointAfter: Int? = nil
+    ) -> (GLM5NextHCState, [MLXArray?]) {
         let (normed, h, post, comb, mm) = attnHC.deferredBranchInput(state, norm: inputLayerNorm)
         let attention: MLXArray
         var topk = previousTopk
         if isLinear {
-            attention = (selfAttn as! GLM5NextLinearAttention)(normed, cache: linearCache(cache))
+            attention = (selfAttn as! GLM5NextLinearAttention)(
+                normed, cache: linearCache(cache), checkpointAfter: checkpointAfter)
         } else {
             (attention, topk) = (selfAttn as! GLM5NextAttention)(
-                normed, cache: cache, previousTopk: previousTopk)
+                normed, cache: cache, previousTopk: previousTopk,
+                perColumn: checkpointAfter != nil && normed.dim(1) > 1)
         }
         let (ffnNormed, ffnH, ffnPost, ffnComb, ffnMM) = ffnHC.deferredBranchInput(
             .deferred(y: attention, residual: h, post: post, comb: comb, mm: mm),
@@ -1232,8 +1235,8 @@ public final class GLM5NextModelInner: Module {
         super.init()
     }
 
-    /// One-token decode (one token per row, any number of rows) passes
-    /// deferred hyper-connection state between half-layers
+    /// Decode of up to 8 tokens per row (any number of rows; each token on
+    /// its own) passes deferred hyper-connection state between half-layers
     /// (`GLM5NextDecoderLayer.decodeDeferred`) where MLX computes the expand's
     /// comb product without NAX (`glm5NextHCDeferredExact`).
     var deferredDecode = true
@@ -1249,14 +1252,15 @@ public final class GLM5NextModelInner: Module {
     func hidden(_ inputs: MLXArray, cache: [KVCache]?, checkpointAfter: Int? = nil) -> MLXArray {
         var h = repeated(expandedDimensions(embedTokens(inputs), axis: 2), count: hcMult, axis: 2)
 
-        if deferredDecode, glm5NextHCDeferredExact, inputs.dim(1) == 1,
+        if deferredDecode, glm5NextHCDeferredExact, inputs.dim(1) <= 8,
             layers.allSatisfy({ $0.deferredDecodeSupported(dtype: h.dtype) })
         {
             var state = GLM5NextHCState.materialized(h)
             var topk = [MLXArray?]()
             for (index, layer) in layers.enumerated() {
                 (state, topk) = layer.decodeDeferred(
-                    state, cache: cache?[index], previousTopk: topk)
+                    state, cache: cache?[index], previousTopk: topk,
+                    checkpointAfter: checkpointAfter)
             }
             return state.materialize().mean(axis: 2)
         }
