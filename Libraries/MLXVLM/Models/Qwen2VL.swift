@@ -613,6 +613,10 @@ private enum Vision {
 
             q = applyMultimodalRotaryPositionEmbedding(q, freqs: rotaryPositionEmbedding)
             k = applyMultimodalRotaryPositionEmbedding(k, freqs: rotaryPositionEmbedding)
+            // The rotary embedding broadcasts in a leading batch axis; the
+            // segmented attention indexes patch rows on axis 0.
+            q = q.reshaped(sequenceLength, numHeads, -1)
+            k = k.reshaped(sequenceLength, numHeads, -1)
 
             let output = qwen2VLSegmentedVisionAttention(
                 queries: q, keys: k, values: v, scale: scale,
