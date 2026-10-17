@@ -1290,6 +1290,164 @@ final class GLM5NextTests: XCTestCase {
         XCTAssertEqual(model.maximumNativeTargetCacheRewind, 1)
     }
 
+    /// Packed MTP verification inside continuous batching through the
+    /// provider's strict facade (`verifyMTPPackedTargets`,
+    /// `requireContinuationState`): rows of widths 2, 1 and 2 (right-padded),
+    /// KDA layers in `MTPPackedMambaBatchCache`, sparse layers in
+    /// `GLM5NextLatentCacheBatch`. Each row's logits equal its serial
+    /// one-token decodes; after per-row commits (accept, width-1 row, reject)
+    /// every row cache equals the serial run of its retained tokens bit for
+    /// bit, and the next batched step equals serial decode.
+    private func assertPackedVerifyMatchesSerialRows(
+        _ model: any LanguageModel, layers: [GLM5NextDecoderLayer], prompts: [MLXArray],
+        label: String
+    ) throws {
+        let widths = [2, 1, 2]
+        let retained = [2, 1, 1]
+        let rows = prompts.count
+        let verifyTokens = (0 ..< rows).map { r in
+            MLXArray([Int32(11 + r), Int32(29 + r)]).reshaped(1, 2)
+        }
+        func prefilled(_ r: Int) throws -> [KVCache] {
+            let cache = try model.newCache(parameters: nil)
+            eval(model(prompts[r], cache: cache))
+            return cache
+        }
+        // Serial references: logits of each input token, and caches after the
+        // retained tokens.
+        var serialLogits = [[MLXArray]]()
+        var serialCaches = [[KVCache]]()
+        for r in 0 ..< rows {
+            let cache = try prefilled(r)
+            var logits = [MLXArray]()
+            var kept: [KVCache]?
+            for c in 0 ..< widths[r] {
+                logits.append(model(verifyTokens[r][0..., c ..< (c + 1)], cache: cache))
+                eval(logits.last!)
+                if c + 1 == retained[r] { kept = cache.map { $0.copy() } }
+            }
+            serialLogits.append(logits)
+            serialCaches.append(kept!)
+        }
+
+        let rowCaches = try (0 ..< rows).map(prefilled)
+        let batched: [KVCache] = try layers.indices.map { layer in
+            if layers[layer].isLinear {
+                return try MTPPackedMambaBatchCache(
+                    rowCaches: rowCaches.map { $0[layer] as! MambaCache })
+            }
+            return GLM5NextLatentCacheBatch(
+                rowCaches: rowCaches.map { $0[layer] as! any GLM5NextLatentCache })
+        }
+        let tokens = concatenated(
+            (0 ..< rows).map { r in
+                widths[r] == 2
+                    ? verifyTokens[r]
+                    : concatenated([verifyTokens[r][0..., ..<1], MLXArray([Int32(0)]).reshaped(1, 1)], axis: 1)
+            }, axis: 0)
+        let maps = (0 ..< rows).map { r in
+            MTPPackedVerificationRowMap(
+                rowIndex: r, queryOffset: prompts[r].dim(1), inputCount: widths[r],
+                proposalCount: widths[r] - 1)
+        }
+        let output = try verifyMTPPackedTargets(
+            model: model, tokens: tokens, rowMaps: maps, cache: batched,
+            requireContinuationState: true)
+        for r in 0 ..< rows {
+            let row = output.rows[r]
+            for c in 0 ..< widths[r] - 1 {
+                assertBitwiseEqual(
+                    row.proposalLogits[c ..< (c + 1)], serialLogits[r][c][0, 0..., 0...],
+                    "\(label) row \(r) proposal logits \(c)")
+            }
+            assertBitwiseEqual(
+                row.bonusLogits, serialLogits[r][widths[r] - 1][0, 0..., 0...],
+                "\(label) row \(r) bonus logits")
+            let state = try XCTUnwrap(row.continuationState)
+            XCTAssertEqual(state.queryOffset, prompts[r].dim(1) + widths[r])
+        }
+        // A padded column never advanced a row's recurrent state.
+        for (layer, cache) in batched.enumerated() {
+            guard let mamba = cache as? MTPPackedMambaBatchCache else { continue }
+            for r in 0 ..< rows where widths[r] == 1 {
+                let serial = serialCaches[r][layer] as! MambaCache
+                assertBitwiseEqual(
+                    mamba[0]![r ..< (r + 1)], serial[0], "\(label) layer \(layer) padded conv")
+                assertBitwiseEqual(
+                    mamba[1]![r ..< (r + 1)], serial[1], "\(label) layer \(layer) padded state")
+            }
+        }
+        // Resolve every row in every layer.
+        for (layer, cache) in batched.enumerated() {
+            if let mamba = cache as? MTPPackedMambaBatchCache {
+                for (r, t) in try mamba.rowTransactions().enumerated() {
+                    try t.commit(retaining: retained[r])
+                }
+            } else {
+                let latent = cache as! GLM5NextLatentCacheBatch
+                for (r, t) in try latent.rowTransactions().enumerated() {
+                    try t.commit(retaining: retained[r])
+                }
+                XCTAssertEqual(
+                    latent.rowCaches.map(\.offset),
+                    (0 ..< rows).map { prompts[$0].dim(1) + retained[$0] }, "\(label) layer \(layer)")
+            }
+        }
+        for r in 0 ..< rows {
+            assertCachesEqual(rowCaches[r], serialCaches[r], "\(label) row \(r) after commit")
+        }
+        // The next ordinary batched step from the committed rows.
+        let next = MLXArray((0 ..< rows).map { Int32(40 + $0) }).reshaped(rows, 1)
+        let stepCaches: [KVCache] = layers.indices.map { layer in
+            if layers[layer].isLinear {
+                let batch = MambaCache()
+                batch[0] = concatenated(rowCaches.map { ($0[layer] as! MambaCache)[0]! }, axis: 0)
+                batch[1] = concatenated(rowCaches.map { ($0[layer] as! MambaCache)[1]! }, axis: 0)
+                return batch
+            }
+            return GLM5NextLatentCacheBatch(
+                rowCaches: rowCaches.map { $0[layer] as! any GLM5NextLatentCache })
+        }
+        let stepLogits = model(next, cache: stepCaches)
+        for r in 0 ..< rows {
+            assertBitwiseEqual(
+                stepLogits[r ..< (r + 1)], model(next[r ..< (r + 1)], cache: serialCaches[r]),
+                "\(label) row \(r) next step")
+        }
+    }
+
+    func testPackedVerifyWithMixedWidthsMatchesSerialRows() throws {
+        let model = try fusedShapesModel(seed: 261)
+        let prompts = [7, 12, 15].enumerated().map { tokens($1, seed: UInt64(262 + $0)) }
+        for deferred in [true, false] {
+            model.model.deferredDecode = deferred
+            try assertPackedVerifyMatchesSerialRows(
+                model, layers: model.model.layers, prompts: prompts, label: "deferred=\(deferred)")
+        }
+        model.model.deferredDecode = true
+    }
+
+    func testPackedVerifyWithMixedWidthsMatchesSerialRowsOnRealCut() throws {
+        guard let path = ProcessInfo.processInfo.environment["GLM5NEXT_CUT_DIR"] else {
+            throw XCTSkip("GLM5NEXT_CUT_DIR is not set")
+        }
+        let dir = URL(fileURLWithPath: path)
+        let data = try Data(contentsOf: dir.appendingPathComponent("config.json"))
+        let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
+        let model = GLM5NextModel(try JSONDecoder().decode(GLM5NextConfiguration.self, from: data))
+        try loadWeights(
+            modelDirectory: dir, model: model, perLayerQuantization: base.perLayerQuantization)
+        model.train(false)
+        // Row 2 crosses index_topk (2048) inside the verification.
+        let prompts = [300, 1500, 2047].enumerated().map { r, n in
+            withRandomState(MLXRandom.RandomState(seed: UInt64(270 + r))) {
+                MLXRandom.randInt(0 ..< 150_000, [1, n]).asType(.int32)
+            }
+        }
+        try assertPackedVerifyMatchesSerialRows(
+            model, layers: model.languageModel.model.layers, prompts: prompts, label: "real cut")
+    }
+
     private func copyState(_ state: MTPDrafterState) -> MTPDrafterState {
         MTPDrafterState(
             cache: state.cache.map { $0.copy() }, nextPosition: state.nextPosition,

@@ -35,21 +35,149 @@ public protocol GLM5NextBatchedLatentCache: KVCache {
 
 /// `GLM5NextBatchedLatentCache` over existing per-sequence caches. The rows
 /// carry the state; `offset` is unused.
-public final class GLM5NextLatentCacheBatch: BaseKVCache, GLM5NextBatchedLatentCache {
-    public let rowCaches: [any GLM5NextLatentCache]
+///
+/// It is also an `MTPPackedVerificationCache` for packed MTP verification in
+/// continuous batching. `prepareMTPPackedVerification` swaps in working copies
+/// of the rows (each a `GLM5NextAttentionCache`) and limits every row to its
+/// `inputCount` leading columns; the forward writes only the copies. After
+/// the forward, `rowTransactions()` returns one transaction per row:
+/// `commit(retaining:)` publishes the copy trimmed to its first `retaining`
+/// columns into the row cache (exact trim); dropping a transaction leaves the
+/// row unchanged.
+public final class GLM5NextLatentCacheBatch: BaseKVCache, GLM5NextBatchedLatentCache,
+    MTPPackedVerificationCache
+{
+    private let rows: [any GLM5NextLatentCache]
+    private var working: [GLM5NextAttentionCache]?
+    private var preparedRowMaps: [MTPPackedVerificationRowMap]?
+    private var pendingTransactions: [GLM5NextLatentRowTransaction]?
+
+    /// Valid leading columns per row of the current forward, or `nil` when
+    /// every column of every row is valid.
+    public private(set) var rowLengths: [Int]?
 
     public init(rowCaches: [any GLM5NextLatentCache]) {
         precondition(!rowCaches.isEmpty, "GLM5NextLatentCacheBatch needs at least one row")
-        self.rowCaches = rowCaches
+        self.rows = rowCaches
         super.init()
     }
+
+    /// The caches the forward reads and writes: the working copies during a
+    /// packed verification, the row caches otherwise.
+    public var rowCaches: [any GLM5NextLatentCache] { working ?? rows }
 
     public override func innerState() -> [MLXArray] {
         rowCaches.flatMap { $0.innerState() }
     }
 
     public override func copy() -> any KVCache {
-        GLM5NextLatentCacheBatch(rowCaches: rowCaches.map { $0.copy() as! any GLM5NextLatentCache })
+        GLM5NextLatentCacheBatch(rowCaches: rows.map { $0.copy() as! any GLM5NextLatentCache })
+    }
+
+    // MARK: Packed MTP verification
+
+    public var batchOffset: MLXArray { MLXArray(rowCaches.map { Int32($0.offset) }) }
+
+    public var mtpPackedHostBatchOffsets: [Int]? { rowCaches.map(\.offset) }
+
+    public func prepareMTPPackedVerification(rowMaps: [MTPPackedVerificationRowMap]) throws {
+        let caches = rows.compactMap { $0 as? GLM5NextAttentionCache }
+        guard rowMaps.count == rows.count, caches.count == rows.count,
+            zip(rowMaps, caches).allSatisfy({ map, cache in
+                map.inputCount == map.proposalCount + 1 && map.queryOffset == cache.offset
+                    && cache.isTrimmable(after: map.proposalCount)
+            })
+        else { throw GLM5NextLatentCacheError.invalidRowMaps }
+        working = caches.map { $0.copy() as! GLM5NextAttentionCache }
+        preparedRowMaps = rowMaps
+        pendingTransactions = nil
+        let lengths = rowMaps.map(\.inputCount)
+        rowLengths = Set(lengths).count == 1 ? nil : lengths
+    }
+
+    /// Ragged packed prefill or verification: valid leading columns per row.
+    public override func prepare(lengths: [Int]?) {
+        rowLengths = lengths.flatMap { Set($0).count <= 1 ? nil : $0 }
+    }
+
+    /// Clears the per-call row lengths only; the working copies stay for
+    /// `rowTransactions()`.
+    public override func finalize() {
+        rowLengths = nil
+    }
+
+    /// One transaction per row after the packed forward; returns the
+    /// batch to its row caches.
+    public func rowTransactions() throws -> [GLM5NextLatentRowTransaction] {
+        if let pendingTransactions { return pendingTransactions }
+        guard let preparedRowMaps, let working else {
+            throw GLM5NextLatentCacheError.missingForwardState
+        }
+        let transactions = try preparedRowMaps.indices.map { index -> GLM5NextLatentRowTransaction in
+            let map = preparedRowMaps[index]
+            guard working[index].offset == map.queryOffset + map.inputCount else {
+                throw GLM5NextLatentCacheError.missingForwardState
+            }
+            return GLM5NextLatentRowTransaction(
+                rowCache: rows[index] as! GLM5NextAttentionCache, forwarded: working[index],
+                inputCount: map.inputCount, proposalCount: map.proposalCount)
+        }
+        self.working = nil
+        self.preparedRowMaps = nil
+        pendingTransactions = transactions
+        return transactions
+    }
+}
+
+public enum GLM5NextLatentCacheError: Error, Equatable {
+    case invalidRowMaps
+    case missingForwardState
+    case invalidRetainedInputCount(retaining: Int, inputCount: Int)
+    case alreadyResolved
+}
+
+/// One row's sparse-layer result of a packed MTP verification. The row cache
+/// is unchanged until `commit(retaining:)`; dropping the transaction rolls
+/// back.
+public final class GLM5NextLatentRowTransaction {
+    public let inputCount: Int
+    public let proposalCount: Int
+    private let rowCache: GLM5NextAttentionCache
+    private let forwarded: GLM5NextAttentionCache
+    private var resolved = false
+
+    init(
+        rowCache: GLM5NextAttentionCache, forwarded: GLM5NextAttentionCache, inputCount: Int,
+        proposalCount: Int
+    ) {
+        self.rowCache = rowCache
+        self.forwarded = forwarded
+        self.inputCount = inputCount
+        self.proposalCount = proposalCount
+    }
+
+    /// Keep the row's first `retaining` verification columns (the base
+    /// column plus the accepted proposals).
+    public func commit(retaining: Int) throws {
+        eval(try stageCommit(retaining: retaining))
+    }
+
+    /// `commit(retaining:)` without evaluating: returns the arrays to evaluate
+    /// with the rest of the round.
+    public func stageCommit(retaining: Int) throws -> [MLXArray] {
+        guard !resolved else { throw GLM5NextLatentCacheError.alreadyResolved }
+        guard retaining > 0, retaining <= inputCount else {
+            throw GLM5NextLatentCacheError.invalidRetainedInputCount(
+                retaining: retaining, inputCount: inputCount)
+        }
+        let drop = inputCount - retaining
+        guard forwarded.trim(drop) == drop else {
+            throw GLM5NextLatentCacheError.invalidRetainedInputCount(
+                retaining: retaining, inputCount: inputCount)
+        }
+        rowCache.adopt(forwarded)
+        resolved = true
+        return rowCache.innerState()
     }
 }
 
@@ -246,6 +374,20 @@ public final class GLM5NextAttentionCache: BaseKVCache, GLM5NextLatentCache {
             precondition(
                 newValue == ["\(kpool)"], "GLM5NextAttentionCache pool width mismatch")
         }
+    }
+
+    /// Take `other`'s contents (same pool width): a packed verification
+    /// publishing its forwarded copy.
+    func adopt(_ other: GLM5NextAttentionCache) {
+        precondition(other.kpool == kpool, "GLM5NextAttentionCache pool width mismatch")
+        step = other.step
+        offset = other.offset
+        latent = other.latent
+        pooledKeys = other.pooledKeys
+        pendingKeys = other.pendingKeys
+        pendingGates = other.pendingGates
+        foldedKeys = other.foldedKeys
+        foldedGates = other.foldedGates
     }
 
     public override func copy() -> any KVCache {

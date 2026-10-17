@@ -532,6 +532,14 @@ final class GLM5NextLinearAttention: Module {
             cache.saveSpeculativeCheckpoint(
                 convState: cache[0]!, recurrentState: cache[1]!, advancedBy: split)
         }
+        // Valid columns per row of a right-padded packed verification (`nil`
+        // when every column is valid): a padded column keeps the row's state.
+        let valid = cache.makeMask(N: L)
+        func keep(_ c: Int, _ new: MLXArray, _ old: MLXArray?) -> MLXArray {
+            guard let valid, let old else { return new }
+            let shape = [B] + Array(repeating: 1, count: new.ndim - 1)
+            return MLX.where(valid[0..., c ..< (c + 1)].reshaped(shape), new, old)
+        }
         if fusedDecode, !training, let lowerBound = forgetGate.lowerBound, convKernelSize == 4,
             let fb = glm5NextAffine(forgetGate.fBProj), let gb = glm5NextAffine(gBProj),
             let projected = inputProjections(x.reshaped(B * L, 1, x.dim(-1)))
@@ -544,6 +552,7 @@ final class GLM5NextLinearAttention: Module {
                 cache[1] ?? MLXArray.zeros([B, numHeads, headDim, headDim], dtype: .float32)
             var steps = [(y: MLXArray, convState: MLXArray, state: MLXArray)]()
             for c in 0 ..< L {
+                let (convBefore, stateBefore) = (convState, state)
                 func col(_ a: MLXArray) -> MLXArray { a[0..., c ..< (c + 1)] }
                 guard
                     let step = glm5NextKDADecodeStep(
@@ -554,8 +563,10 @@ final class GLM5NextLinearAttention: Module {
                         normWeight: oNorm.weight, state: state, heads: numHeads, headDim: headDim,
                         lowerBound: lowerBound, normEps: oNorm.eps)
                 else { break }
-                steps.append(step)
-                (convState, state) = (step.convState, step.state)
+                (convState, state) = (
+                    keep(c, step.convState, convBefore), keep(c, step.state, stateBefore)
+                )
+                steps.append((step.y, convState, state))
             }
             if steps.count == L {
                 for (c, step) in steps.enumerated() {
@@ -569,7 +580,10 @@ final class GLM5NextLinearAttention: Module {
         }
         var outputs = [MLXArray]()
         for c in 0 ..< L {
+            let (convBefore, stateBefore) = (cache[0], cache[1])
             outputs.append(self(x[0..., c ..< (c + 1)], cache: cache))
+            cache[0] = keep(c, cache[0]!, convBefore)
+            cache[1] = keep(c, cache[1]!, stateBefore)
             if c + 1 == split { save() }
         }
         return concatenated(outputs, axis: 1)
@@ -881,12 +895,16 @@ final class GLM5NextAttention: Module {
     ) -> (MLXArray, [MLXArray?]) {
         let (B, L) = (x.dim(0), x.dim(1))
         let rows: [any GLM5NextLatentCache]
+        var rowLengths = rowLengths
         switch cache {
         case let batch as any GLM5NextBatchedLatentCache:
             precondition(
                 batch.rowCaches.count == B,
                 "GLM5Next batched cache has \(batch.rowCaches.count) rows for a batch of \(B)")
             rows = batch.rowCaches
+            if rowLengths == nil, let packed = batch as? GLM5NextLatentCacheBatch {
+                rowLengths = packed.rowLengths
+            }
         case let serial as any GLM5NextLatentCache:
             rows = [serial]
         case nil:
@@ -909,9 +927,16 @@ final class GLM5NextAttention: Module {
             let (rx, rq, rl) = (row(x), row(qResid), row(latentIn))
             let rqLatent = row(qLatent)
             if perColumn {
+                let valid = rowLengths?[index] ?? L
                 var columns = [MLXArray]()
                 for c in 0 ..< L {
                     let slot = index * L + c
+                    guard c < valid else {
+                        // A padded column: attends nothing, writes no cache.
+                        columns.append(MLXArray.zeros(like: columns[0]))
+                        selections.append(nil)
+                        continue
+                    }
                     let (out, topk) = attendRow(
                         x: rx[0..., c ..< (c + 1)], qResid: rq[0..., c ..< (c + 1)],
                         qLatent: rqLatent[0..., 0..., c ..< (c + 1)],
