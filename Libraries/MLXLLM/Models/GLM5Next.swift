@@ -855,12 +855,62 @@ final class GLM5NextIndexer: Module {
     }
 }
 
+struct GLM5NextAttentionInput {
+    let queries: MLXArray
+    let latent: MLXArray
+    let mask: MLXArray?
+
+    func evaluate(scale: Float) -> MLXArray {
+        MLXFast.scaledDotProductAttention(
+            queries: queries, keys: latent, values: latent, scale: scale,
+            mask: mask.map { .array($0) } ?? .none)
+    }
+}
+
+struct GLM5NextRaggedAttention {
+    let scale: Float
+    private let traced: @Sendable ([MLXArray]) -> [MLXArray]
+
+    init(scale: Float) {
+        self.scale = scale
+        traced = compile(shapeless: true) { arguments in
+            stride(from: 0, to: arguments.count, by: 3).map { i in
+                MLXFast.scaledDotProductAttention(
+                    queries: arguments[i], keys: arguments[i + 1], values: arguments[i + 1],
+                    scale: scale,
+                    mask: arguments[i + 2].ndim == 0 ? .none : .array(arguments[i + 2]))
+            }
+        }
+    }
+
+    func supports(_ inputs: [GLM5NextAttentionInput]) -> Bool {
+        guard (2 ... 8).contains(inputs.count) else { return false }
+        return inputs.allSatisfy { input in
+            let q = input.queries
+            let kv = input.latent
+            guard q.shape == [1, 64, 1, 512], q.dtype == .bfloat16,
+                kv.ndim == 4, kv.dim(0) == 1, kv.dim(1) == 1,
+                kv.dim(2) > 0, kv.dim(3) == 512, kv.dtype == q.dtype
+            else { return false }
+            guard let mask = input.mask else { return true }
+            return mask.dtype == .bool && mask.shape == [1, 1, 1, kv.dim(2)]
+        }
+    }
+
+    func callAsFunction(_ inputs: [GLM5NextAttentionInput]) -> [MLXArray] {
+        guard supports(inputs) else { return inputs.map { $0.evaluate(scale: scale) } }
+        // Keep each serial matmul's batch and true KV length; never pad or batch reductions.
+        return traced(inputs.flatMap { [$0.queries, $0.latent, $0.mask ?? MLXArray(false)] })
+    }
+}
+
 final class GLM5NextAttention: Module {
     let numHeads: Int
     let qHeadDim: Int
     let vHeadDim: Int
     let indexTopk: Int
     let scale: Float
+    let raggedAttention: GLM5NextRaggedAttention
 
     /// Skip the indexer's selection while the whole context fits in `index_topk`:
     /// it would select every causal token, so DSA is dense MLA there.
@@ -885,6 +935,7 @@ final class GLM5NextAttention: Module {
         self.vHeadDim = config.vHeadDim
         self.indexTopk = config.indexTopk
         self.scale = pow(Float(qHeadDim), -0.5)
+        self.raggedAttention = GLM5NextRaggedAttention(scale: pow(Float(qHeadDim), -0.5))
         let hidden = config.hiddenSize
         let kvLoraRank = config.kvLoraRank
 
@@ -967,12 +1018,18 @@ final class GLM5NextAttention: Module {
             ? indexer.flatMap { glm5NextPackedIndexerProjection($0.weightsProj, x) } : nil
         var attended = [MLXArray]()
         var selections = [MLXArray?]()
+        let deferAttention =
+            perColumn && B > 1 && B * L <= 8
+            && qLatent.shape == [B, 64, L, 512] && qLatent.dtype == .bfloat16
+        var attentionInputs = [GLM5NextAttentionInput]()
         for (index, rowCache) in rows.enumerated() {
             func row(_ a: MLXArray) -> MLXArray { rows.count == 1 ? a : a[index ..< (index + 1)] }
             let (rx, rq, rl) = (row(x), row(qResid), row(latentIn))
             let rqLatent = row(qLatent)
             if perColumn {
                 let valid = rowLengths?[index] ?? L
+                precondition(
+                    valid >= 1 && valid <= L, "GLM5Next row length \(valid) outside 1...\(L)")
                 // The indexer's projections for every column at once (row-
                 // independent); the gates, selection and attention per column.
                 let indexerKeys = indexer.map {
@@ -989,7 +1046,7 @@ final class GLM5NextAttention: Module {
                     let slot = index * L + c
                     guard c < valid else {
                         // A padded column: attends nothing, writes no cache.
-                        columns.append(MLXArray.zeros(like: columns[0]))
+                        if !deferAttention { columns.append(MLXArray.zeros(like: columns[0])) }
                         selections.append(nil)
                         continue
                     }
@@ -999,11 +1056,15 @@ final class GLM5NextAttention: Module {
                         qLatent: rqLatent[0..., 0..., c ..< (c + 1)],
                         latentIn: rl[0..., 0..., c ..< (c + 1)], cache: rowCache,
                         previousTopk: slot < previousTopk.count ? previousTopk[slot] : nil,
-                        indexerInputs: (col(indexerKeys), col(indexerQ), col(indexerWeights)))
-                    columns.append(out)
+                        indexerInputs: (col(indexerKeys), col(indexerQ), col(indexerWeights)),
+                        deferred: deferAttention ? { attentionInputs.append($0) } : nil)
+                    if !deferAttention { columns.append(out) }
                     selections.append(topk)
                 }
-                attended.append(columns.count == 1 ? columns[0] : concatenated(columns, axis: 2))
+                if !deferAttention {
+                    attended.append(
+                        columns.count == 1 ? columns[0] : concatenated(columns, axis: 2))
+                }
                 continue
             }
             let valid = rowLengths?[index] ?? L
@@ -1023,6 +1084,19 @@ final class GLM5NextAttention: Module {
             }
             selections.append(topk)
         }
+        if deferAttention {
+            let outputs = raggedAttention(attentionInputs)
+            var next = 0
+            attended = rows.indices.map { index in
+                let valid = rowLengths?[index] ?? L
+                let columns = (0 ..< L).map { column -> MLXArray in
+                    guard column < valid else { return MLXArray.zeros(like: outputs[next - 1]) }
+                    defer { next += 1 }
+                    return outputs[next]
+                }
+                return columns.count == 1 ? columns[0] : concatenated(columns, axis: 2)
+            }
+        }
         let all = attended.count == 1 ? attended[0] : concatenated(attended, axis: 0)
         let output = callMultiLinear(unembedOut, all)
             .transposed(0, 2, 1, 3)
@@ -1035,7 +1109,8 @@ final class GLM5NextAttention: Module {
     private func attendRow(
         x: MLXArray, qResid: MLXArray, qLatent: MLXArray, latentIn: MLXArray,
         cache: any GLM5NextLatentCache, previousTopk: MLXArray?,
-        indexerInputs: (keys: MLXArray?, q: MLXArray?, weights: MLXArray?) = (nil, nil, nil)
+        indexerInputs: (keys: MLXArray?, q: MLXArray?, weights: MLXArray?) = (nil, nil, nil),
+        deferred: ((GLM5NextAttentionInput) -> Void)? = nil
     ) -> (MLXArray, MLXArray?) {
         let L = x.dim(1)
         let latent = cache.appendLatent(latentIn)
@@ -1058,7 +1133,26 @@ final class GLM5NextAttention: Module {
         }
 
         if let topk {
+            if let deferred {
+                precondition(L == 1)
+                let T = latent.dim(2)
+                let K = topk.dim(-1)
+                let valid = logicalAnd(topk .>= 0, topk .< Int32(T))
+                let selected = take(
+                    latent.reshaped(T, latent.dim(3)),
+                    clip(topk, min: 0, max: max(T - 1, 0)).flattened(), axis: 0
+                )
+                .reshaped(1, 1, K, latent.dim(3))
+                deferred(
+                    .init(queries: qLatent, latent: selected, mask: valid.reshaped(1, 1, 1, K)))
+                return (qLatent, topk)
+            }
             return (sparseAttention(qLatent, latent: latent, topk: topk), topk)
+        }
+        if let deferred {
+            precondition(L == 1)
+            deferred(.init(queries: qLatent, latent: latent, mask: nil))
+            return (qLatent, nil)
         }
         let mask: MLXFast.ScaledDotProductAttentionMaskMode =
             L == 1 ? .none : .array(createCausalMask(n: L, offset: kvLength - L))
