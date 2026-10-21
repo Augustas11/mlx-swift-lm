@@ -956,11 +956,14 @@ final class GLM5NextAttention: Module {
         let qLatent = callMultiLinear(embedQ, q)
 
         precondition(rowLengths == nil || rowLengths!.count == rows.count)
-        let packedIndexerKeys = perColumn
+        let packedIndexerKeys =
+            perColumn
             ? indexer.flatMap { glm5NextPackedIndexerProjection($0.wk, x) } : nil
-        let packedIndexerQ = perColumn
+        let packedIndexerQ =
+            perColumn
             ? indexer.flatMap { glm5NextPackedIndexerProjection($0.wqB, qResid) } : nil
-        let packedIndexerWeights = perColumn
+        let packedIndexerWeights =
+            perColumn
             ? indexer.flatMap { glm5NextPackedIndexerProjection($0.weightsProj, x) } : nil
         var attended = [MLXArray]()
         var selections = [MLXArray?]()
