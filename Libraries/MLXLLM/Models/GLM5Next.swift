@@ -211,6 +211,16 @@ func glm5NextProject(_ linear: Linear, _ x: MLXArray) -> MLXArray {
     return y.reshaped(Array(x.shape.dropLast()) + [y.dim(-1)])
 }
 
+/// Share an indexer projection across request rows only on the exact QMV kernel.
+/// Unsupported projections stay on their original per-row path.
+func glm5NextPackedIndexerProjection(_ linear: Linear, _ x: MLXArray) -> MLXArray? {
+    guard x.ndim == 3, x.dim(0) > 1, (2 ... 8).contains(x.dim(0) * x.dim(1)),
+        let parts = glm5NextAffine(linear),
+        let y = glm5NextQMVBatch(x.reshaped(-1, x.dim(-1)), parts)
+    else { return nil }
+    return y.reshaped(x.dim(0), x.dim(1), y.dim(-1))
+}
+
 // MARK: - Feed-forward
 
 final class GLM5NextMLP: Module, UnaryLayer {
@@ -946,6 +956,12 @@ final class GLM5NextAttention: Module {
         let qLatent = callMultiLinear(embedQ, q)
 
         precondition(rowLengths == nil || rowLengths!.count == rows.count)
+        let packedIndexerKeys = perColumn
+            ? indexer.flatMap { glm5NextPackedIndexerProjection($0.wk, x) } : nil
+        let packedIndexerQ = perColumn
+            ? indexer.flatMap { glm5NextPackedIndexerProjection($0.wqB, qResid) } : nil
+        let packedIndexerWeights = perColumn
+            ? indexer.flatMap { glm5NextPackedIndexerProjection($0.weightsProj, x) } : nil
         var attended = [MLXArray]()
         var selections = [MLXArray?]()
         for (index, rowCache) in rows.enumerated() {
@@ -956,9 +972,15 @@ final class GLM5NextAttention: Module {
                 let valid = rowLengths?[index] ?? L
                 // The indexer's projections for every column at once (row-
                 // independent); the gates, selection and attention per column.
-                let indexerKeys = indexer.map { $0.kNorm(glm5NextProject($0.wk, rx)) }
-                let indexerQ = indexer.map { glm5NextProject($0.wqB, rq) }
-                let indexerWeights = indexer.map { glm5NextProject($0.weightsProj, rx) }
+                let indexerKeys = indexer.map {
+                    $0.kNorm(packedIndexerKeys.map(row) ?? glm5NextProject($0.wk, rx))
+                }
+                let indexerQ = indexer.map {
+                    packedIndexerQ.map(row) ?? glm5NextProject($0.wqB, rq)
+                }
+                let indexerWeights = indexer.map {
+                    packedIndexerWeights.map(row) ?? glm5NextProject($0.weightsProj, rx)
+                }
                 var columns = [MLXArray]()
                 for c in 0 ..< L {
                     let slot = index * L + c

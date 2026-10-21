@@ -1237,6 +1237,81 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
+    func testPackedIndexerProjectionUsesExactKernelForCoveredRows() throws {
+        for dtype: DType in [.float16, .bfloat16] {
+            for bits in [4, 8] {
+                let linear = Linear(512, 64, bias: false)
+                randomize(linear, seed: UInt64(730 + bits))
+                linear.update(parameters: ModuleParameters.unflattened(
+                    linear.parameters().flattened().map { ($0.0, $0.1.asType(dtype)) }))
+                let projection = QuantizedLinear(linear, groupSize: 64, bits: bits)
+                eval(projection)
+                for batch in [2, 4] {
+                    for width in [1, 2] {
+                        let x = withRandomState(MLXRandom.RandomState(seed: UInt64(740 + batch + width))) {
+                            MLXRandom.normal([batch, width, 512]).asType(dtype)
+                        }
+                        // Non-nil is returned only by the exact kernel, never a generic matmul.
+                        let packed = try XCTUnwrap(glm5NextPackedIndexerProjection(projection, x))
+                        let reference = concatenated((0 ..< batch).map { row in
+                            glm5NextProject(projection, x[row ..< (row + 1)])
+                        }, axis: 0)
+                        assertBitwiseEqual(
+                            packed, reference, "indexer \(dtype) \(bits)b B=\(batch) L=\(width)")
+                    }
+                }
+            }
+        }
+    }
+
+    func testPackedIndexerProjectionRefusesUnsupportedPaths() throws {
+        let linear = Linear(512, 64, bias: false)
+        randomize(linear, seed: 750)
+        linear.update(parameters: ModuleParameters.unflattened(
+            linear.parameters().flattened().map { ($0.0, $0.1.asType(.bfloat16)) }))
+        let projection = QuantizedLinear(linear, groupSize: 64, bits: 8)
+        let covered = MLXArray.zeros([4, 2, 512], dtype: .bfloat16)
+        XCTAssertNotNil(glm5NextPackedIndexerProjection(projection, covered))
+        XCTAssertNil(glm5NextPackedIndexerProjection(linear, covered))
+        XCTAssertNil(glm5NextPackedIndexerProjection(projection, covered.asType(.float32)))
+        XCTAssertNil(glm5NextPackedIndexerProjection(projection, covered.asType(.float16)))
+        for shape in [[1, 2, 512], [4, 3, 512], [4, 512]] {
+            XCTAssertNil(glm5NextPackedIndexerProjection(
+                projection, MLXArray.zeros(shape, dtype: .bfloat16)))
+        }
+        let narrow = Linear(64, 64, bias: false)
+        narrow.update(parameters: ModuleParameters.unflattened(
+            narrow.parameters().flattened().map { ($0.0, $0.1.asType(.bfloat16)) }))
+        let unsupported = QuantizedLinear(narrow, groupSize: 64, bits: 8)
+        XCTAssertNil(glm5NextPackedIndexerProjection(
+            unsupported, MLXArray.zeros([4, 2, 64], dtype: .bfloat16)))
+    }
+
+    func testPackedIndexerProjectionPreservesPaddingAndThresholdCrossing() throws {
+        for dtype: DType in [.float16, .bfloat16] {
+            let model = try fusedShapesModel(seed: 761)
+            if dtype == .float16 {
+                model.update(parameters: ModuleParameters.unflattened(
+                    model.parameters().flattened().map { key, value in
+                        (key, value.dtype == .bfloat16 ? value.asType(dtype) : value)
+                    }))
+                eval(model)
+            }
+            let attention = model.model.layers[3].selfAttn as! GLM5NextAttention
+            let indexer = try XCTUnwrap(attention.indexer)
+            let x = MLXArray.zeros([4, 2, model.configuration.hiddenSize], dtype: dtype)
+            XCTAssertNotNil(glm5NextPackedIndexerProjection(indexer.wk, x))
+            XCTAssertNotNil(glm5NextPackedIndexerProjection(indexer.weightsProj, x))
+            // This fixture's narrow q projection remains on the old path independently.
+            XCTAssertNil(glm5NextPackedIndexerProjection(
+                indexer.wqB, MLXArray.zeros([4, 2, model.configuration.qLoraRank], dtype: dtype)))
+            let prompts = [7, 8, 12, 15].enumerated().map { tokens($1, seed: UInt64(762 + $0)) }
+            try assertPackedVerifyMatchesSerialRows(
+                model, layers: model.model.layers, prompts: prompts, label: "indexer \(dtype)",
+                widths: [2, 1, 2, 2], retained: [1, 1, 2, 1])
+        }
+    }
+
     /// A model whose every decode kernel engages: hidden 1024 (deferred HC),
     /// head_dim-128 KDA with 8 heads, 32 indexer heads, 128 experts of 512,
     /// affine-quantized as the artifact (4-bit experts, 8-bit elsewhere).
