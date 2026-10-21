@@ -368,7 +368,7 @@ final class GLM5NextTests: XCTestCase {
         XCTAssertEqual(a.shape, b.shape, message, file: file, line: line)
         XCTAssertEqual(a.dtype, b.dtype, message, file: file, line: line)
         XCTAssertTrue(
-            arrayEqual(a, b).item(Bool.self),
+            arrayEqual(a.view(dtype: .uint8), b.view(dtype: .uint8)).item(Bool.self),
             "\(message): max |diff| \(maxAbsDifference(a, b))", file: file, line: line)
     }
 
@@ -1241,12 +1241,13 @@ final class GLM5NextTests: XCTestCase {
         let scale = pow(Float(128), -0.5)
         let attention = GLM5NextRaggedAttention(scale: scale)
         // Both directions cross history thresholds with the same trace and mask ranks.
-        for lengths in [
+        for (invocation, lengths) in [
             [2047, 2049, 1536, 4096], [2049, 2047, 4097, 1537], [17, 31, 2048, 2051],
-        ] {
+        ].enumerated() {
             let inputs = (0 ..< 8).map { slot -> GLM5NextAttentionInput in
                 let length = lengths[slot % lengths.count]
-                let state = MLXRandom.RandomState(seed: UInt64(810 + slot + length))
+                let state = MLXRandom.RandomState(
+                    seed: UInt64(810 + invocation * 10_000 + slot + length))
                 let (queries, latent) = withRandomState(state) {
                     (
                         MLXRandom.normal([1, 64, 1, 512]).asType(.bfloat16),
