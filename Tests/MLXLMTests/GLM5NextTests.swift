@@ -1240,7 +1240,7 @@ final class GLM5NextTests: XCTestCase {
     func testRaggedAttentionPreservesSerialBitsAcrossChangingHistories() throws {
         let scale = pow(Float(128), -0.5)
         let attention = GLM5NextRaggedAttention(scale: scale)
-        // Both directions cross history thresholds with the same trace and mask ranks.
+        // Both directions cross history thresholds with the same trace and top-k ranks.
         for (invocation, lengths) in [
             [2047, 2049, 1536, 4096], [2049, 2047, 4097, 1537], [17, 31, 2048, 2051],
         ].enumerated() {
@@ -1254,12 +1254,16 @@ final class GLM5NextTests: XCTestCase {
                         MLXRandom.normal([1, 1, length, 512]).asType(.bfloat16)
                     )
                 }
-                let mask =
+                let topk =
                     slot % 2 == 0
                     ? nil
-                    : (MLXArray(Int32(0) ..< Int32(length)) .< Int32(length - 3))
-                        .reshaped(1, 1, 1, length)
-                return .init(queries: queries, latent: latent, mask: mask)
+                    : concatenated([
+                        MLXArray(Int32(0) ..< Int32(length)),
+                        MLXArray([
+                            Int32(-1), 0, Int32(length - 1), Int32(length), Int32(length + 1), -2,
+                        ]),
+                    ]).reshaped(1, 1, -1)
+                return .init(queries: queries, latent: latent, topk: topk)
             }
             for count in [2, 4, 8] {
                 let active = Array(inputs.prefix(count))
@@ -1283,20 +1287,22 @@ final class GLM5NextTests: XCTestCase {
         let attention = GLM5NextRaggedAttention(scale: 0.125)
         let q = MLXArray.zeros([1, 64, 1, 512], dtype: .bfloat16)
         let kv = MLXArray.zeros([1, 1, 17, 512], dtype: .bfloat16)
-        let input = GLM5NextAttentionInput(queries: q, latent: kv, mask: nil)
+        let input = GLM5NextAttentionInput(queries: q, latent: kv, topk: nil)
         XCTAssertTrue(attention.supports([input, input]))
         for count in [0, 1, 9] {
             XCTAssertFalse(attention.supports(Array(repeating: input, count: count)))
         }
         for invalid in [
             GLM5NextAttentionInput(
-                queries: q.asType(.float16), latent: kv.asType(.float16), mask: nil),
-            GLM5NextAttentionInput(queries: q[0..., ..<32], latent: kv, mask: nil),
-            GLM5NextAttentionInput(queries: q, latent: kv, mask: MLXArray(true)),
+                queries: q.asType(.float16), latent: kv.asType(.float16), topk: nil),
+            GLM5NextAttentionInput(queries: q[0..., ..<32], latent: kv, topk: nil),
+            GLM5NextAttentionInput(queries: q, latent: kv, topk: MLXArray(Int32(0))),
             GLM5NextAttentionInput(
-                queries: q, latent: kv, mask: MLXArray.zeros([1, 1, 1, 17], dtype: .bfloat16)),
+                queries: q, latent: kv, topk: MLXArray.zeros([1, 1, 17], dtype: .bfloat16)),
             GLM5NextAttentionInput(
-                queries: q, latent: kv, mask: MLXArray.zeros([1, 1, 1, 16], dtype: .bool)),
+                queries: q, latent: kv, topk: MLXArray.zeros([1, 2, 17], dtype: .int32)),
+            GLM5NextAttentionInput(
+                queries: q, latent: kv, topk: MLXArray.zeros([1, 1, 0], dtype: .int32)),
         ] {
             XCTAssertFalse(attention.supports([input, invalid]))
         }
@@ -1308,7 +1314,7 @@ final class GLM5NextTests: XCTestCase {
         let inputs = [17, 31].map { length in
             GLM5NextAttentionInput(
                 queries: MLXArray.ones([1, 32, 1, 64], dtype: .float16),
-                latent: MLXArray.ones([1, 1, length, 64], dtype: .float16), mask: nil)
+                latent: MLXArray.ones([1, 1, length, 64], dtype: .float16), topk: nil)
         }
         XCTAssertFalse(attention.supports(inputs))
         let outputs = attention(inputs)

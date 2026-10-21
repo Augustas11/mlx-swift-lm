@@ -858,12 +858,29 @@ final class GLM5NextIndexer: Module {
 struct GLM5NextAttentionInput {
     let queries: MLXArray
     let latent: MLXArray
-    let mask: MLXArray?
+    let topk: MLXArray?
 
     func evaluate(scale: Float) -> MLXArray {
-        MLXFast.scaledDotProductAttention(
-            queries: queries, keys: latent, values: latent, scale: scale,
-            mask: mask.map { .array($0) } ?? .none)
+        guard let topk else {
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: latent, values: latent, scale: scale, mask: .none)
+        }
+        // Independent uncompiled serial preparation, matching sparseAttention's B1/L1 path.
+        let T = latent.dim(2)
+        let R = latent.dim(3)
+        let H = queries.dim(1)
+        let K = topk.dim(-1)
+        let batchOffsets = (MLXArray(Int32(0) ..< Int32(1)) * Int32(T)).reshaped(1, 1, 1)
+        let valid = logicalAnd(topk .>= 0, topk .< Int32(T))
+        let safe = clip(topk, min: 0, max: max(T - 1, 0)) + batchOffsets
+        let selected = take(latent.reshaped(T, R), safe.flattened(), axis: 0)
+            .reshaped(1, 1, K, R)
+        let q = queries.transposed(0, 2, 1, 3).reshaped(1, H, 1, R)
+        return MLXFast.scaledDotProductAttention(
+            queries: q, keys: selected, values: selected, scale: scale,
+            mask: .array(valid.reshaped(1, 1, 1, K))
+        )
+        .reshaped(1, 1, H, R).transposed(0, 2, 1, 3)
     }
 }
 
@@ -874,11 +891,29 @@ struct GLM5NextRaggedAttention {
     init(scale: Float) {
         self.scale = scale
         traced = compile(shapeless: true) { arguments in
-            stride(from: 0, to: arguments.count, by: 3).map { i in
-                MLXFast.scaledDotProductAttention(
-                    queries: arguments[i], keys: arguments[i + 1], values: arguments[i + 1],
-                    scale: scale,
-                    mask: arguments[i + 2].ndim == 0 ? .none : .array(arguments[i + 2]))
+            stride(from: 0, to: arguments.count, by: 4).map { i in
+                let queries = arguments[i]
+                let latent = arguments[i + 1]
+                let topk = arguments[i + 2]
+                guard topk.ndim != 0 else {
+                    return MLXFast.scaledDotProductAttention(
+                        queries: queries, keys: latent, values: latent, scale: scale, mask: .none)
+                }
+                // T is an argument: a shapeless trace must not retain the first history's bounds.
+                let length = arguments[i + 3]
+                let batchOffsets = (MLXArray(Int32(0) ..< Int32(1)) * length).reshaped(1, 1, 1)
+                let valid = logicalAnd(topk .>= 0, topk .< length)
+                let safe =
+                    clip(topk, min: 0, max: maximum(length - Int32(1), Int32(0)))
+                    + batchOffsets
+                let selected = take(latent.reshaped(-1, 512), safe.flattened(), axis: 0)
+                    .reshaped(1, 1, -1, 512)
+                let q = queries.transposed(0, 2, 1, 3).reshaped(1, 64, 1, 512)
+                return MLXFast.scaledDotProductAttention(
+                    queries: q, keys: selected, values: selected, scale: scale,
+                    mask: .array(valid.reshaped(1, 1, 1, -1))
+                )
+                .reshaped(1, 1, 64, 512).transposed(0, 2, 1, 3)
             }
         }
     }
@@ -890,17 +925,24 @@ struct GLM5NextRaggedAttention {
             let kv = input.latent
             guard q.shape == [1, 64, 1, 512], q.dtype == .bfloat16,
                 kv.ndim == 4, kv.dim(0) == 1, kv.dim(1) == 1,
-                kv.dim(2) > 0, kv.dim(3) == 512, kv.dtype == q.dtype
+                kv.dim(2) > 0, kv.dim(2) <= Int(Int32.max), kv.dim(3) == 512, kv.dtype == q.dtype
             else { return false }
-            guard let mask = input.mask else { return true }
-            return mask.dtype == .bool && mask.shape == [1, 1, 1, kv.dim(2)]
+            guard let topk = input.topk else { return true }
+            return topk.dtype == .int32 && topk.ndim == 3
+                && topk.dim(0) == 1 && topk.dim(1) == 1 && topk.dim(2) > 0
         }
     }
 
     func callAsFunction(_ inputs: [GLM5NextAttentionInput]) -> [MLXArray] {
         guard supports(inputs) else { return inputs.map { $0.evaluate(scale: scale) } }
         // Keep each serial matmul's batch and true KV length; never pad or batch reductions.
-        return traced(inputs.flatMap { [$0.queries, $0.latent, $0.mask ?? MLXArray(false)] })
+        return traced(
+            inputs.flatMap {
+                [
+                    $0.queries, $0.latent, $0.topk ?? MLXArray(false),
+                    MLXArray(Int32($0.latent.dim(2))),
+                ]
+            })
     }
 }
 
@@ -1135,23 +1177,14 @@ final class GLM5NextAttention: Module {
         if let topk {
             if let deferred {
                 precondition(L == 1)
-                let T = latent.dim(2)
-                let K = topk.dim(-1)
-                let valid = logicalAnd(topk .>= 0, topk .< Int32(T))
-                let selected = take(
-                    latent.reshaped(T, latent.dim(3)),
-                    clip(topk, min: 0, max: max(T - 1, 0)).flattened(), axis: 0
-                )
-                .reshaped(1, 1, K, latent.dim(3))
-                deferred(
-                    .init(queries: qLatent, latent: selected, mask: valid.reshaped(1, 1, 1, K)))
+                deferred(.init(queries: qLatent, latent: latent, topk: topk))
                 return (qLatent, topk)
             }
             return (sparseAttention(qLatent, latent: latent, topk: topk), topk)
         }
         if let deferred {
             precondition(L == 1)
-            deferred(.init(queries: qLatent, latent: latent, mask: nil))
+            deferred(.init(queries: qLatent, latent: latent, topk: nil))
             return (qLatent, nil)
         }
         let mask: MLXFast.ScaledDotProductAttentionMaskMode =
