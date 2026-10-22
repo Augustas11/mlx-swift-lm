@@ -35,7 +35,7 @@ let glm5NextHCExpand: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXA
         return (expanded + mixed).asType(x.dtype)
     }
 
-private func makeLimitedSwiGLU(limit: Float?) -> @Sendable (MLXArray, MLXArray) -> MLXArray {
+func makeLimitedSwiGLU(limit: Float?) -> @Sendable (MLXArray, MLXArray) -> MLXArray {
     guard let limit else { return compiledSiluProduct }
     return compile(shapeless: true) { gate, up in
         silu(minimum(gate, limit)) * clip(up, min: -limit, max: limit)
@@ -77,17 +77,21 @@ final class GLM5NextHyperConnection: Module {
 
     private let sinkhorn: @Sendable (MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray, MLXArray)
 
-    init(_ config: GLM5NextConfiguration) {
-        let hc = config.hcMult
-        let iterations = config.hcSinkhornIters
-        let eps = config.hcEps
+    convenience init(_ config: GLM5NextConfiguration) {
+        self.init(
+            hcMult: config.hcMult, sinkhornIterations: config.hcSinkhornIters,
+            hcEps: config.hcEps, normEps: config.rmsNormEps, hiddenSize: config.hiddenSize)
+    }
+
+    /// Also DeepSeek-V4's `attn_hc`/`ffn_hc`, which share the math.
+    init(hcMult hc: Int, sinkhornIterations iterations: Int, hcEps eps: Float, normEps: Float, hiddenSize: Int) {
         self.hcMult = hc
-        self.normEps = config.rmsNormEps
+        self.normEps = normEps
         self.hcEps = eps
         self.sinkhornIterations = iterations
 
         let mix = (2 + hc) * hc
-        _fn.wrappedValue = MLXArray.zeros([mix, hc * config.hiddenSize], dtype: .float32)
+        _fn.wrappedValue = MLXArray.zeros([mix, hc * hiddenSize], dtype: .float32)
         _base.wrappedValue = MLXArray.zeros([mix], dtype: .float32)
         _scale.wrappedValue = MLXArray.ones([3], dtype: .float32)
 
