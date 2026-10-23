@@ -112,6 +112,35 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
+    /// The serving path (`TokenIterator`, whatever prefill step and chunking
+    /// the caller asks for) prefills with the reference plan, so it decodes
+    /// the step-2048 oracle cases exactly.
+    func testTokenIteratorUsesReferencePrefillPlan() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let dir = try fixture
+            let oracle = try JSONDecoder().decode(
+                Oracle.self, from: Data(contentsOf: dir.appendingPathComponent("oracle.json")))
+            let cases = oracle.cases.filter {
+                $0.prefillStep == DeepseekV4Model.prefillStepSize
+            }
+            XCTAssertEqual(cases.count, 2)
+            for item in cases {
+                let model = try loadTiny(indexBlock: item.indexBlock, indexKeep: item.indexKeep)
+                for chunking in [PrefillParameters.Chunking.remainder, .balanced, .unchunked] {
+                    let parameters = GenerateParameters(
+                        maxTokens: oracle.decode, temperature: 0,
+                        prefill: PrefillParameters(stepSize: 16, chunking: chunking))
+                    var iterator = try TokenIterator(
+                        input: LMInput(tokens: MLXArray(item.prompt.map(Int32.init))),
+                        model: model, parameters: parameters)
+                    var tokens = [Int]()
+                    while let token = iterator.next() { tokens.append(token) }
+                    XCTAssertEqual(tokens, item.greedy, "\(item.indexer) \(chunking)")
+                }
+            }
+        }
+    }
+
     func testPoolCacheCompletesWindowsAcrossChunksAndDecode() throws {
         try Device.withDefaultDevice(.cpu) {
             let cache = DeepseekV4PoolCache(ratio: 4)

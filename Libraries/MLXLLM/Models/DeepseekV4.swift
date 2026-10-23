@@ -979,6 +979,35 @@ public final class DeepseekV4Model: Module, LLMModel {
         return head(norm(hcHead(h)))
     }
 
+    /// The reference prefill step (mlx-vlm `generate_step` default).
+    public static let prefillStepSize = 2048
+
+    /// Prefill as mlx-vlm `generate_step` does: chunks of
+    /// `min(prefillStepSize, remaining - 1)` while more than one prompt token
+    /// is left, each followed by a cache eval, then the last token alone in
+    /// the iterator's first forward. The ratio-4 overlap pools borrow the
+    /// previous window only within one call, so the pools depend on the chunk
+    /// plan; the model fixes the plan the parity oracles were made with and
+    /// ignores the caller's step size and chunking.
+    public func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        let y = input.text
+        let total = y.tokens.size
+        var processed = 0
+        while total - processed > 1 {
+            try Task.checkCancellation()
+            let n = min(Self.prefillStepSize, total - processed - 1)
+            autoreleasepool {
+                _ = self(y[.newAxis, processed ..< processed + n].tokens, cache: cache)
+                eval(cache)
+            }
+            processed += n
+            prefill.progress?(processed, total)
+        }
+        return .tokens(y[processed...])
+    }
+
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         layers.map { layer -> KVCache in
             let window = RotatingKVCache(maxSize: configuration.slidingWindow)
