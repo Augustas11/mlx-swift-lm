@@ -183,6 +183,112 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
+    private func prefetchedRow(_ model: DeepseekV4Model, prompt: [Int]) throws -> [KVCache] {
+        let cache = try model.newCache(parameters: nil)
+        let input = LMInput(tokens: MLXArray(prompt.map(Int32.init)))
+        let result = try model.prepare(
+            input, cache: cache, state: nil, prefill: PrefillParameters(stepSize: 16))
+        guard case .tokens(let last) = result else {
+            XCTFail("DeepSeek V4 prepare must leave the last token for decode")
+            return cache
+        }
+        XCTAssertEqual(last.tokens.asArray(Int32.self), [Int32(prompt.last!)])
+        for (layer, item) in zip(model.layers, cache) {
+            XCTAssertEqual(
+                DeepseekV4LayerCache(item, ratio: layer.attn.ratio).local.offset, prompt.count - 1)
+        }
+        return cache
+    }
+
+    func testContinuousBatchGreedyParityAtOneTwoFourEightRows() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let lengths = [3, 6, 9, 13, 127, 128, 131, 137]
+            let prompts = lengths.enumerated().map { row, count in
+                (0 ..< count).map { ($0 * 7 + row * 11 + 2) % 128 }
+            }
+            for indexBlock in [0, 4] {
+                let model = try loadTiny(indexBlock: indexBlock, indexKeep: 2)
+                let count = 16
+                let serial = try prompts.map {
+                    try greedy(model, prompt: $0, step: DeepseekV4Model.prefillStepSize, count: count).0
+                }
+                for rows in [1, 2, 4, 8] {
+                    let caches = try prompts.prefix(rows).map { try prefetchedRow(model, prompt: $0) }
+                    var inputs = prompts.prefix(rows).map { Int32($0.last!) }
+                    var tokens = Array(repeating: [Int](), count: rows)
+                    for _ in 0 ..< count {
+                        let logits = model.decodeBatch(
+                            MLXArray(inputs).reshaped(rows, 1), rowCaches: caches)
+                        let next = argMax(logits, axis: -1).asArray(Int32.self)
+                        for row in 0 ..< rows { tokens[row].append(Int(next[row])) }
+                        inputs = next
+                        eval(caches.flatMap { $0 })
+                    }
+                    XCTAssertEqual(tokens, Array(serial.prefix(rows)), "rows=\(rows) block=\(indexBlock)")
+                }
+            }
+        }
+    }
+
+    func testContinuousBatchRowsJoinLeaveAndReorderWithoutChangingTokens() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = try loadTiny(indexBlock: 4, indexKeep: 2)
+            let prompts = [7, 31, 127, 130].enumerated().map { row, count in
+                (0 ..< count).map { ($0 * 3 + row * 17) % 128 }
+            }
+            let serial = try prompts.map {
+                try greedy(model, prompt: $0, step: DeepseekV4Model.prefillStepSize, count: 16).0
+            }
+            var caches = [Int: [KVCache]]()
+            var inputs = prompts.map { Int32($0.last!) }
+            var positions = Array(repeating: 0, count: prompts.count)
+            let schedule = [[0, 1], [1, 0], [1, 0, 2], [2, 1], [3, 2], [0, 3, 2], [2], [3, 0]]
+            for active in schedule {
+                for row in active where caches[row] == nil {
+                    caches[row] = try prefetchedRow(model, prompt: prompts[row])
+                }
+                let next = argMax(
+                    model.decodeBatch(
+                        MLXArray(active.map { inputs[$0] }).reshaped(active.count, 1),
+                        rowCaches: active.map { caches[$0]! }), axis: -1).asArray(Int32.self)
+                for (slot, row) in active.enumerated() {
+                    XCTAssertEqual(Int(next[slot]), serial[row][positions[row]], "row=\(row)")
+                    inputs[row] = next[slot]
+                    positions[row] += 1
+                }
+                for row in caches.keys {
+                    for (layer, item) in zip(model.layers, caches[row]!) {
+                        XCTAssertEqual(
+                            DeepseekV4LayerCache(item, ratio: layer.attn.ratio).local.offset,
+                            prompts[row].count - 1 + positions[row])
+                    }
+                }
+            }
+        }
+    }
+
+    func testPoolCacheIncompleteMultiTokenContinuationPreservesBufferedPrefix() throws {
+        try Device.withDefaultDevice(.cpu) {
+            for ratio in [4, 128] {
+                let cache = DeepseekV4PoolCache(ratio: ratio)
+                let values = MLXArray(0 ..< ratio).asType(.float32).reshaped(1, ratio, 1)
+                let gates = values + 1000
+                _ = cache.accumulateWindows(
+                    kv: values[0..., ..<1], gate: gates[0..., ..<1], offset: 0)
+                var ready = cache.accumulateWindows(
+                    kv: values[0..., 1 ..< 3], gate: gates[0..., 1 ..< 3], offset: 1)
+                XCTAssertEqual(ready.kv.dim(1), 0)
+                XCTAssertEqual(cache.remainder, 3)
+                ready = cache.accumulateWindows(
+                    kv: values[0..., 3...], gate: gates[0..., 3...], offset: 3)
+                XCTAssertEqual(ready.kv.asArray(Float.self), (0 ..< ratio).map(Float.init))
+                XCTAssertEqual(ready.gate.asArray(Float.self), (0 ..< ratio).map { Float($0 + 1000) })
+                XCTAssertEqual(ready.base, 0)
+                XCTAssertEqual(cache.remainder, 0)
+            }
+        }
+    }
+
     func testArtifactConfigurationTakesOneRatioPerLayer() throws {
         let ratios = [0, 0] + (0 ..< 20).flatMap { _ in [4, 128] } + [4, 0, 0, 0]
         let json = """

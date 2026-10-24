@@ -737,6 +737,31 @@ final class DeepseekV4Attention: Module {
         return woB(out)
     }
 
+    /// Project all decode rows together, then attend each row at its own
+    /// offset against its own window, compressor and indexer state.
+    func decodeBatch(_ x: MLXArray, caches: [DeepseekV4LayerCache]) -> MLXArray {
+        let B = x.dim(0)
+        let qResidual = qNorm(wqA(x))
+        let q = MLXFast.rmsNorm(
+            wqB(qResidual).reshaped(B, 1, heads, headDim),
+            weight: MLXArray.mlxNone, eps: normEps).transposed(0, 2, 1, 3)
+        let kv = kvNorm(wkv(x)).reshaped(B, 1, 1, headDim)
+        var attended = [MLXArray]()
+        for (i, cache) in caches.enumerated() {
+            let row = i ..< (i + 1)
+            let offset = cache.local.offset
+            let out = attend(
+                x[row], q: rope(q[row], offset: offset), kv: rope(kv[row], offset: offset),
+                qResidual: qResidual[row], mask: nil, cache: cache, offset: offset)
+            attended.append(rope(out, offset: offset, inverse: true))
+        }
+        var out = concatenated(attended, axis: 0)
+        out = out.reshaped(B, groups, heads / groups, 1, headDim).transposed(0, 1, 3, 2, 4)
+            .reshaped(B, groups, 1, heads / groups * headDim)
+        out = callMultiLinear(woA, out)
+        return woB(out.transposed(0, 2, 1, 3).reshaped(B, 1, -1))
+    }
+
     private func attend(
         _ x: MLXArray, q: MLXArray, kv: MLXArray, qResidual: MLXArray, mask: MLXArray?,
         cache: DeepseekV4LayerCache, offset: Int
@@ -902,6 +927,16 @@ final class DeepseekV4Block: Module {
         let (ffnInput, ffnPost, ffnComb) = ffnHC.normalizedBranchInput(h, norm: ffnNorm)
         return glm5NextHCExpand(ffn(ffnInput, inputIDs: inputIDs), h, ffnPost, ffnComb)
     }
+
+    func decodeBatch(
+        _ h: MLXArray, caches: [DeepseekV4LayerCache], inputIDs: MLXArray
+    ) -> MLXArray {
+        let (attnInput, attnPost, attnComb) = attnHC.normalizedBranchInput(h, norm: attnNorm)
+        let h = glm5NextHCExpand(
+            attn.decodeBatch(attnInput, caches: caches), h, attnPost, attnComb)
+        let (ffnInput, ffnPost, ffnComb) = ffnHC.normalizedBranchInput(h, norm: ffnNorm)
+        return glm5NextHCExpand(ffn(ffnInput, inputIDs: inputIDs), h, ffnPost, ffnComb)
+    }
 }
 
 /// A layer's caches: the 128-token window, plus the attention pool on
@@ -975,6 +1010,25 @@ public final class DeepseekV4Model: Module, LLMModel {
 
         for (layer, layerCache) in zip(layers, layerCaches) {
             h = layer(h, mask: mask, cache: layerCache, inputIDs: inputs)
+        }
+        return head(norm(hcHead(h)))
+    }
+
+    /// One token per independently prefetched row. Each row owns ordinary
+    /// `newCache` caches and may join, leave or change batch position between
+    /// calls. Prefill each row with `prepare` before admitting its last token.
+    /// Only projections and MoE are batched; ragged attention never pads or
+    /// changes the reference pooling boundaries.
+    public func decodeBatch(_ inputs: MLXArray, rowCaches: [[KVCache]]) -> MLXArray {
+        precondition(inputs.ndim == 2 && inputs.dim(1) == 1)
+        precondition((1 ... 8).contains(inputs.dim(0)), "DeepSeek V4 decode supports 1...8 rows")
+        precondition(rowCaches.count == inputs.dim(0))
+        precondition(rowCaches.allSatisfy { $0.count == layers.count })
+        var h = repeated(
+            expandedDimensions(embed(inputs), axis: 2), count: configuration.hcMult, axis: 2)
+        for (i, layer) in layers.enumerated() {
+            let caches = rowCaches.map { DeepseekV4LayerCache($0[i], ratio: layer.attn.ratio) }
+            h = layer.decodeBatch(h, caches: caches, inputIDs: inputs)
         }
         return head(norm(hcHead(h)))
     }

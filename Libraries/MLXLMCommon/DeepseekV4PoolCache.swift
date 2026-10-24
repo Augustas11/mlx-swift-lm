@@ -72,8 +72,11 @@ public final class DeepseekV4PoolCache: BaseKVCache {
                 remainder = 0
             }
             if newRemainder > 0 {
-                bufferKV![0..., remainder ..< newRemainder] = kv[0..., (L - newRemainder)...]
-                bufferGate![0..., remainder ..< newRemainder] = gate[0..., (L - newRemainder)...]
+                // With no completed window the existing remainder stays in
+                // place; only the new chunk belongs after it.
+                let take = newRemainder - remainder
+                bufferKV![0..., remainder ..< newRemainder] = kv[0..., (L - take)...]
+                bufferGate![0..., remainder ..< newRemainder] = gate[0..., (L - take)...]
             }
             remainder = newRemainder
             return ready
