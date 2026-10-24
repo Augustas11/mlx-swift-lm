@@ -891,6 +891,11 @@ final class DeepseekV4HyperHead: Module {
         let pre = sigmoid(matmul(z, fn.T) * scale + base) + hcEps
         return (expandedDimensions(pre, axis: -1) * y).sum(axis: 2).asType(x.dtype)
     }
+
+    func decodeBatch(_ x: MLXArray) -> MLXArray {
+        guard Device.defaultDevice().deviceType == .cpu, x.dim(0) > 1 else { return self(x) }
+        return concatenated((0 ..< x.dim(0)).map { self(x[$0 ..< ($0 + 1)]) }, axis: 0)
+    }
 }
 
 // MARK: - Decoder
@@ -931,11 +936,30 @@ final class DeepseekV4Block: Module {
     func decodeBatch(
         _ h: MLXArray, caches: [DeepseekV4LayerCache], inputIDs: MLXArray
     ) -> MLXArray {
-        let (attnInput, attnPost, attnComb) = attnHC.normalizedBranchInput(h, norm: attnNorm)
+        let (attnInput, attnPost, attnComb) = decodeBranchInput(attnHC, h, norm: attnNorm)
         let h = glm5NextHCExpand(
             attn.decodeBatch(attnInput, caches: caches), h, attnPost, attnComb)
-        let (ffnInput, ffnPost, ffnComb) = ffnHC.normalizedBranchInput(h, norm: ffnNorm)
+        let (ffnInput, ffnPost, ffnComb) = decodeBranchInput(ffnHC, h, norm: ffnNorm)
         return glm5NextHCExpand(ffn(ffnInput, inputIDs: inputIDs), h, ffnPost, ffnComb)
+    }
+
+    private func decodeBranchInput(
+        _ hc: GLM5NextHyperConnection, _ h: MLXArray, norm: RMSNorm
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        // CPU GEMM changes the float32 mix reduction at eight rows; a tiny
+        // post/comb delta can change a later bf16 rounding and greedy token.
+        // GPU fused HC already evaluates each row with serial arithmetic.
+        guard Device.defaultDevice().deviceType == .cpu, h.dim(0) > 1 else {
+            return hc.normalizedBranchInput(h, norm: norm)
+        }
+        let rows = (0 ..< h.dim(0)).map {
+            hc.normalizedBranchInput(h[$0 ..< ($0 + 1)], norm: norm)
+        }
+        return (
+            concatenated(rows.map { $0.0 }, axis: 0),
+            concatenated(rows.map { $0.1 }, axis: 0),
+            concatenated(rows.map { $0.2 }, axis: 0)
+        )
     }
 }
 
@@ -1030,7 +1054,7 @@ public final class DeepseekV4Model: Module, LLMModel {
             let caches = rowCaches.map { DeepseekV4LayerCache($0[i], ratio: layer.attn.ratio) }
             h = layer.decodeBatch(h, caches: caches, inputIDs: inputs)
         }
-        return head(norm(hcHead(h)))
+        return head(norm(hcHead.decodeBatch(h)))
     }
 
     /// The reference prefill step (mlx-vlm `generate_step` default).
