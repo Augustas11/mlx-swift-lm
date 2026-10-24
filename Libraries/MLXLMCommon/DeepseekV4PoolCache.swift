@@ -23,7 +23,13 @@ public final class DeepseekV4PoolCache: BaseKVCache {
     public private(set) var remainder = 0
 
     /// `[B, P, D]` compressed entries in token order, or `nil` before the first window.
-    public private(set) var pooled: MLXArray?
+    private var pooledStorage: MLXArray?
+    private var count = 0
+
+    public var pooled: MLXArray? {
+        guard let pooledStorage else { return nil }
+        return pooledStorage[0..., ..<count]
+    }
 
     public init(ratio: Int) {
         precondition(ratio > 0)
@@ -32,10 +38,10 @@ public final class DeepseekV4PoolCache: BaseKVCache {
     }
 
     /// Compressed entries held (the reference's `offset`).
-    public var pooledCount: Int { pooled?.dim(1) ?? 0 }
+    public var pooledCount: Int { count }
 
     public override func innerState() -> [MLXArray] {
-        [bufferKV, bufferGate, pooled].compactMap { $0 }
+        [bufferKV, bufferGate, pooledStorage].compactMap { $0 }
     }
 
     /// Rows of every window this call completes, `[B, W * ratio, D]` (empty
@@ -94,8 +100,17 @@ public final class DeepseekV4PoolCache: BaseKVCache {
 
     /// Append `[B, W, D]` new entries and return the whole pool (`[B, 0, D]` while empty).
     public func appendPooled(_ entries: MLXArray) -> MLXArray {
-        if entries.dim(1) > 0 {
-            pooled = pooled.map { concatenated([$0, entries], axis: 1) } ?? entries
+        let added = entries.dim(1)
+        if added > 0 {
+            let capacity = pooledStorage?.dim(1) ?? 0
+            if count + added > capacity {
+                let newCapacity = max(count + added, max(16, capacity * 2))
+                let reserve = MLXArray.zeros(
+                    [entries.dim(0), newCapacity - capacity, entries.dim(2)], dtype: entries.dtype)
+                pooledStorage = pooledStorage.map { concatenated([$0, reserve], axis: 1) } ?? reserve
+            }
+            pooledStorage![0..., count ..< (count + added)] = entries
+            count += added
         }
         return pooled ?? entries
     }
@@ -113,14 +128,15 @@ public final class DeepseekV4PoolCache: BaseKVCache {
     /// `[]`, `[bufferKV, bufferGate]` or `[bufferKV, bufferGate, pooled]`: the
     /// buffers exist from the first call on, before any entry is pooled.
     public override var state: [MLXArray] {
-        get { innerState() }
+        get { [bufferKV, bufferGate, pooled].compactMap { $0 } }
         set {
             guard [0, 2, 3].contains(newValue.count) else {
                 fatalError("DeepseekV4PoolCache state must have 0, 2 or 3 arrays")
             }
             bufferKV = newValue.count >= 2 ? newValue[0] : nil
             bufferGate = newValue.count >= 2 ? newValue[1] : nil
-            pooled = newValue.count == 3 ? newValue[2] : nil
+            pooledStorage = newValue.count == 3 ? newValue[2] : nil
+            count = pooledStorage?.dim(1) ?? 0
         }
     }
 
@@ -137,7 +153,8 @@ public final class DeepseekV4PoolCache: BaseKVCache {
         let new = DeepseekV4PoolCache(ratio: ratio)
         new.bufferKV = bufferKV?[.ellipsis]
         new.bufferGate = bufferGate?[.ellipsis]
-        new.pooled = pooled?[.ellipsis]
+        new.pooledStorage = pooledStorage?[.ellipsis]
+        new.count = count
         new.remainder = remainder
         return new
     }

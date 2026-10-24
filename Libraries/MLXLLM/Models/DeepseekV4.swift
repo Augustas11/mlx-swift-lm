@@ -291,6 +291,15 @@ final class DeepseekV4RoPE {
         return f
     }
 
+    /// Each batch row starts at its own absolute token position.
+    func callAsFunction(_ x: MLXArray, offsets: MLXArray, inverse: Bool = false) -> MLXArray {
+        let headDim = x.dim(-1)
+        return MLXFast.RoPE(
+            x, dimensions: headDim, traditional: true, base: nil, scale: 1,
+            offset: freqScale != 1 ? offsets.floorDivide(Int32(freqScale)) : offsets,
+            freqs: frequencies(headDim: headDim, inverse: inverse))
+    }
+
     /// Rotate `[..., T, headDim]` at positions `offset ..< offset + T`.
     func callAsFunction(_ x: MLXArray, offset: Int, inverse: Bool = false) -> MLXArray {
         let headDim = x.dim(-1)
@@ -470,6 +479,40 @@ final class DeepseekV4Compressor: Module {
         super.init()
     }
 
+    /// Projections and completed-window compression are shared across decode rows.
+    func decodeBatch(_ x: MLXArray, caches: [DeepseekV4PoolCache], offsets: [Int]) -> [MLXArray] {
+        let kv = wkv(x)
+        let gate = wgate(x)
+        var readyKV = [MLXArray]()
+        var readyGate = [MLXArray]()
+        var completed = [Int]()
+        var bases = [Int32]()
+        for row in caches.indices {
+            let ready = caches[row].accumulateWindows(
+                kv: kv[row ..< (row + 1)], gate: gate[row ..< (row + 1)], offset: offsets[row])
+            if ready.kv.dim(1) > 0 {
+                completed.append(row)
+                bases.append(Int32(ready.base))
+                readyKV.append(ready.kv)
+                readyGate.append(ready.gate)
+            }
+        }
+        if !completed.isEmpty {
+            let kv = concatenated(readyKV, axis: 0).reshaped(completed.count, 1, ratio, -1)
+            let gate = concatenated(readyGate, axis: 0).reshaped(completed.count, 1, ratio, -1)
+            var entries = overlap
+                ? deepseekV4OverlapCompress(kv, gate, ape) : deepseekV4SimpleCompress(kv, gate, ape)
+            entries = rope(
+                expandedDimensions(norm(entries), axis: 1), offsets: MLXArray(bases))
+                .squeezed(axis: 1)
+            for (slot, row) in completed.enumerated() {
+                _ = caches[row].appendPooled(entries[slot ..< (slot + 1)])
+            }
+        }
+        let empty = MLXArray.zeros([1, 0, headDim], dtype: x.dtype)
+        return caches.map { $0.pooled ?? empty }
+    }
+
     /// The whole pool `[B, P, headDim]` after adding the windows that
     /// `x` (`[B, L, hidden]`, tokens `offset ..< offset + L`) completes.
     func callAsFunction(_ x: MLXArray, cache: DeepseekV4PoolCache, offset: Int) -> MLXArray {
@@ -518,6 +561,75 @@ final class DeepseekV4Indexer: Module {
         _weightsProj.wrappedValue = Linear(config.hiddenSize, heads, bias: false)
         _compressor.wrappedValue = DeepseekV4Compressor(config, ratio: ratio, headDim: headDim)
         super.init()
+    }
+
+    /// Ragged pools share one query/weight projection and one scoring graph.
+    /// Rows below top-k retain their pool's original order.
+    func decodeBatch(
+        _ x: MLXArray, qResidual: MLXArray, rope: DeepseekV4RoPE, pools: [MLXArray],
+        offsets: MLXArray
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let counts = pools.map { $0.dim(1) }
+        let poolCount = counts.max()!
+        let k = min(topK, poolCount)
+        let pooled = concatenated(pools.map { pool in
+            let padding = poolCount - pool.dim(1)
+            return padding == 0 ? pool : concatenated([
+                pool, MLXArray.zeros([1, padding, headDim], dtype: pool.dtype),
+            ], axis: 1)
+        }, axis: 0)
+        let q = rope(
+            wqB(qResidual).reshaped(B, 1, heads, headDim).transposed(0, 2, 1, 3), offsets: offsets)
+            .asType(.float32)
+        let weights = weightsProj(x).asType(.float32) * pow(Float(heads), -0.5)
+        let wq = expandedDimensions(weights.swappedAxes(-1, -2), axis: -1)
+        let lengths = MLXArray(counts.map(Int32.init)).reshaped(B, 1, 1)
+        let masked = MLXArray(-Float.greatestFiniteMagnitude)
+        var scores = maximum(
+            matmul(q, expandedDimensions(pooled, axis: 1).swappedAxes(-1, -2).asType(.float32)), 0)
+        scores = (scores * scale * wq).sum(axis: 1)
+        scores = MLX.where(
+            MLXArray.arange(poolCount, dtype: .int32).reshaped(1, 1, poolCount) .< lengths,
+            scores, masked)
+        var selected = argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k].asType(.int32)
+
+        let hisaRows = counts.map { block > 0 && keep > 0 && $0 >= block * keep && keep * block >= min(topK, $0) }
+        if hisaRows.contains(true) {
+            let blocks = poolCount / block
+            let usable = blocks * block
+            let rep = pooled[0..., ..<usable].reshaped(B, blocks, block, headDim).mean(axis: 2)
+            var coarse = maximum(
+                matmul(q, expandedDimensions(rep, axis: 1).swappedAxes(-1, -2).asType(.float32)), 0)
+            coarse = (coarse * scale * wq).sum(axis: 1)
+            let completeBlocks = MLXArray(counts.map { Int32($0 / block) }).reshaped(B, 1, 1)
+            coarse = MLX.where(
+                MLXArray.arange(blocks, dtype: .int32).reshaped(1, 1, blocks) .< completeBlocks,
+                coarse, masked)
+            let kept = min(keep, blocks)
+            let topBlocks = argPartition(-coarse, kth: kept - 1, axis: -1)[.ellipsis, ..<kept]
+                .asType(.int32)
+            let candidates = kept * block
+            let positions = (expandedDimensions(topBlocks, axis: -1) * Int32(block)
+                + MLXArray.arange(block, dtype: .int32)).reshaped(B, 1, candidates)
+            let gather = broadcast(positions.reshaped(B, candidates, 1), to: [B, candidates, headDim])
+            let candidateKeys = takeAlong(pooled, gather, axis: 1)
+            var fine = maximum(
+                matmul(q, expandedDimensions(candidateKeys, axis: 1).swappedAxes(-1, -2).asType(.float32)), 0)
+            fine = (fine * scale * wq).sum(axis: 1)
+            let selectedCount = min(k, candidates)
+            let fineTop = argPartition(-fine, kth: selectedCount - 1, axis: -1)[.ellipsis, ..<selectedCount]
+            var hisa = takeAlong(positions, fineTop, axis: -1)
+            if selectedCount < k {
+                hisa = concatenated([hisa, MLXArray.zeros([B, 1, k - selectedCount], dtype: .int32)], axis: -1)
+            }
+            selected = MLX.where(MLXArray(hisaRows).reshaped(B, 1, 1), hisa, selected)
+        }
+        let original = broadcast(MLXArray.arange(k, dtype: .int32).reshaped(1, 1, k), to: [B, 1, k])
+        // Padded positions must be valid gather indices even for an empty row.
+        return MLX.where(
+            lengths .> Int32(topK), selected,
+            minimum(original, maximum(lengths - Int32(1), Int32(0))))
     }
 
     /// `[B, L, k]` pooled indices, or `nil` while the pool is empty.
@@ -737,25 +849,90 @@ final class DeepseekV4Attention: Module {
         return woB(out)
     }
 
-    /// Project all decode rows together, then attend each row at its own
-    /// offset against its own window, compressor and indexer state.
+    /// Only cache slice writes remain row-local. All attention arithmetic is batched.
     func decodeBatch(_ x: MLXArray, caches: [DeepseekV4LayerCache]) -> MLXArray {
         let B = x.dim(0)
+        let offsets = caches.map { $0.local.offset }
+        let offsetArray = MLXArray(offsets.map(Int32.init))
         let qResidual = qNorm(wqA(x))
-        let q = MLXFast.rmsNorm(
-            wqB(qResidual).reshaped(B, 1, heads, headDim),
-            weight: MLXArray.mlxNone, eps: normEps).transposed(0, 2, 1, 3)
-        let kv = kvNorm(wkv(x)).reshaped(B, 1, 1, headDim)
-        var attended = [MLXArray]()
-        for (i, cache) in caches.enumerated() {
-            let row = i ..< (i + 1)
-            let offset = cache.local.offset
-            let out = attend(
-                x[row], q: rope(q[row], offset: offset), kv: rope(kv[row], offset: offset),
-                qResidual: qResidual[row], mask: nil, cache: cache, offset: offset)
-            attended.append(rope(out, offset: offset, inverse: true))
+        let q = rope(
+            MLXFast.rmsNorm(
+                wqB(qResidual).reshaped(B, 1, heads, headDim),
+                weight: MLXArray.mlxNone, eps: normEps).transposed(0, 2, 1, 3),
+            offsets: offsetArray)
+        let kv = rope(kvNorm(wkv(x)).reshaped(B, 1, 1, headDim), offsets: offsetArray)
+        let emptyValues = MLXArray.zeros([B, 1, 1, 0], dtype: kv.dtype)
+        let windows = caches.enumerated().map { row, cache in
+            cache.local.update(
+                keys: kv[row ..< (row + 1)], values: emptyValues[row ..< (row + 1)]).0
         }
-        var out = concatenated(attended, axis: 0)
+        let localLength = windows.map { $0.dim(2) }.max()!
+        let local = concatenated(windows.map { window in
+            let padding = localLength - window.dim(2)
+            return padding == 0 ? window : concatenated([
+                window, MLXArray.zeros([1, 1, padding, headDim], dtype: window.dtype),
+            ], axis: 2)
+        }, axis: 0)
+        let localMask = MLXArray.arange(localLength, dtype: .int32).reshaped(1, 1, 1, localLength)
+            .< MLXArray(windows.map { Int32($0.dim(2)) }).reshaped(B, 1, 1, 1)
+
+        var keys = local
+        var mask = localMask
+        var sparseOutput: MLXArray?
+        var sparseRows = Array(repeating: false, count: B)
+        if let compressor {
+            let pools = compressor.decodeBatch(x, caches: caches.map { $0.pool! }, offsets: offsets)
+            // The index pool must advance even before selection becomes necessary.
+            let indexPools = indexer?.compressor.decodeBatch(
+                x, caches: caches.map { $0.indexPool! }, offsets: offsets)
+            let poolLength = pools.map { $0.dim(1) }.max()!
+            if poolLength > 0 {
+                let counts = pools.map { $0.dim(1) }
+                let pooled = concatenated(pools.map { pool in
+                    let padding = poolLength - pool.dim(1)
+                    return padding == 0 ? pool : concatenated([
+                        pool, MLXArray.zeros([1, padding, headDim], dtype: pool.dtype),
+                    ], axis: 1)
+                }, axis: 0)
+                let poolKeys: MLXArray
+                let poolMask: MLXArray
+                if let indexer, let indexPools, poolLength > indexer.topK {
+                    let selected = indexer.decodeBatch(
+                        x, qResidual: qResidual, rope: rope, pools: indexPools,
+                        offsets: offsetArray)
+                    let k = selected.dim(2)
+                    let gather = broadcast(selected.reshaped(B, k, 1), to: [B, k, headDim])
+                    poolKeys = expandedDimensions(takeAlong(pooled, gather, axis: 1), axis: 1)
+                    poolMask = MLXArray.arange(k, dtype: .int32).reshaped(1, 1, 1, k)
+                        .< MLXArray(counts.map { Int32(min($0, indexer.topK)) }).reshaped(B, 1, 1, 1)
+                    sparseRows = counts.map { $0 > indexer.topK }
+                    sparseOutput = sparsePooledAttention(
+                        q: q, local: local, pooled: pooled, topk: selected,
+                        localMask: localMask, pooledMask: poolMask, sinks: attnSink.asType(q.dtype))
+                } else {
+                    poolKeys = expandedDimensions(pooled, axis: 1)
+                    poolMask = MLXArray.arange(poolLength, dtype: .int32).reshaped(1, 1, 1, poolLength)
+                        .< MLXArray(counts.map(Int32.init)).reshaped(B, 1, 1, 1)
+                }
+                keys = concatenated([local, poolKeys], axis: 2)
+                mask = concatenated([localMask, poolMask], axis: -1)
+            }
+        }
+        let attended: MLXArray
+        if let sparseOutput {
+            if sparseRows.allSatisfy({ $0 }) {
+                attended = sparseOutput
+            } else {
+                // Dense and sparse serial attention use different reduction orders.
+                // Keep both batched bodies for mixed rows, never one body per row.
+                attended = MLX.where(
+                    MLXArray(sparseRows).reshaped(B, 1, 1, 1), sparseOutput,
+                    sdpa(q, keys, mask: mask, sinks: attnSink.asType(q.dtype)))
+            }
+        } else {
+            attended = sdpa(q, keys, mask: mask, sinks: attnSink.asType(q.dtype))
+        }
+        var out = rope(attended, offsets: offsetArray, inverse: true)
         out = out.reshaped(B, groups, heads / groups, 1, headDim).transposed(0, 1, 3, 2, 4)
             .reshaped(B, groups, 1, heads / groups * headDim)
         out = callMultiLinear(woA, out)
@@ -767,7 +944,8 @@ final class DeepseekV4Attention: Module {
         cache: DeepseekV4LayerCache, offset: Int
     ) -> MLXArray {
         let L = x.dim(1)
-        let (local, _) = cache.local.update(keys: kv, values: kv)
+        let (local, _) = cache.local.update(
+            keys: kv, values: MLXArray.zeros([kv.dim(0), 1, L, 0], dtype: kv.dtype))
         let localMask = alignLocalMask(mask, length: local.dim(2))
         let sinks = attnSink.asType(q.dtype)
 

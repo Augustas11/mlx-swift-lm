@@ -230,6 +230,34 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
+    func testContinuousBatchLongContextGreedyParityAtOneTwoFourEightRows() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let prompts = [31, 32, 33, 127, 128, 129, 131, 137].enumerated().map { row, count in
+                (0 ..< count).map { ($0 * 7 + row * 11 + 2) % 128 }
+            }
+            for indexBlock in [0, 4] {
+                let model = try loadTiny(indexBlock: indexBlock, indexKeep: 2)
+                let serial = try prompts.map {
+                    try greedy(model, prompt: $0, step: DeepseekV4Model.prefillStepSize, count: 4).0
+                }
+                for rows in [1, 2, 4, 8] {
+                    let caches = try prompts.prefix(rows).map { try prefetchedRow(model, prompt: $0) }
+                    var inputs = prompts.prefix(rows).map { Int32($0.last!) }
+                    for step in 0 ..< 4 {
+                        let next = argMax(
+                            model.decodeBatch(MLXArray(inputs).reshaped(rows, 1), rowCaches: caches),
+                            axis: -1).asArray(Int32.self)
+                        XCTAssertEqual(
+                            next.map(Int.init), serial.prefix(rows).map { $0[step] },
+                            "long rows=\(rows) block=\(indexBlock) step=\(step)")
+                        inputs = next
+                        eval(caches.flatMap { $0 })
+                    }
+                }
+            }
+        }
+    }
+
     func testContinuousBatchRowsJoinLeaveAndReorderWithoutChangingTokens() throws {
         try Device.withDefaultDevice(.cpu) {
             let model = try loadTiny(indexBlock: 4, indexKeep: 2)
@@ -264,6 +292,106 @@ final class DeepseekV4Tests: XCTestCase {
                     }
                 }
             }
+        }
+    }
+
+    func testBatchedRoPEKeepsPerRowOffsetsAndInverse() throws {
+        Device.withDefaultDevice(.cpu) {
+            let rope = DeepseekV4RoPE(dims: 16, base: 160000, scaling: nil)
+            let offsets = [0, 3, 127, 128]
+            let x = (MLXArray.arange(4 * 2 * 64, dtype: .float32) / 97).reshaped(4, 2, 1, 64)
+            for inverse in [false, true] {
+                let batched = rope(x, offsets: MLXArray(offsets.map(Int32.init)), inverse: inverse)
+                let serial = concatenated(offsets.enumerated().map { row, offset in
+                    rope(x[row ..< (row + 1)], offset: offset, inverse: inverse)
+                }, axis: 0)
+                XCTAssertEqual(batched.asArray(Float.self), serial.asArray(Float.self))
+            }
+        }
+    }
+
+    func testBatchedCompressorMatchesIndependentRaggedWindows() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = try loadTiny(indexBlock: 4, indexKeep: 2)
+            for layer in model.layers where layer.attn.ratio > 0 {
+                let compressor = try XCTUnwrap(layer.attn.compressor)
+                let ratio = layer.attn.ratio
+                let starts = [0, ratio - 2, ratio - 1, ratio * 2 - 1]
+                let batchedCaches = starts.map { _ in DeepseekV4PoolCache(ratio: ratio) }
+                let serialCaches = starts.map { _ in DeepseekV4PoolCache(ratio: ratio) }
+                for row in starts.indices where starts[row] > 0 {
+                    let prefix = sin(MLXArray.arange(starts[row] * 64, dtype: .float32) / 17)
+                        .reshaped(1, starts[row], 64)
+                    _ = compressor(prefix, cache: batchedCaches[row], offset: 0)
+                    _ = compressor(prefix, cache: serialCaches[row], offset: 0)
+                }
+                for step in 0 ..< 4 {
+                    let x = cos(MLXArray.arange(starts.count * 64, dtype: .float32) / Float(step + 3))
+                        .reshaped(starts.count, 1, 64)
+                    let actual = compressor.decodeBatch(
+                        x, caches: batchedCaches, offsets: starts.map { $0 + step })
+                    for row in starts.indices {
+                        let expected = compressor(
+                            x[row ..< (row + 1)], cache: serialCaches[row], offset: starts[row] + step)
+                        XCTAssertEqual(batchedCaches[row].remainder, serialCaches[row].remainder)
+                        XCTAssertEqual(actual[row].shape, expected.shape)
+                        if expected.size > 0 {
+                            XCTAssertLessThan(
+                                abs(actual[row] - expected).max().item(Float.self), 1e-5,
+                                "ratio=\(ratio) row=\(row) step=\(step)")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func testContinuousBatchUsesKeysOnlyWindowsAndIndependentPoolSnapshots() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = try loadTiny(indexBlock: 4, indexKeep: 2)
+            let prompts = [1, 3, 31, 32, 33, 127, 128, 129].enumerated().map { row, count in
+                (0 ..< count).map { ($0 * 5 + row * 7) % 128 }
+            }
+            let serial = try prompts.map {
+                try greedy(model, prompt: $0, step: DeepseekV4Model.prefillStepSize, count: 4).0
+            }
+            let caches = try prompts.map { try prefetchedRow(model, prompt: $0) }
+            var inputs = prompts.map { Int32($0.last!) }
+            for step in 0 ..< 4 {
+                let next = argMax(
+                    model.decodeBatch(MLXArray(inputs).reshaped(8, 1), rowCaches: caches), axis: -1)
+                    .asArray(Int32.self)
+                XCTAssertEqual(next.map(Int.init), serial.map { $0[step] })
+                for row in caches {
+                    for (layer, item) in zip(model.layers, row) {
+                        let local = DeepseekV4LayerCache(item, ratio: layer.attn.ratio).local
+                        XCTAssertEqual(local.state.count, 2)
+                        XCTAssertEqual(local.state[1].dim(-1), 0)
+                    }
+                }
+                inputs = next
+            }
+
+            let cache = DeepseekV4PoolCache(ratio: 4)
+            _ = cache.accumulateWindows(
+                kv: MLXArray.zeros([1, 1, 1]), gate: MLXArray.zeros([1, 1, 1]), offset: 0)
+            _ = cache.appendPooled(MLXArray([Float(2), 3]).reshaped(1, 2, 1))
+            let snapshot = cache.copy() as! DeepseekV4PoolCache
+            _ = cache.appendPooled(MLXArray([Float(4)]).reshaped(1, 1, 1))
+            XCTAssertEqual(snapshot.pooled!.asArray(Float.self), [2, 3])
+            XCTAssertEqual(cache.pooled!.asArray(Float.self), [2, 3, 4])
+            XCTAssertEqual(cache.state.last!.dim(1), 3)
+            let restored = DeepseekV4PoolCache(ratio: 4)
+            restored.state = cache.state
+            restored.metaState = cache.metaState
+            _ = restored.appendPooled(MLXArray([Float(5)]).reshaped(1, 1, 1))
+            XCTAssertEqual(restored.pooled!.asArray(Float.self), [2, 3, 4, 5])
+            XCTAssertEqual(cache.pooled!.asArray(Float.self), [2, 3, 4])
+            _ = restored.appendPooled(MLXArray(6 ..< 25).asType(.float32).reshaped(1, 19, 1))
+            XCTAssertEqual(restored.pooledCount, 23)
+            XCTAssertEqual(restored.pooled!.asArray(Float.self), (2 ..< 25).map(Float.init))
+            XCTAssertEqual(restored.state.last!.dim(1), 23)
+            XCTAssertEqual(snapshot.pooled!.asArray(Float.self), [2, 3])
         }
     }
 
