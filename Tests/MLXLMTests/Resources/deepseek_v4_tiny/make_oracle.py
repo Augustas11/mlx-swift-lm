@@ -3,8 +3,9 @@
 `make_fixture.py` writes the weights (`config.json`, `model.safetensors`).
 This script writes `oracle.json` from the TensorFold MLX port of DeepSeek's
 `inference/model.py` + `kernel.py` (`deepseek_v4.py` in the
-`DeepSeek-V4-Flash-0731-MXFP4-MLX` repository), with its `hc_post` stream mix
-and its sparse attention's bf16 weight rounding corrected to DeepSeek's: fp32
+`DeepSeek-V4-Flash-0731-MXFP4-MLX` repository), with its `hc_post` stream
+mix, its sparse attention (bf16 weights against each 64-key block's running
+max) and its indexer's top-k order (descending score) corrected to DeepSeek's: fp32
 compressor with carried overlap state, exact flat top-k indexer, sparse
 attention with fp32 scores and sinks,
 fp32 router, fp32 expert SwiGLU and combine, fp32 head logits. The fixture's
@@ -38,6 +39,36 @@ DECODE = 24
 CASES = [(300, 64), (300, 2048), (45, 16)]
 
 
+def kernel_sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
+    """DeepSeek's sparse_attn (kernel.py:294-350) over the ordered key lists:
+    float32 scores; per 64-key block a running max, exp(s - running max)
+    rounded to bf16 for the value product, the float32 accumulator and
+    normalizer rescaled when the max rises; the sink joins at the end."""
+    n = kv.shape[1]
+    safe = mx.clip(topk_idxs, 0, n - 1)
+    sel = mx.take_along_axis(
+        kv[:, None, :, :], mx.broadcast_to(safe[..., None], (*safe.shape, kv.shape[-1])), axis=2)
+    sel = sel.astype(mx.float32)
+    b, s, h, _ = q.shape
+    k = topk_idxs.shape[-1]
+    scores = mx.einsum("bshd,bskd->bhsk", q.astype(mx.float32), sel) * softmax_scale
+    scores = mx.where((topk_idxs != -1)[:, None, :, :], scores, mx.array(-float("inf"), mx.float32))
+    blocks = (k + 63) // 64
+    if blocks * 64 > k:
+        scores = mx.concatenate(
+            [scores, mx.full((b, h, s, blocks * 64 - k), -float("inf"), mx.float32)], axis=-1)
+    blocked = scores.reshape(b, h, s, blocks, 64)
+    running = mx.cummax(blocked.max(axis=-1), axis=-1)
+    peak = running[..., -1:]
+    p = mx.exp(blocked - running[..., None])
+    rescale = mx.exp(running - peak)
+    denom = (p.sum(axis=-1) * rescale).sum(axis=-1) + mx.exp(
+        attn_sink.astype(mx.float32)[None, :, None] - peak[..., 0])
+    w = (p.astype(mx.bfloat16).astype(mx.float32) * rescale[..., None]).reshape(b, h, s, blocks * 64)[..., :k]
+    o = mx.einsum("bhsk,bskd->bhsd", w, sel) / denom[..., None]
+    return mx.swapaxes(o, 1, 2).astype(q.dtype)
+
+
 def load_reference(path, qat):
     spec = importlib.util.spec_from_file_location("deepseek_v4_reference", path)
     module = importlib.util.module_from_spec(spec)
@@ -61,26 +92,37 @@ def load_reference(path, qat):
 
     module.Block.hc_post = hc_post
 
-    # DeepSeek's sparse_attn kernel rounds the unnormalized weights exp(s - max)
-    # to bf16 before the value product (kernel.py:305, 340-343) and keeps the
-    # normalizer and accumulation in float32; the port keeps the weights in
-    # float32. Like the Swift port, this takes the row max over all keys.
-    def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
-        n = kv.shape[1]
-        safe = mx.clip(topk_idxs, 0, n - 1)
-        sel = mx.take_along_axis(
-            kv[:, None, :, :], mx.broadcast_to(safe[..., None], (*safe.shape, kv.shape[-1])), axis=2)
-        sel = sel.astype(mx.float32)
-        scores = mx.einsum("bshd,bskd->bhsk", q.astype(mx.float32), sel) * softmax_scale
-        valid = (topk_idxs != -1)[:, None, :, :]
-        scores = mx.where(valid, scores, mx.array(-float("inf"), mx.float32))
-        m = scores.max(axis=-1, keepdims=True)
-        p = mx.exp(scores - m)
-        denom = p.sum(axis=-1) + mx.exp(attn_sink.astype(mx.float32)[None, :, None] - m[..., 0])
-        o = mx.einsum("bhsk,bskd->bhsd", p.astype(mx.bfloat16).astype(mx.float32), sel)
-        return mx.swapaxes(o / denom[..., None], 1, 2).astype(q.dtype)
+    # DeepSeek's sparse_attn kernel: bf16 weights against each 64-key block's
+    # running max (the port keeps float32 weights and one softmax).
+    module.sparse_attn = lambda *args: kernel_sparse_attn(*args)
 
-    module.sparse_attn = sparse_attn
+    # The reference's topk returns the selection in descending score order,
+    # which fixes the attention's block layout; the port's argpartition does not.
+    def indexer_call(self, x, qr, start_pos, offset):
+        bsz, seqlen, _ = x.shape
+        rd, ratio = self.rope_head_dim, self.compress_ratio
+        end_pos = start_pos + seqlen
+        q = self.wq_b(qr).reshape(bsz, seqlen, self.n_heads, self.head_dim)
+        q = mx.concatenate([q[..., :-rd], self.rope(q[..., -rd:], start_pos)], axis=-1)
+        q = module.fp4_act_quant_sim(module.rotate_activation(q), 32)
+        self.compressor(x, start_pos)
+        weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+        t = self.compressor.n
+        if t == 0:
+            return mx.zeros((bsz, seqlen, 0), mx.int32)
+        scores = mx.einsum("bshd,btd->bsht", q.astype(mx.float32),
+                           self.compressor.cache[:, :t].astype(mx.float32))
+        scores = (mx.maximum(scores, 0.0) * weights.astype(mx.float32)[..., None]).sum(axis=2)
+        if start_pos == 0:
+            limit = np.arange(1, seqlen + 1)[:, None] // ratio
+            scores = scores + mx.array(np.where(np.arange(t)[None, :] >= limit, -np.inf, 0.0), mx.float32)
+        topk = mx.argsort(-scores, axis=-1)[..., :min(self.index_topk, t)].astype(mx.int32)
+        if start_pos == 0:
+            invalid = topk >= mx.array(np.arange(1, seqlen + 1)[:, None] // ratio)
+            return mx.where(invalid, -1, topk + offset)
+        return topk + offset
+
+    module.Indexer.__call__ = indexer_call
     return module
 
 
