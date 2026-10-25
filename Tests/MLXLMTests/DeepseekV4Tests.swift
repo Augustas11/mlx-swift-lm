@@ -6,13 +6,14 @@ import XCTest
 
 @testable import MLXLLM
 
-/// DeepSeek-V4 against the mlx-vlm 0.7.10 reference. The fixture
-/// (`Resources/deepseek_v4_tiny`, made by its `make_fixture.py`) is a 4-layer
-/// model with every V4 path: a hash-routed layer, local, ratio-4 (indexer,
-/// HISA and flat selection) and ratio-128 attention, an 8-token window, and
-/// the artifact's MXFP4/MXFP8 per-layer quantization. Everything runs on the
-/// CPU; the oracle is mlx-vlm's `generate_step` on the CPU, so the expected
-/// tokens and log-probabilities are those of the same op graph.
+/// DeepSeek-V4 against a port of DeepSeek's reference (`inference/model.py`
+/// + `kernel.py`). The fixture (`Resources/deepseek_v4_tiny`, weights from
+/// its `make_fixture.py`) is a 4-layer model with every V4 path: a
+/// hash-routed layer, local, ratio-4 (indexer) and ratio-128 attention, an
+/// 8-token window, and the artifact's MXFP4/MXFP8 per-layer quantization.
+/// Everything runs on the CPU. The oracle (`make_oracle.py`) prefills the
+/// whole prompt in one call with float32 activations, so the parity test
+/// loads the fixture with its bf16 tensors widened to float32 as well.
 final class DeepseekV4Tests: XCTestCase {
 
     private struct Oracle: Decodable {
@@ -42,7 +43,9 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
-    private func loadTiny(indexBlock: Int, indexKeep: Int) throws -> DeepseekV4Model {
+    private func loadTiny(indexBlock: Int, indexKeep: Int, float32: Bool = false) throws
+        -> DeepseekV4Model
+    {
         let dir = try fixture
         let data = try Data(contentsOf: dir.appendingPathComponent("config.json"))
         var config = try JSONDecoder().decode(DeepseekV4Configuration.self, from: data)
@@ -53,6 +56,12 @@ final class DeepseekV4Tests: XCTestCase {
         let model = DeepseekV4Model(config)
         try loadWeights(
             modelDirectory: dir, model: model, perLayerQuantization: base.perLayerQuantization)
+        if float32 {
+            let widened = model.parameters().flattened().map { key, value in
+                (key, value.dtype == .bfloat16 ? value.asType(.float32) : value)
+            }
+            try model.update(parameters: ModuleParameters.unflattened(widened), verify: [.all])
+        }
         model.train(false)
         return model
     }
@@ -91,13 +100,10 @@ final class DeepseekV4Tests: XCTestCase {
             let dir = try fixture
             let oracle = try JSONDecoder().decode(
                 Oracle.self, from: Data(contentsOf: dir.appendingPathComponent("oracle.json")))
-            XCTAssertEqual(oracle.cases.count, 6)
-            var models = [String: DeepseekV4Model]()
+            XCTAssertEqual(oracle.cases.count, 3)
+            let model = try loadTiny(indexBlock: 0, indexKeep: 0, float32: true)
             for item in oracle.cases {
-                let model =
-                    try models[item.indexer]
-                    ?? loadTiny(indexBlock: item.indexBlock, indexKeep: item.indexKeep)
-                models[item.indexer] = model
+                XCTAssertEqual(item.indexer, "flat")
                 let (tokens, logprobs) = try greedy(
                     model, prompt: item.prompt, step: item.prefillStep, count: oracle.decode)
                 let label = "\(item.indexer) prompt=\(item.prompt.count) step=\(item.prefillStep)"
@@ -106,15 +112,16 @@ final class DeepseekV4Tests: XCTestCase {
                     zip(mine, theirs).map { abs($0 - $1) }.max() ?? 0
                 }.max() ?? 0
                 print("deepseek_v4 parity \(label): max |dlogprob| = \(diff)")
-                // Same MLX core and the same CPU op graph: equal up to reduction order.
+                // Float32 activations on both sides: equal up to reduction order
+                // and the oracle's single-call prefill against this chunk plan.
                 XCTAssertLessThan(diff, 1e-3, label)
             }
         }
     }
 
     /// The serving path (`TokenIterator`, whatever prefill step and chunking
-    /// the caller asks for) prefills with the reference plan, so it decodes
-    /// the step-2048 oracle cases exactly.
+    /// the caller asks for) prefills with the fixed 2048-token plan and
+    /// decodes the oracle's tokens.
     func testTokenIteratorUsesReferencePrefillPlan() throws {
         try Device.withDefaultDevice(.cpu) {
             let dir = try fixture
@@ -123,9 +130,9 @@ final class DeepseekV4Tests: XCTestCase {
             let cases = oracle.cases.filter {
                 $0.prefillStep == DeepseekV4Model.prefillStepSize
             }
-            XCTAssertEqual(cases.count, 2)
+            XCTAssertEqual(cases.count, 1)
             for item in cases {
-                let model = try loadTiny(indexBlock: item.indexBlock, indexKeep: item.indexKeep)
+                let model = try loadTiny(indexBlock: 0, indexKeep: 0, float32: true)
                 for chunking in [PrefillParameters.Chunking.remainder, .balanced, .unchunked] {
                     let parameters = GenerateParameters(
                         maxTokens: oracle.decode, temperature: 0,
