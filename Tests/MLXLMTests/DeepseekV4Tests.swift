@@ -213,7 +213,7 @@ final class DeepseekV4Tests: XCTestCase {
             let prompts = lengths.enumerated().map { row, count in
                 (0 ..< count).map { ($0 * 7 + row * 11 + 2) % 128 }
             }
-            for indexBlock in [0, 4] {
+            for indexBlock in [0] {
                 let model = try loadTiny(indexBlock: indexBlock, indexKeep: 2)
                 let count = 16
                 let serial = try prompts.map {
@@ -231,13 +231,6 @@ final class DeepseekV4Tests: XCTestCase {
                         inputs = next
                         eval(caches.flatMap { $0 })
                     }
-                    if indexBlock > 0 {
-                        // Explicit-config HISA only (never the default): its batched
-                        // rows already differed from serial by ~4e-2 in the logits at
-                        // 3.32.3-macprovider.10.6 on the CPU; the kernel's bf16
-                        // attention-weight rounding can turn that into a token flip.
-                        XCTExpectFailure("HISA batched rows are not bit-exact", strict: false)
-                    }
                     XCTAssertEqual(tokens, Array(serial.prefix(rows)), "rows=\(rows) block=\(indexBlock)")
                 }
             }
@@ -249,7 +242,7 @@ final class DeepseekV4Tests: XCTestCase {
             let prompts = [31, 32, 33, 127, 128, 129, 131, 137].enumerated().map { row, count in
                 (0 ..< count).map { ($0 * 7 + row * 11 + 2) % 128 }
             }
-            for indexBlock in [0, 4] {
+            for indexBlock in [0] {
                 let model = try loadTiny(indexBlock: indexBlock, indexKeep: 2)
                 let serial = try prompts.map {
                     try greedy(model, prompt: $0, step: DeepseekV4Model.prefillStepSize, count: 4).0
@@ -274,7 +267,7 @@ final class DeepseekV4Tests: XCTestCase {
 
     func testContinuousBatchRowsJoinLeaveAndReorderWithoutChangingTokens() throws {
         try Device.withDefaultDevice(.cpu) {
-            let model = try loadTiny(indexBlock: 4, indexKeep: 2)
+            let model = try loadTiny(indexBlock: 0, indexKeep: 0)
             let prompts = [7, 31, 127, 130].enumerated().map { row, count in
                 (0 ..< count).map { ($0 * 3 + row * 17) % 128 }
             }
@@ -512,6 +505,42 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
+    /// DeepSeek's kernel rounds the unnormalized weights against the running
+    /// max of each 64-key block, then rescales the float32 accumulator when a
+    /// later block raises the max. A query whose first block holds a value of
+    /// 128 at score 0 and whose second block holds -47 at score 1 keeps
+    /// 128 * exp(-1) - 47; rounding exp(-1) to bf16 (47/128) against the final
+    /// max would cancel it to 0.
+    func testAttentionRoundsWeightsPerRunningMaxBlock() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let json = """
+                {"model_type": "deepseek_v4", "num_hidden_layers": 1, "hidden_size": 64,
+                 "num_attention_heads": 2, "o_groups": 2, "head_dim": 64, "qk_rope_head_dim": 16,
+                 "q_lora_rank": 32, "o_lora_rank": 8, "sliding_window": 128, "compress_ratios": [0]}
+                """
+            let config = try JSONDecoder().decode(DeepseekV4Configuration.self, from: Data(json.utf8))
+            let attention = DeepseekV4Attention(config, layerIdx: 0)
+            // scale 1/8: q = 8 e0 gives scores k[0].
+            var keys = [[Float]](repeating: [Float](repeating: 0, count: 64), count: 128)
+            keys[0][1] = 128
+            keys[64][0] = 1
+            keys[64][1] = -47
+            let k = MLXArray(keys.flatMap { $0 }).reshaped(1, 1, 128, 64)
+            var query = [Float](repeating: 0, count: 64)
+            query[0] = 8
+            let q = broadcast(MLXArray(query).reshaped(1, 1, 1, 64), to: [1, 2, 1, 64])
+            let out = attention.referenceAttention(
+                q, keys: k, valid: MLXArray.ones([1, 1, 128], dtype: .bool))
+            // Block 0: max 0, weights 1, accumulator 128. Block 1 raises the max to 1:
+            // the accumulator rescales by e^-1 and adds -47; 128 + 1 weights and
+            // the sink (e^-1) form the normalizer.
+            let e = Float(Foundation.exp(-1.0))
+            let expected = (128 * e - 47) / (1 + 128 * e)
+            XCTAssertEqual(out[0, 0, 0, 1].item(Float.self), expected, accuracy: 1e-6)
+            XCTAssertGreaterThan(out[0, 0, 0, 1].item(Float.self), 1e-3)
+        }
+    }
+
     /// The float32 linear (compressor projections, head) on the GPU: the
     /// bfloat16-weight kernel equals a float32 matmul over the widened weight
     /// up to summation order, and a row's result does not depend on how many
@@ -540,7 +569,9 @@ final class DeepseekV4Tests: XCTestCase {
 
     func testContinuousBatchUsesKeysOnlyWindowsAndIndependentPoolSnapshots() throws {
         try Device.withDefaultDevice(.cpu) {
-            let model = try loadTiny(indexBlock: 4, indexKeep: 2)
+            let model = try loadTiny(indexBlock: 0, indexKeep: 0)
+            XCTAssertTrue(model.batchesExactly)
+            XCTAssertFalse(try loadTiny(indexBlock: 4, indexKeep: 2).batchesExactly)
             let prompts = [1, 3, 31, 32, 33, 127, 128, 129].enumerated().map { row, count in
                 (0 ..< count).map { ($0 * 5 + row * 7) % 128 }
             }
