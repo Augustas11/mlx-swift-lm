@@ -74,9 +74,11 @@ public struct DeepseekV4Configuration: Codable, Sendable {
     var indexNHeads: Int
     var indexHeadDim: Int
     var indexTopk: Int
-    /// HISA hierarchical indexer selection. The reference config defaults
-    /// these to 64 and 16 (`deepseek_v4/config.py`), and the 0731 artifact
-    /// sets neither, so the reference oracles ran with HISA on. 0 disables it.
+    /// HISA hierarchical indexer selection (block size and blocks kept), an
+    /// mlx-vlm approximation of the indexer. DeepSeek's reference selects the
+    /// exact top `index_topk` of every pooled entry (`inference/model.py:
+    /// 426-433`), so both default to 0 (exact flat top-k) and HISA runs only
+    /// when a config sets both explicitly.
     var indexBlock: Int
     var indexKeep: Int
     var tieWordEmbeddings: Bool
@@ -155,8 +157,8 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         indexNHeads = try c.decodeIfPresent(Int.self, forKey: .indexNHeads) ?? 64
         indexHeadDim = try c.decodeIfPresent(Int.self, forKey: .indexHeadDim) ?? 128
         indexTopk = try c.decodeIfPresent(Int.self, forKey: .indexTopk) ?? 512
-        indexBlock = try c.decodeIfPresent(Int.self, forKey: .indexBlock) ?? 64
-        indexKeep = try c.decodeIfPresent(Int.self, forKey: .indexKeep) ?? 16
+        indexBlock = try c.decodeIfPresent(Int.self, forKey: .indexBlock) ?? 0
+        indexKeep = try c.decodeIfPresent(Int.self, forKey: .indexKeep) ?? 0
         tieWordEmbeddings = try c.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
 
         // The checkpoint lists one ratio per layer plus the MTP stages; the
@@ -581,9 +583,10 @@ final class DeepseekV4Compressor: Module {
 
 /// Lightning indexer over the ratio-4 index pool (`Indexer`,
 /// `language.py:657-785`): `sum_h relu(q_h . k) * scale * w_h(x) / sqrt(H)`,
-/// then the top `index_topk` pooled entries per query. With `index_block`
-/// and `index_keep` set and a pool of at least `block * keep` entries the
-/// selection is HISA's two-stage block filter, as in the reference.
+/// then the exact top `min(index_topk, P)` pooled entries per query
+/// (`inference/model.py:426-433`). Only a config that sets `index_block` and
+/// `index_keep` swaps in HISA's two-stage block filter for pools of at least
+/// `block * keep` entries.
 final class DeepseekV4Indexer: Module {
     let heads: Int
     let headDim: Int
