@@ -19,8 +19,10 @@ import XCTest
 /// The tokens prefill in the serving plan's 2048-token chunks. At each listed
 /// position the dump holds, per layer, the attention and expert inputs, the
 /// hidden state after the layer (`h.L`, all hyper-connection streams), the
-/// chosen experts (sorted) and, on ratio-4 layers, the indexer's top-k over
-/// the entries visible at that position (sorted, `-1` padded); per
+/// chosen experts (sorted) and, on ratio-4 layers, the exact top-k over the
+/// entries visible at that position, recomputed from the captured attention
+/// input and the final index pool (sorted, `-1` padded; for an explicit HISA
+/// config this is not the selection the forward used); per
 /// compressed layer the final pooled entries; and the float32 logits.
 final class DeepseekV4TeacherForcedDumpTests: XCTestCase {
     func testFullModelTeacherForcedDump() throws {
@@ -130,7 +132,7 @@ final class DeepseekV4TeacherForcedDumpTests: XCTestCase {
                         ? top
                         : concatenated([top, MLXArray.full([indexer.topK - k], values: MLXArray(Int32(-1)))]))
             }
-            out["topk.\(l)"] = stacked(selections)
+            out["topk_exact.\(l)"] = stacked(selections)
         }
         out = out.mapValues { $0.dtype == .bfloat16 ? $0.asType(.float32) : $0 }
         eval(Array(out.values))
