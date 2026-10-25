@@ -1526,7 +1526,8 @@ final class GLM5NextTests: XCTestCase {
     /// bit, and the next batched step equals serial decode.
     private func assertPackedVerifyMatchesSerialRows(
         _ model: any LanguageModel, layers: [GLM5NextDecoderLayer], prompts: [MLXArray],
-        label: String, widths: [Int] = [2, 1, 2], retained: [Int] = [2, 1, 1]
+        label: String, widths: [Int] = [2, 1, 2], retained: [Int] = [2, 1, 1],
+        continuationSteps: Int = 1
     ) throws {
         let rows = prompts.count
         let maxWidth = widths.max()!
@@ -1624,7 +1625,6 @@ final class GLM5NextTests: XCTestCase {
             assertCachesEqual(rowCaches[r], serialCaches[r], "\(label) row \(r) after commit")
         }
         // The next ordinary batched step from the committed rows.
-        let next = MLXArray((0 ..< rows).map { Int32(40 + $0) }).reshaped(rows, 1)
         let stepCaches: [KVCache] = layers.indices.map { layer in
             if layers[layer].isLinear {
                 let batch = MambaCache()
@@ -1635,11 +1635,14 @@ final class GLM5NextTests: XCTestCase {
             return GLM5NextLatentCacheBatch(
                 rowCaches: rowCaches.map { $0[layer] as! any GLM5NextLatentCache })
         }
-        let stepLogits = model(next, cache: stepCaches)
-        for r in 0 ..< rows {
-            assertBitwiseEqual(
-                stepLogits[r ..< (r + 1)], model(next[r ..< (r + 1)], cache: serialCaches[r]),
-                "\(label) row \(r) next step")
+        for step in 0 ..< continuationSteps {
+            let next = MLXArray((0 ..< rows).map { Int32(40 + $0 + step) }).reshaped(rows, 1)
+            let stepLogits = model(next, cache: stepCaches)
+            for r in 0 ..< rows {
+                assertBitwiseEqual(
+                    stepLogits[r ..< (r + 1)], model(next[r ..< (r + 1)], cache: serialCaches[r]),
+                    "\(label) row \(r) continuation \(step)")
+            }
         }
     }
 
@@ -1655,7 +1658,7 @@ final class GLM5NextTests: XCTestCase {
     }
 
     /// The campaign cohorts fit the eight-token qmv bound. Equal-length
-    /// rows share attention; ragged/padded rows retain independent rollback.
+    /// rows retain serial attention; ragged/padded rows keep independent rollback.
     func testPackedVerifyDepthOneCohortsMatchSerialRows() throws {
         let model = try fusedShapesModel(seed: 301)
         for count in [2, 4] {
@@ -1673,6 +1676,58 @@ final class GLM5NextTests: XCTestCase {
             }
         }
         model.model.deferredDecode = true
+    }
+
+    /// Rank 512 with two query heads and short contexts uses MLX's SDPA
+    /// matmul fallback, whose arithmetic changes when independent rows batch.
+    func testPackedVerifyRank512FallbackMatchesSerialRows() throws {
+        for (dtype, bits) in [(DType.bfloat16, 8), (DType.float16, 4)] {
+            var json = textConfigJSON(indexTopk: 2048)
+            for (from, to) in [
+                (#""hidden_size": 64"#, #""hidden_size": 1024"#),
+                (#""kv_lora_rank": 32"#, #""kv_lora_rank": 512"#),
+                (#""q_lora_rank": 32"#, #""q_lora_rank": 1024"#),
+                (#""index_head_dim": 16"#, #""index_head_dim": 32"#),
+            ] {
+                json = json.replacingOccurrences(of: from, with: to)
+            }
+            let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+            try config.validateModelConfiguration()
+            let model = GLM5NextTextModel(config)
+            randomize(model, seed: 321)
+            castToBFloat16(model)
+            if dtype == .float16 {
+                model.update(parameters: ModuleParameters.unflattened(
+                    model.parameters().flattened().map { key, value in
+                        (key, value.dtype == .bfloat16 ? value.asType(dtype) : value)
+                    }))
+            }
+            quantize(model: model) { _, module in
+                guard module is Linear || module is SwitchLinear || module is MultiLinear else {
+                    return nil
+                }
+                return (32, bits, .affine)
+            }
+            eval(model)
+            model.train(false)
+            // Covered keys/query projections share qmv; the two-output
+            // weights projection retains its original per-row fallback.
+            let attention = model.model.layers.first { !$0.isLinear }!.selfAttn as! GLM5NextAttention
+            let indexer = try XCTUnwrap(attention.indexer)
+            for count in [2, 4] {
+                let x = MLXArray.zeros([count * 2, 1024], dtype: dtype)
+                XCTAssertNotNil(glm5NextQMVBatch(x, try XCTUnwrap(glm5NextAffine(indexer.wk))))
+                XCTAssertNotNil(glm5NextQMVBatch(x, try XCTUnwrap(glm5NextAffine(indexer.wqB))))
+                XCTAssertNil(glm5NextQMVBatch(x, try XCTUnwrap(glm5NextAffine(indexer.weightsProj))))
+                let prompts = (0 ..< count).map { tokens(17, seed: UInt64(322 + $0)) }
+                try assertPackedVerifyMatchesSerialRows(
+                    model, layers: model.model.layers, prompts: prompts,
+                    label: "rank512 \(dtype) \(bits)b rows=\(count)",
+                    widths: Array(repeating: 2, count: count),
+                    retained: (0 ..< count).map { $0.isMultiple(of: 2) ? 2 : 1 },
+                    continuationSteps: 3)
+            }
+        }
     }
 
     /// Depth-D packed verification: rows of 4 and 2 columns (8 flattened

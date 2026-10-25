@@ -950,15 +950,17 @@ final class GLM5NextAttention: Module {
         let qLatent = callMultiLinear(embedQ, q)
 
         precondition(rowLengths == nil || rowLengths!.count == rows.count)
-        if perColumn && rows.count > 1 && B * L <= 8 {
-            let (all, selections) = attendPackedColumns(
-                x: x, qResid: qResid, qLatent: qLatent, latentIn: latentIn,
-                caches: rows, previousTopk: previousTopk, rowLengths: rowLengths)
-            let output = callMultiLinear(unembedOut, all)
-                .transposed(0, 2, 1, 3)
-                .reshaped(B, L, numHeads * vHeadDim)
-            return (glm5NextProject(oProj, output), selections)
+        // Share only the vector-stable qmv route. Other projection shapes
+        // retain their serial-row dispatch, as does all attention arithmetic.
+        func cohortProjection(_ linear: Linear, _ input: MLXArray) -> MLXArray? {
+            guard perColumn, rows.count > 1, let parts = glm5NextAffine(linear),
+                let output = glm5NextQMVBatch(input.reshaped(B * L, input.dim(-1)), parts)
+            else { return nil }
+            return output.reshaped(B, L, output.dim(-1))
         }
+        let cohortKeys = indexer.flatMap { cohortProjection($0.wk, x) }
+        let cohortQ = indexer.flatMap { cohortProjection($0.wqB, qResid) }
+        let cohortWeights = indexer.flatMap { cohortProjection($0.weightsProj, x) }
         var attended = [MLXArray]()
         var selections = [MLXArray?]()
         for (index, rowCache) in rows.enumerated() {
@@ -969,9 +971,13 @@ final class GLM5NextAttention: Module {
                 let valid = rowLengths?[index] ?? L
                 // The indexer's projections for every column at once (row-
                 // independent); the gates, selection and attention per column.
-                let indexerKeys = indexer.map { $0.kNorm(glm5NextProject($0.wk, rx)) }
-                let indexerQ = indexer.map { glm5NextProject($0.wqB, rq) }
-                let indexerWeights = indexer.map { glm5NextProject($0.weightsProj, rx) }
+                let indexerKeys = indexer.map {
+                    $0.kNorm(cohortKeys.map(row) ?? glm5NextProject($0.wk, rx))
+                }
+                let indexerQ = cohortQ.map(row)
+                    ?? indexer.map { glm5NextProject($0.wqB, rq) }
+                let indexerWeights = cohortWeights.map(row)
+                    ?? indexer.map { glm5NextProject($0.weightsProj, rx) }
                 var columns = [MLXArray]()
                 for c in 0 ..< L {
                     let slot = index * L + c
@@ -1016,79 +1022,6 @@ final class GLM5NextAttention: Module {
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, numHeads * vHeadDim)
         return (glm5NextProject(oProj, output), selections)
-    }
-
-    /// Project the cohort together, then batch compatible one-token attention
-    /// calls. Cache updates and selections remain row-local and column-ordered.
-    private func attendPackedColumns(
-        x: MLXArray, qResid: MLXArray, qLatent: MLXArray, latentIn: MLXArray,
-        caches: [any GLM5NextLatentCache], previousTopk: [MLXArray?], rowLengths: [Int]?
-    ) -> (MLXArray, [MLXArray?]) {
-        let (B, L) = (x.dim(0), x.dim(1))
-        let keys = indexer.map { $0.kNorm(glm5NextProject($0.wk, x)) }
-        let queries = indexer.map { glm5NextProject($0.wqB, qResid) }
-        let weights = indexer.map { glm5NextProject($0.weightsProj, x) }
-        var outputs = Array(repeating: [MLXArray](), count: B)
-        var selections = [MLXArray?](repeating: nil, count: B * L)
-        for c in 0 ..< L {
-            var active = [Int]()
-            var latents = [MLXArray]()
-            var topks = [MLXArray?]()
-            var qs = [MLXArray]()
-            for r in 0 ..< B {
-                let valid = rowLengths?[r] ?? L
-                precondition(valid >= 1 && valid <= L)
-                guard c < valid else {
-                    outputs[r].append(MLXArray.zeros(like: outputs[r][0]))
-                    continue
-                }
-                func col(_ a: MLXArray) -> MLXArray { a[r ..< (r + 1), c ..< (c + 1)] }
-                let slot = r * L + c
-                let prepared = prepareAttention(
-                    x: col(x), qResid: col(qResid),
-                    latentIn: latentIn[r ..< (r + 1), 0..., c ..< (c + 1)],
-                    cache: caches[r], previousTopk: slot < previousTopk.count ? previousTopk[slot] : nil,
-                    indexerInputs: (keys.map(col), queries.map(col), weights.map(col)))
-                active.append(r)
-                latents.append(prepared.latent)
-                topks.append(prepared.topk)
-                qs.append(qLatent[r ..< (r + 1), 0..., c ..< (c + 1)])
-                selections[slot] = prepared.topk
-            }
-            // Equal shapes retain the same unpadded attention and reduction
-            // route as a serial token. Ragged contexts form separate groups.
-            var groups = [[Int]]()
-            for i in active.indices {
-                if let g = groups.firstIndex(where: {
-                    latents[$0[0]].shape == latents[i].shape
-                        && topks[$0[0]]?.shape == topks[i]?.shape
-                }) {
-                    groups[g].append(i)
-                } else {
-                    groups.append([i])
-                }
-            }
-            for group in groups {
-                let q = group.count == 1 ? qs[group[0]] : concatenated(group.map { qs[$0] }, axis: 0)
-                let latent = group.count == 1
-                    ? latents[group[0]] : concatenated(group.map { latents[$0] }, axis: 0)
-                let out: MLXArray
-                if let first = topks[group[0]] {
-                    let topk = group.count == 1
-                        ? first : concatenated(group.map { topks[$0]! }, axis: 0)
-                    out = sparseAttention(q, latent: latent, topk: topk)
-                } else {
-                    out = MLXFast.scaledDotProductAttention(
-                        queries: q, keys: latent, values: latent, scale: scale, mask: .none)
-                }
-                for (index, i) in group.enumerated() {
-                    outputs[active[i]].append(
-                        group.count == 1 ? out : out[index ..< (index + 1)])
-                }
-            }
-        }
-        let attended = outputs.map { $0.count == 1 ? $0[0] : concatenated($0, axis: 2) }
-        return (concatenated(attended, axis: 0), selections)
     }
 
     /// One cache's attention: append the latent, update the indexer's pools,
