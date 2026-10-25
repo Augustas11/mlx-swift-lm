@@ -260,7 +260,7 @@ private let deepseekV4LinearF32Kernel = MLXFast.metalKernel(
         const uint n = threadgroup_position_in_grid.x * 8 + simdgroup_index_in_threadgroup;
         const uint lane = thread_index_in_simdgroup;
         if (n >= uint(N)) { return; }
-        const device uint4* row = reinterpret_cast<const device uint4*>(w) + n * uint(K / 8);
+        const device uint4* row = reinterpret_cast<const device uint4*>(w) + size_t(n) * size_t(K / 8);
         float acc[M];
         for (int m = 0; m < M; ++m) { acc[m] = 0.0f; }
         for (uint i = lane; i < uint(K / 8); i += 32) {
@@ -272,13 +272,13 @@ private let deepseekV4LinearF32Kernel = MLXFast.metalKernel(
                 as_type<float>(p.z << 16), as_type<float>(p.z & 0xFFFF0000u),
                 as_type<float>(p.w << 16), as_type<float>(p.w & 0xFFFF0000u));
             for (int m = 0; m < M; ++m) {
-                const device float4* xr = reinterpret_cast<const device float4*>(x + m * K) + 2 * i;
+                const device float4* xr = reinterpret_cast<const device float4*>(x + size_t(m) * size_t(K)) + 2 * i;
                 acc[m] += dot(xr[0], lo) + dot(xr[1], hi);
             }
         }
         for (int m = 0; m < M; ++m) {
             const float total = simd_sum(acc[m]);
-            if (lane == 0) { out[m * N + n] = total; }
+            if (lane == 0) { out[size_t(m) * size_t(N) + n] = total; }
         }
         """)
 
