@@ -1418,7 +1418,7 @@ public final class DeepseekV4Model: Module, LLMModel {
         for (layer, layerCache) in zip(layers, layerCaches) {
             h = layer(h, mask: mask, cache: layerCache, inputIDs: inputs)
         }
-        return head(norm(hcHead(h)))
+        return logits(norm(hcHead(h)))
     }
 
     /// One token per independently prefetched row. Each row owns ordinary
@@ -1437,7 +1437,14 @@ public final class DeepseekV4Model: Module, LLMModel {
             let caches = rowCaches.map { DeepseekV4LayerCache($0[i], ratio: layer.attn.ratio) }
             h = layer.decodeBatch(h, caches: caches, inputIDs: inputs)
         }
-        return head(norm(hcHead.decodeBatch(h)))
+        return logits(norm(hcHead.decodeBatch(h)))
+    }
+
+    /// Float32 logits (`ParallelHead`, `inference/model.py:728-735`:
+    /// `F.linear(x.float(), weight)` with a float32 head) from the bf16 head
+    /// weight, without a resident float32 copy.
+    private func logits(_ x: MLXArray) -> MLXArray {
+        deepseekV4LinearF32(head, x)
     }
 
     /// The reference prefill step (mlx-vlm `generate_step` default).
