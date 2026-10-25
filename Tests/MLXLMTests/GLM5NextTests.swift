@@ -1678,54 +1678,98 @@ final class GLM5NextTests: XCTestCase {
         model.model.deferredDecode = true
     }
 
-    /// Rank 512 with two query heads and short contexts uses MLX's SDPA
-    /// matmul fallback, whose arithmetic changes when independent rows batch.
+    /// Compare the changed attention component at the same verification width,
+    /// avoiding upstream KDA/MoE and one-token versus block projection routes.
+    /// Whole-model ordinary-decode parity remains covered by the tests above.
     func testPackedVerifyRank512FallbackMatchesSerialRows() throws {
-        for (dtype, bits) in [(DType.bfloat16, 8), (DType.float16, 4)] {
-            var json = textConfigJSON(indexTopk: 2048)
+        for topk in [2048, 8] {
+            var json = textConfigJSON(indexTopk: topk)
             for (from, to) in [
                 (#""hidden_size": 64"#, #""hidden_size": 1024"#),
                 (#""kv_lora_rank": 32"#, #""kv_lora_rank": 512"#),
                 (#""q_lora_rank": 32"#, #""q_lora_rank": 1024"#),
-                (#""index_head_dim": 16"#, #""index_head_dim": 32"#),
+                (#""qk_nope_head_dim": 32"#, #""qk_nope_head_dim": 64"#),
+                (#""v_head_dim": 32"#, #""v_head_dim": 64"#),
+                (#""index_head_dim": 16"#, #""index_head_dim": 128"#),
+                (#""index_n_heads": 2"#, #""index_n_heads": 32"#),
             ] {
                 json = json.replacingOccurrences(of: from, with: to)
             }
             let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
             try config.validateModelConfiguration()
-            let model = GLM5NextTextModel(config)
-            randomize(model, seed: 321)
-            castToBFloat16(model)
-            if dtype == .float16 {
-                model.update(parameters: ModuleParameters.unflattened(
-                    model.parameters().flattened().map { key, value in
-                        (key, value.dtype == .bfloat16 ? value.asType(dtype) : value)
-                    }))
+            let attention = GLM5NextAttention(config, sharedIndexer: false)
+            randomize(attention, seed: 321)
+            castToBFloat16(attention)
+            quantize(model: attention) { _, module in
+                guard module is Linear || module is MultiLinear else { return nil }
+                return (64, 4, .affine)
             }
-            quantize(model: model) { _, module in
-                guard module is Linear || module is SwitchLinear || module is MultiLinear else {
-                    return nil
-                }
-                return (32, bits, .affine)
-            }
-            eval(model)
-            model.train(false)
-            // Covered keys/query projections share qmv; the two-output
-            // weights projection retains its original per-row fallback.
-            let attention = model.model.layers.first { !$0.isLinear }!.selfAttn as! GLM5NextAttention
+            eval(attention)
+            attention.train(false)
             let indexer = try XCTUnwrap(attention.indexer)
+            func assertCache(
+                _ actual: GLM5NextAttentionCache, _ expected: GLM5NextAttentionCache, _ label: String
+            ) {
+                XCTAssertEqual(actual.offset, expected.offset, label)
+                XCTAssertEqual(actual.state.count, 6, label)
+                XCTAssertEqual(expected.state.count, 6, label)
+                for i in 0 ..< 6 {
+                    assertBitwiseEqual(actual.state[i], expected.state[i], "\(label) state \(i)")
+                }
+            }
             for count in [2, 4] {
-                let x = MLXArray.zeros([count * 2, 1024], dtype: dtype)
-                XCTAssertNotNil(glm5NextQMVBatch(x, try XCTUnwrap(glm5NextAffine(indexer.wk))))
-                XCTAssertNotNil(glm5NextQMVBatch(x, try XCTUnwrap(glm5NextAffine(indexer.wqB))))
-                XCTAssertNil(glm5NextQMVBatch(x, try XCTUnwrap(glm5NextAffine(indexer.weightsProj))))
-                let prompts = (0 ..< count).map { tokens(17, seed: UInt64(322 + $0)) }
-                try assertPackedVerifyMatchesSerialRows(
-                    model, layers: model.model.layers, prompts: prompts,
-                    label: "rank512 \(dtype) \(bits)b rows=\(count)",
-                    widths: Array(repeating: 2, count: count),
-                    retained: (0 ..< count).map { $0.isMultiple(of: 2) ? 2 : 1 },
-                    continuationSteps: 3)
+                let projectionInput = MLXArray.zeros([count * 2, 1024], dtype: .bfloat16)
+                for projection in [indexer.wk, indexer.wqB, indexer.weightsProj] {
+                    XCTAssertNotNil(glm5NextQMVBatch(
+                        projectionInput, try XCTUnwrap(glm5NextAffine(projection))))
+                }
+                let inputs = withRandomState(MLXRandom.RandomState(seed: 322)) {
+                    (0.05 * MLXRandom.normal([count, 27, 1024])).asType(.bfloat16)
+                }
+                let rows = (0 ..< count).map { r in
+                    let cache = GLM5NextAttentionCache(kpool: config.indexKpool, maxTrim: 2)
+                    let (output, _) = attention(
+                        inputs[r ..< (r + 1), ..<23], cache: cache, previousTopk: [])
+                    eval(output, cache)
+                    return cache
+                }
+                let serial = rows.map { $0.copy() as! GLM5NextAttentionCache }
+                let batch = GLM5NextLatentCacheBatch(rowCaches: rows)
+                // First round accepts/rejects independently; the next round
+                // continues those different offsets with the same L=2 reference.
+                for round in 0 ..< 2 {
+                    let label = "rank512 BF16 4b topk=\(topk) rows=\(count) round=\(round)"
+                    let start = 23 + round * 2
+                    let x = inputs[0..., start ..< (start + 2)]
+                    let originals = rows.map { $0.copy() as! GLM5NextAttentionCache }
+                    try batch.prepareMTPPackedVerification(rowMaps: rows.indices.map { r in
+                        MTPPackedVerificationRowMap(
+                            rowIndex: r, queryOffset: rows[r].offset, inputCount: 2, proposalCount: 1)
+                    })
+                    let (output, selections) = attention(
+                        x, cache: batch, previousTopk: [], perColumn: true)
+                    for r in rows.indices {
+                        let (reference, selected) = attention(
+                            x[r ..< (r + 1)], cache: serial[r], previousTopk: [], perColumn: true)
+                        assertBitwiseEqual(output[r ..< (r + 1)], reference, "\(label) row \(r) output")
+                        for c in 0 ..< 2 {
+                            assertBitwiseEqual(
+                                selections[r * 2 + c], selected[c], "\(label) row \(r) selection \(c)")
+                            XCTAssertEqual(selected[c] == nil, topk == 2048, label)
+                        }
+                        assertCache(
+                            batch.rowCaches[r] as! GLM5NextAttentionCache, serial[r],
+                            "\(label) row \(r) forwarded")
+                        assertCache(rows[r], originals[r], "\(label) row \(r) before commit")
+                    }
+                    let transactions = try batch.rowTransactions()
+                    for r in rows.indices {
+                        let retained = round == 0 && !r.isMultiple(of: 2) ? 1 : 2
+                        XCTAssertEqual(serial[r].trim(2 - retained), 2 - retained, label)
+                        try transactions[r].commit(retaining: retained)
+                        assertCache(rows[r], serial[r], "\(label) row \(r) committed")
+                    }
+                }
             }
         }
     }
