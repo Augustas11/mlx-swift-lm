@@ -569,6 +569,7 @@ final class DeepseekV4Tests: XCTestCase {
             "layers.0.hc_attn_fn": MLXArray.zeros([2]),
             "layers.0.hc_ffn_scale": MLXArray.zeros([3]),
             "layers.0.ffn.gate.tid2eid": MLXArray([Int64(1), 0]),
+            "layers.0.ffn.gate.weight": MLXArray.zeros([2, 64], dtype: .bfloat16),
             "layers.0.ffn.shared_experts.w3.weight": MLXArray.zeros([2]),
             "layers.1.attn.wkv.weight": MLXArray.zeros([2]),
             "mtp.0.block.attn.wkv.weight": MLXArray.zeros([2]),
@@ -581,13 +582,15 @@ final class DeepseekV4Tests: XCTestCase {
             [
                 "layers.0.ffn.switch_mlp.gate_proj.weight", "layers.0.ffn.switch_mlp.down_proj.scales",
                 "layers.0.attn.wo_a.weight", "layers.0.attn_hc.fn", "layers.0.ffn_hc.scale",
-                "layers.0.ffn.gate.tid2eid", "layers.0.ffn.shared_experts.w3.weight",
+                "layers.0.ffn.gate.tid2eid", "layers.0.ffn.gate.weight",
+                "layers.0.ffn.shared_experts.w3.weight",
                 "hc_head.fn", "embed.weight",
             ])
         XCTAssertEqual(out["layers.0.ffn.switch_mlp.gate_proj.weight"]!.shape, [2, 3, 5])
         XCTAssertEqual(out["layers.0.ffn.switch_mlp.gate_proj.weight"]![1].sum().item(Float.self), 15)
         XCTAssertEqual(out["layers.0.attn.wo_a.weight"]!.shape, [2, 4, 6])
         XCTAssertEqual(out["layers.0.ffn.gate.tid2eid"]!.dtype, .int32)
+        XCTAssertEqual(out["layers.0.ffn.gate.weight"]!.dtype, .float32)
     }
     /// The real artifact's tensor names, shapes and dtypes (from the
     /// safetensors headers) against the module tree after sanitize and the
