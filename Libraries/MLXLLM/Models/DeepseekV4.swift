@@ -295,7 +295,7 @@ func deepseekV4LinearF32(_ layer: Linear, _ x: MLXArray) -> MLXArray {
     let rows = x.size / max(K, 1)
     var out: MLXArray
     if weight.dtype == .bfloat16, (1 ... 8).contains(rows), K % 8 == 0,
-        Device.defaultDevice().deviceType == .gpu
+        (N + 7) / 8 * 256 <= Int(Int32.max), Device.defaultDevice().deviceType == .gpu
     {
         out = deepseekV4LinearF32Kernel(
             [x32.reshaped(rows, K), weight],
@@ -735,7 +735,10 @@ final class DeepseekV4Indexer: Module {
     }
 
     /// Ragged pools share one query/weight projection and one scoring graph.
-    /// Rows below top-k retain their pool's original order.
+    /// Each row gets the top `min(index_topk, P)` of its own pool in
+    /// descending score order (the order of the reference's `topk`); entries
+    /// at ranks past a row's pool size are padding. The exact selection only:
+    /// a HISA configuration does not batch (`DeepseekV4Model.batchesExactly`).
     func decodeBatch(
         _ x: MLXArray, qResidual: MLXArray, rope: DeepseekV4RoPE, pools: [MLXArray],
         offsets: MLXArray
@@ -756,51 +759,13 @@ final class DeepseekV4Indexer: Module {
         let weights = weightsProj(x).asType(.float32) * pow(Float(heads), -0.5)
         let wq = expandedDimensions(weights.swappedAxes(-1, -2), axis: -1)
         let lengths = MLXArray(counts.map(Int32.init)).reshaped(B, 1, 1)
-        let masked = MLXArray(-Float.greatestFiniteMagnitude)
         var scores = maximum(
             matmul(q, expandedDimensions(pooled, axis: 1).swappedAxes(-1, -2).asType(.float32)), 0)
         scores = (scores * scale * wq).sum(axis: 1)
         scores = MLX.where(
             MLXArray.arange(poolCount, dtype: .int32).reshaped(1, 1, poolCount) .< lengths,
-            scores, masked)
-        var selected = argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k].asType(.int32)
-
-        let hisaRows = counts.map { block > 0 && keep > 0 && $0 >= block * keep && keep * block >= min(topK, $0) }
-        if hisaRows.contains(true) {
-            let blocks = poolCount / block
-            let usable = blocks * block
-            let rep = pooled[0..., ..<usable].reshaped(B, blocks, block, headDim).mean(axis: 2)
-            var coarse = maximum(
-                matmul(q, expandedDimensions(rep, axis: 1).swappedAxes(-1, -2).asType(.float32)), 0)
-            coarse = (coarse * scale * wq).sum(axis: 1)
-            let completeBlocks = MLXArray(counts.map { Int32($0 / block) }).reshaped(B, 1, 1)
-            coarse = MLX.where(
-                MLXArray.arange(blocks, dtype: .int32).reshaped(1, 1, blocks) .< completeBlocks,
-                coarse, masked)
-            let kept = min(keep, blocks)
-            let topBlocks = argPartition(-coarse, kth: kept - 1, axis: -1)[.ellipsis, ..<kept]
-                .asType(.int32)
-            let candidates = kept * block
-            let positions = (expandedDimensions(topBlocks, axis: -1) * Int32(block)
-                + MLXArray.arange(block, dtype: .int32)).reshaped(B, 1, candidates)
-            let gather = broadcast(positions.reshaped(B, candidates, 1), to: [B, candidates, headDim])
-            let candidateKeys = takeAlong(pooled, gather, axis: 1)
-            var fine = maximum(
-                matmul(q, expandedDimensions(candidateKeys, axis: 1).swappedAxes(-1, -2).asType(.float32)), 0)
-            fine = (fine * scale * wq).sum(axis: 1)
-            let selectedCount = min(k, candidates)
-            let fineTop = argPartition(-fine, kth: selectedCount - 1, axis: -1)[.ellipsis, ..<selectedCount]
-            var hisa = takeAlong(positions, fineTop, axis: -1)
-            if selectedCount < k {
-                hisa = concatenated([hisa, MLXArray.zeros([B, 1, k - selectedCount], dtype: .int32)], axis: -1)
-            }
-            selected = MLX.where(MLXArray(hisaRows).reshaped(B, 1, 1), hisa, selected)
-        }
-        let original = broadcast(MLXArray.arange(k, dtype: .int32).reshaped(1, 1, k), to: [B, 1, k])
-        // Padded positions must be valid gather indices even for an empty row.
-        return MLX.where(
-            lengths .> Int32(topK), selected,
-            minimum(original, maximum(lengths - Int32(1), Int32(0))))
+            scores, MLXArray(-Float.infinity))
+        return argSort(-scores, axis: -1)[.ellipsis, ..<k].asType(.int32)
     }
 
     /// `[B, L, k]` pooled indices, or `nil` while the pool is empty.
@@ -842,7 +807,7 @@ final class DeepseekV4Indexer: Module {
                     expandedDimensions(poolMask, axis: 0), scores,
                     MLXArray(-Float.greatestFiniteMagnitude))
             }
-            return argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k]
+            return argSort(-scores, axis: -1)[.ellipsis, ..<k].asType(.int32)
         }
         // The `[B, H, tile, P]` float32 scores stay within the workspace
         // budget however long the context grows; each tile keeps only its
@@ -965,6 +930,7 @@ final class DeepseekV4Attention: Module {
     let groups: Int
     let scale: Float
     let normEps: Float
+    let window: Int
 
     @ModuleInfo(key: "wq_a") var wqA: Linear
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
@@ -985,6 +951,7 @@ final class DeepseekV4Attention: Module {
         self.groups = config.oGroups
         self.scale = pow(Float(config.headDim), -0.5)
         self.normEps = config.rmsNormEps
+        self.window = config.slidingWindow
 
         _wqA.wrappedValue = Linear(config.hiddenSize, config.qLoraRank, bias: false)
         _qNorm.wrappedValue = RMSNorm(dimensions: config.qLoraRank, eps: config.rmsNormEps)
@@ -1036,7 +1003,10 @@ final class DeepseekV4Attention: Module {
         return woB(out)
     }
 
-    /// Only cache slice writes remain row-local. All attention arithmetic is batched.
+    /// One token per row. Projections and the attention arithmetic are
+    /// batched; each row keeps its own window, pools and selection, and its
+    /// key list is the one `attend` builds for it alone, so a batched row
+    /// computes exactly what it computes serially.
     func decodeBatch(_ x: MLXArray, caches: [DeepseekV4LayerCache]) -> MLXArray {
         let B = x.dim(0)
         let offsets = caches.map { $0.local.offset }
@@ -1050,75 +1020,63 @@ final class DeepseekV4Attention: Module {
         let kv = rope(kvNorm(wkv(x)).reshaped(B, 1, 1, headDim), offsets: offsetArray)
         let emptyValues = MLXArray.zeros([B, 1, 1, 0], dtype: kv.dtype)
         let windows = caches.enumerated().map { row, cache in
-            cache.local.update(
-                keys: kv[row ..< (row + 1)], values: emptyValues[row ..< (row + 1)]).0
+            Self.temporal(
+                cache.local.update(
+                    keys: kv[row ..< (row + 1)], values: emptyValues[row ..< (row + 1)]).0,
+                cache: cache.local)
         }
-        let localLength = windows.map { $0.dim(2) }.max()!
-        let local = concatenated(windows.map { window in
-            let padding = localLength - window.dim(2)
-            return padding == 0 ? window : concatenated([
-                window, MLXArray.zeros([1, 1, padding, headDim], dtype: window.dtype),
-            ], axis: 2)
-        }, axis: 0)
-        let localMask = MLXArray.arange(localLength, dtype: .int32).reshaped(1, 1, 1, localLength)
-            .< MLXArray(windows.map { Int32($0.dim(2)) }).reshaped(B, 1, 1, 1)
 
-        var keys = local
-        var mask = localMask
-        var sparseOutput: MLXArray?
-        var sparseRows = Array(repeating: false, count: B)
+        // Each row's compressed list: [C, D] keys and the count of valid entries.
+        var compressed = Array(repeating: (keys: MLXArray?.none, valid: 0), count: B)
         if let compressor {
             let pools = compressor.decodeBatch(x, caches: caches.map { $0.pool! }, offsets: offsets)
             // The index pool must advance even before selection becomes necessary.
             let indexPools = indexer?.compressor.decodeBatch(
                 x, caches: caches.map { $0.indexPool! }, offsets: offsets)
-            let poolLength = pools.map { $0.dim(1) }.max()!
-            if poolLength > 0 {
-                let counts = pools.map { $0.dim(1) }
-                let pooled = concatenated(pools.map { pool in
-                    let padding = poolLength - pool.dim(1)
-                    return padding == 0 ? pool : concatenated([
-                        pool, MLXArray.zeros([1, padding, headDim], dtype: pool.dtype),
-                    ], axis: 1)
-                }, axis: 0)
-                let poolKeys: MLXArray
-                let poolMask: MLXArray
-                if let indexer, let indexPools, poolLength > indexer.topK {
+            if let indexer, let indexPools {
+                if indexPools.contains(where: { $0.dim(1) > 0 }) {
                     let selected = indexer.decodeBatch(
-                        x, qResidual: qResidual, rope: rope, pools: indexPools,
-                        offsets: offsetArray)
-                    let k = selected.dim(2)
-                    let gather = broadcast(selected.reshaped(B, k, 1), to: [B, k, headDim])
-                    poolKeys = expandedDimensions(takeAlong(pooled, gather, axis: 1), axis: 1)
-                    poolMask = MLXArray.arange(k, dtype: .int32).reshaped(1, 1, 1, k)
-                        .< MLXArray(counts.map { Int32(min($0, indexer.topK)) }).reshaped(B, 1, 1, 1)
-                    sparseRows = counts.map { $0 > indexer.topK }
-                    sparseOutput = sparsePooledAttention(
-                        q: q, local: local, pooled: pooled, topk: selected,
-                        localMask: localMask, pooledMask: poolMask, sinks: attnSink.asType(.float32))
-                } else {
-                    poolKeys = expandedDimensions(pooled, axis: 1)
-                    poolMask = MLXArray.arange(poolLength, dtype: .int32).reshaped(1, 1, 1, poolLength)
-                        .< MLXArray(counts.map(Int32.init)).reshaped(B, 1, 1, 1)
+                        x, qResidual: qResidual, rope: rope, pools: indexPools, offsets: offsetArray)
+                    for row in 0 ..< B where pools[row].dim(1) > 0 {
+                        let count = min(indexer.topK, pools[row].dim(1))
+                        compressed[row] = (
+                            take(pools[row][0], selected[row, 0, ..<count], axis: 0), count
+                        )
+                    }
                 }
-                keys = concatenated([local, poolKeys], axis: 2)
-                mask = concatenated([localMask, poolMask], axis: -1)
-            }
-        }
-        let attended: MLXArray
-        if let sparseOutput {
-            if sparseRows.allSatisfy({ $0 }) {
-                attended = sparseOutput
             } else {
-                // Dense and sparse serial attention use different reduction orders.
-                // Keep both batched bodies for mixed rows, never one body per row.
-                attended = MLX.where(
-                    MLXArray(sparseRows).reshaped(B, 1, 1, 1), sparseOutput,
-                    sdpa(q, keys, mask: mask, sinks: attnSink.asType(.float32)))
+                for row in 0 ..< B where pools[row].dim(1) > 0 {
+                    compressed[row] = (pools[row][0], pools[row].dim(1))
+                }
             }
-        } else {
-            attended = sdpa(q, keys, mask: mask, sinks: attnSink.asType(.float32))
         }
+        let width = compressed.map { $0.keys?.dim(0) ?? 0 }.max()!
+        var keys = [MLXArray]()
+        var valid = [MLXArray]()
+        for row in 0 ..< B {
+            let (windowKeys, windowValid) = windowList(
+                windows[row][0, 0], first: offsets[row] + 1 - windows[row].dim(2),
+                positions: [offsets[row]])
+            var rowKeys = [windowKeys[0]]
+            var rowValid = [windowValid[0]]
+            if width > 0 {
+                let entries = compressed[row].keys ?? MLXArray.zeros([0, headDim], dtype: kv.dtype)
+                let padding = width - entries.dim(0)
+                rowKeys.append(
+                    padding == 0
+                        ? entries
+                        : concatenated([
+                            entries, MLXArray.zeros([padding, headDim], dtype: entries.dtype),
+                        ]))
+                rowValid.append(MLXArray.arange(width, dtype: .int32) .< Int32(compressed[row].valid))
+            }
+            keys.append(concatenated(rowKeys, axis: 0))
+            valid.append(concatenated(rowValid, axis: 0))
+        }
+        let attended = referenceAttention(
+            q, keys: expandedDimensions(stacked(keys, axis: 0), axis: 1),
+            valid: expandedDimensions(stacked(valid, axis: 0), axis: 1)
+        ).asType(q.dtype)
         var out = rope(attended, offsets: offsetArray, inverse: true)
         out = out.reshaped(B, groups, heads / groups, 1, headDim).transposed(0, 1, 3, 2, 4)
             .reshaped(B, groups, 1, heads / groups * headDim)
@@ -1126,161 +1084,145 @@ final class DeepseekV4Attention: Module {
         return woB(out.transposed(0, 2, 1, 3).reshaped(B, 1, -1))
     }
 
+    /// `RotatingKVCache` returns a one-token update in storage (ring) order;
+    /// the window list needs temporal order. Multi-token updates already are.
+    static func temporal(_ window: MLXArray, cache: RotatingKVCache) -> MLXArray {
+        let meta = cache.metaState
+        guard meta.count >= 7, let idx = Int(meta[4]), Int(meta[0]) == 0 else { return window }
+        let length = window.dim(2)
+        if idx >= length { return window }
+        if meta[6] == "true" {
+            return concatenated([window[.ellipsis, idx..., 0...], window[.ellipsis, ..<idx, 0...]], axis: 2)
+        }
+        return window[.ellipsis, ..<idx, 0...]
+    }
+
+    /// The reference's window list (`get_window_topk_idxs`, `inference/
+    /// model.py:258-270`) for queries at `positions`: `slidingWindow` slots in
+    /// temporal order, the last `window` positions up to the query, or
+    /// positions `0...p` followed by invalid slots early on. `local` is
+    /// `[S, D]` in temporal order, `local[0]` at position `first`. Returns
+    /// `[L, W, D]` keys and `[L, W]` validity.
+    private func windowList(_ local: MLXArray, first: Int, positions: [Int]) -> (MLXArray, MLXArray) {
+        let S = local.dim(0)
+        var index = [Int32]()
+        var valid = [Bool]()
+        for p in positions {
+            for j in 0 ..< window {
+                let position = p >= window - 1 ? p - window + 1 + j : j
+                let ok = position <= p && position - first >= 0 && position - first < S
+                index.append(Int32(ok ? position - first : 0))
+                valid.append(ok)
+            }
+        }
+        let L = positions.count
+        return (
+            take(local, MLXArray(index), axis: 0).reshaped(L, window, -1),
+            MLXArray(valid).reshaped(L, window)
+        )
+    }
+
+    /// Bytes of gathered float32 keys one prompt tile may hold.
+    var keyWorkspaceBytes = 512 << 20
+
+    /// The reference attention for the queries at `offset ..< offset + L`:
+    /// each query's key list is its window list followed by its compressed
+    /// list (every visible entry of a ratio-128 pool in order; the indexer's
+    /// top-k in descending score order on ratio-4 layers), as `sparse_attn`
+    /// receives them.
     private func attend(
         _ x: MLXArray, q: MLXArray, kv: MLXArray, qResidual: MLXArray, mask: MLXArray?,
         cache: DeepseekV4LayerCache, offset: Int
     ) -> MLXArray {
-        let L = x.dim(1)
-        let (local, _) = cache.local.update(
+        let (B, L) = (x.dim(0), x.dim(1))
+        let (updated, _) = cache.local.update(
             keys: kv, values: MLXArray.zeros([kv.dim(0), 1, L, 0], dtype: kv.dtype))
-        let localMask = alignLocalMask(mask, length: local.dim(2))
-        let sinks = attnSink.asType(.float32)
+        let local = L == 1 ? Self.temporal(updated, cache: cache.local) : updated
+        let first = offset + L - local.dim(2)
 
-        guard let compressor, let poolCache = cache.pool else {
-            return sdpa(q, local, mask: localMask, sinks: sinks)
-        }
-        let pooled = compressor(x, cache: poolCache, offset: offset)
-        let poolMask = poolCache.poolMask(queries: L, offset: offset)
-        let topk: MLXArray?
-        if let indexer, let indexCache = cache.indexPool {
-            topk = indexer(x, qResidual: qResidual, rope: rope, cache: indexCache, offset: offset)
-        } else {
-            topk = nil
-        }
-
-        if pooled.dim(1) == 0 {
-            return sdpa(q, local, mask: localMask, sinks: sinks)
-        }
-        if let topk, let indexer, pooled.dim(1) > indexer.topK {
-            var sparseMask: MLXArray?
-            if let poolMask {
-                sparseMask = expandedDimensions(
-                    takeAlong(expandedDimensions(poolMask, axis: 0), topk, axis: 2), axis: 1)
+        // [B, L, C] compressed indices and validity, or nil without a pool.
+        var list: (indices: MLXArray, valid: MLXArray, pooled: MLXArray)?
+        if let compressor, let poolCache = cache.pool {
+            let pooled = compressor(x, cache: poolCache, offset: offset)
+            let visible = MLXArray((offset ..< (offset + L)).map { Int32(($0 + 1) / ratio) })
+                .reshaped(1, L, 1)
+            if let indexer, let indexCache = cache.indexPool {
+                if let topk = indexer(x, qResidual: qResidual, rope: rope, cache: indexCache, offset: offset) {
+                    let topk = topk.asType(.int32)
+                    list = (topk, topk .< visible, pooled)
+                }
+            } else if pooled.dim(1) > 0 {
+                let indices = broadcast(
+                    MLXArray.arange(pooled.dim(1), dtype: .int32).reshaped(1, 1, -1),
+                    to: [B, L, pooled.dim(1)])
+                list = (indices, indices .< visible, pooled)
             }
-            return sparsePooledAttention(
-                q: q, local: local, pooled: pooled, topk: topk, localMask: localMask,
-                pooledMask: sparseMask, sinks: sinks)
         }
-        let full = concatenated([local, expandedDimensions(pooled, axis: 1)], axis: 2)
-        return sdpa(q, full, mask: extendMask(localMask, poolMask, length: full.dim(2)), sinks: sinks)
+
+        let K = window + (list?.indices.dim(2) ?? 0)
+        let tile = max(1, min(L, keyWorkspaceBytes / max(1, B * K * headDim * 4)))
+        var parts = [MLXArray]()
+        for start in stride(from: 0, to: L, by: tile) {
+            let end = min(start + tile, L)
+            let n = end - start
+            var keys = [MLXArray]()
+            var valid = [MLXArray]()
+            for row in 0 ..< B {
+                let (windowKeys, windowValid) = windowList(
+                    local[row, 0], first: first, positions: Array((offset + start) ..< (offset + end)))
+                var rowKeys = [windowKeys]
+                var rowValid = [windowValid]
+                if let list {
+                    let indices = list.indices[row, start ..< end]
+                    let safe = maximum(indices, Int32(0))
+                    rowKeys.append(
+                        take(list.pooled[row], safe.flattened(), axis: 0)
+                            .reshaped(n, indices.dim(-1), headDim))
+                    rowValid.append(list.valid[row, start ..< end])
+                }
+                keys.append(concatenated(rowKeys, axis: 1))
+                valid.append(concatenated(rowValid, axis: 1))
+            }
+            let part = referenceAttention(
+                q[0..., 0..., start ..< end], keys: stacked(keys, axis: 0),
+                valid: stacked(valid, axis: 0)
+            ).asType(q.dtype)
+            if tile < L { eval(part) }
+            parts.append(part)
+        }
+        return parts.count == 1 ? parts[0] : concatenated(parts, axis: 2)
     }
 
-    /// Queries per tile of a multi-token float32 attention, bounding its
-    /// `[B, H, tile, S]` scores.
-    static let queryTile = 512
-
-    /// Attention with the float32 sinks joining the softmax (`sparse_attn`,
-    /// `inference/kernel.py:294-350`): float32 scores, max and normalizer;
-    /// the unnormalized weights are rounded to bf16 before the value product
-    /// (`deepseekV4KernelWeights`), which accumulates in float32. Long prompt
-    /// chunks run in query tiles.
-    private func sdpa(_ q: MLXArray, _ kv: MLXArray, mask: MLXArray?, sinks: MLXArray) -> MLXArray {
-        let kv32 = kv.asType(.float32)
-        let sinkLogits = sinks.asType(.float32).reshaped(1, -1, 1, 1)
-        func attend(_ q: MLXArray, _ mask: MLXArray?) -> MLXArray {
-            let scores = deepseekV4MaskScores(
-                matmul(q.asType(.float32) * scale, kv32.swappedAxes(-1, -2)), mask)
-            let peak = scores.max(axis: -1, keepDims: true)
-            let weights = exp(scores - peak)
-            let normalizer = weights.sum(axis: -1, keepDims: true) + exp(sinkLogits - peak)
-            return matmul(deepseekV4KernelWeights(weights), kv32) / normalizer
+    /// `sparse_attn` (`inference/kernel.py:294-350`) for queries `[B, H, L, D]`
+    /// over per-query keys `[B, L, K, D]` (values are the keys) with validity
+    /// `[B, L, K]`: float32 scores; over 64-key blocks in list order, a
+    /// running max, `exp(s - running max)` rounded to bf16 for the value
+    /// product, and the float32 accumulator and normalizer rescaled when the
+    /// max rises; the float32 sink joins the normalizer at the end.
+    func referenceAttention(_ q: MLXArray, keys: MLXArray, valid: MLXArray) -> MLXArray {
+        let (B, H, L) = (q.dim(0), q.dim(1), q.dim(2))
+        let K = keys.dim(2)
+        let block = 64
+        let blocks = (K + block - 1) / block
+        let keys32 = keys.asType(.float32)
+        var scores = matmul(
+            q.transposed(0, 2, 1, 3).asType(.float32) * scale, keys32.swappedAxes(-1, -2))  // [B, L, H, K]
+        scores = MLX.where(expandedDimensions(valid, axis: 2), scores, MLXArray(-Float.infinity))
+        if blocks * block > K {
+            scores = concatenated(
+                [scores, MLXArray.full([B, L, H, blocks * block - K], values: MLXArray(-Float.infinity))],
+                axis: -1)
         }
-        let L = q.dim(2)
-        guard L > Self.queryTile else { return attend(q, mask).asType(q.dtype) }
-        var tiles = [MLXArray]()
-        for start in stride(from: 0, to: L, by: Self.queryTile) {
-            let end = min(start + Self.queryTile, L)
-            let tile = attend(
-                q[0..., 0..., start ..< end], mask.map { $0[.ellipsis, start ..< end, 0...] })
-                .asType(q.dtype)
-            eval(tile)
-            tiles.append(tile)
-        }
-        return concatenated(tiles, axis: 2)
-    }
-
-    /// `_align_local_mask`: the mask's key axis to the local window's length.
-    private func alignLocalMask(_ mask: MLXArray?, length: Int) -> MLXArray? {
-        guard let mask else { return nil }
-        let current = mask.dim(-1)
-        if current == length { return mask }
-        if current > length { return mask[.ellipsis, (current - length)...] }
-        var padShape = mask.shape
-        padShape[padShape.count - 1] = length - current
-        return concatenated([MLXArray.ones(padShape, dtype: .bool), mask], axis: -1)
-    }
-
-    /// `_extend_mask`: append the pool's `[L, P]` visibility (all visible when `nil`).
-    private func extendMask(_ mask: MLXArray?, _ poolMask: MLXArray?, length: Int) -> MLXArray? {
-        guard let mask else { return nil }
-        let width = length - mask.dim(-1)
-        let pool = poolMask ?? MLXArray.ones([mask.dim(-2), width], dtype: .bool)
-        return concatenated([mask, pool], axis: -1)
-    }
-
-    /// `_sparse_pooled_attention` (`language.py:438-473`): one softmax over the
-    /// local window, the gathered top-k pooled entries and the sink, with the
-    /// arithmetic of `sdpa` (`sparse_attn`, `inference/kernel.py:294-350`).
-    /// Long prompt chunks run in query tiles.
-    private func sparsePooledAttention(
-        q: MLXArray, local: MLXArray, pooled: MLXArray, topk: MLXArray, localMask: MLXArray?,
-        pooledMask: MLXArray?, sinks: MLXArray
-    ) -> MLXArray {
-        let L = topk.dim(1)
-        guard L > Self.queryTile else {
-            return sparsePooledTile(
-                q: q, local: local, pooled: pooled, topk: topk, localMask: localMask,
-                pooledMask: pooledMask, sinks: sinks)
-        }
-        var tiles = [MLXArray]()
-        for start in stride(from: 0, to: L, by: Self.queryTile) {
-            let end = min(start + Self.queryTile, L)
-            let tile = sparsePooledTile(
-                q: q[0..., 0..., start ..< end], local: local, pooled: pooled,
-                topk: topk[0..., start ..< end],
-                localMask: localMask.map { $0[.ellipsis, start ..< end, 0...] },
-                pooledMask: pooledMask.map { $0[.ellipsis, start ..< end, 0...] }, sinks: sinks)
-            eval(tile)
-            tiles.append(tile)
-        }
-        return concatenated(tiles, axis: 2)
-    }
-
-    private func sparsePooledTile(
-        q: MLXArray, local: MLXArray, pooled: MLXArray, topk: MLXArray, localMask: MLXArray?,
-        pooledMask: MLXArray?, sinks: MLXArray
-    ) -> MLXArray {
-        let (B, poolCount, D) = (pooled.dim(0), pooled.dim(1), pooled.dim(2))
-        let (L, k) = (topk.dim(1), topk.dim(2))
-        let gathered: MLXArray
-        if B == 1 {
-            gathered = take(pooled, topk.reshaped(-1), axis: 1).reshaped(B, L, k, D)
-        } else {
-            var rows = MLX.where(topk .< 0, topk + Int32(poolCount), topk)
-            rows = rows + (MLXArray.arange(B, dtype: topk.dtype) * Int32(poolCount)).reshaped(B, 1, 1)
-            gathered = take(pooled.reshaped(B * poolCount, D), rows.reshaped(-1), axis: 0)
-                .reshaped(B, L, k, D)
-        }
-        let local32 = local.asType(.float32)
-        let gathered32 = gathered.asType(.float32)
-
-        let qScaled = q.asType(.float32) * scale
-        let localScores = deepseekV4MaskScores(matmul(qScaled, local32.swappedAxes(-1, -2)), localMask)
-        let pooledScores = deepseekV4MaskScores(
-            matmul(qScaled.transposed(0, 2, 1, 3), gathered32.swappedAxes(-1, -2))
-                .transposed(0, 2, 1, 3), pooledMask)
-        let peak = maximum(
-            localScores.max(axis: -1, keepDims: true), pooledScores.max(axis: -1, keepDims: true))
-        let localWeights = exp(localScores - peak)
-        let pooledWeights = exp(pooledScores - peak)
-        let normalizer = localWeights.sum(axis: -1, keepDims: true)
-            + pooledWeights.sum(axis: -1, keepDims: true)
-            + exp(sinks.asType(.float32).reshaped(1, -1, 1, 1) - peak)
-
-        let out = (matmul(deepseekV4KernelWeights(localWeights), local32)
-            + matmul(deepseekV4KernelWeights(pooledWeights).transposed(0, 2, 1, 3), gathered32)
-                .transposed(0, 2, 1, 3)) / normalizer
-        return out.asType(q.dtype)
+        let blocked = scores.reshaped(B, L, H, blocks, block)
+        let running = cummax(blocked.max(axis: -1), axis: -1)  // [B, L, H, blocks]
+        let peak = running[.ellipsis, (blocks - 1)...]  // [B, L, H, 1]
+        let weights = exp(blocked - expandedDimensions(running, axis: -1))
+        let rescale = exp(running - peak)
+        let normalizer = (weights.sum(axis: -1) * rescale).sum(axis: -1, keepDims: true)
+            + exp(attnSink.asType(.float32).reshaped(1, 1, H, 1) - peak)
+        let valueWeights = (deepseekV4KernelWeights(weights) * expandedDimensions(rescale, axis: -1))
+            .reshaped(B, L, H, blocks * block)[.ellipsis, ..<K]
+        return (matmul(valueWeights, keys32) / normalizer).transposed(0, 2, 1, 3)
     }
 }
 
@@ -1464,7 +1406,15 @@ public final class DeepseekV4Model: Module, LLMModel {
     /// calls. Prefill each row with `prepare` before admitting its last token.
     /// Only projections and MoE are batched; ragged attention never pads or
     /// changes the reference pooling boundaries.
+    /// Whether `decodeBatch` rows equal their serial runs exactly. An
+    /// explicitly configured HISA indexer (approximate, never the default)
+    /// does not batch; serve it serially.
+    public var batchesExactly: Bool {
+        !(configuration.indexBlock > 0 && configuration.indexKeep > 0)
+    }
+
     public func decodeBatch(_ inputs: MLXArray, rowCaches: [[KVCache]]) -> MLXArray {
+        precondition(batchesExactly, "DeepSeek V4 with a HISA indexer does not batch")
         precondition(inputs.ndim == 2 && inputs.dim(1) == 1)
         precondition((1 ... 8).contains(inputs.dim(0)), "DeepSeek V4 decode supports 1...8 rows")
         precondition(rowCaches.count == inputs.dim(0))
