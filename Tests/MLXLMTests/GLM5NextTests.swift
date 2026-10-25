@@ -1654,6 +1654,27 @@ final class GLM5NextTests: XCTestCase {
         model.model.deferredDecode = true
     }
 
+    /// The campaign cohorts fit the eight-token qmv bound. Equal-length
+    /// rows share attention; ragged/padded rows retain independent rollback.
+    func testPackedVerifyDepthOneCohortsMatchSerialRows() throws {
+        let model = try fusedShapesModel(seed: 301)
+        for count in [2, 4] {
+            for lengths in [Array(repeating: 7, count: count),
+                            (0 ..< count).map { $0 < count / 2 ? 11 : 15 }] {
+                let prompts = lengths.enumerated().map { tokens($1, seed: UInt64(302 + $0)) }
+                for deferred in [true, false] {
+                    model.model.deferredDecode = deferred
+                    try assertPackedVerifyMatchesSerialRows(
+                        model, layers: model.model.layers, prompts: prompts,
+                        label: "depth 1 rows=\(count) lengths=\(lengths) deferred=\(deferred)",
+                        widths: Array(repeating: 2, count: count),
+                        retained: (0 ..< count).map { $0.isMultiple(of: 2) ? 2 : 1 })
+                }
+            }
+        }
+        model.model.deferredDecode = true
+    }
+
     /// Depth-D packed verification: rows of 4 and 2 columns (8 flattened
     /// tokens) committed at every retained count.
     func testPackedVerifyDepthThreeMatchesSerialRows() throws {
