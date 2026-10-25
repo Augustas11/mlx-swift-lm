@@ -224,6 +224,15 @@ private func deepseekV4FinfoMin(_ dtype: DType) -> Float {
     }
 }
 
+/// The kernel's unnormalized attention weights as the value product reads
+/// them: `exp(s - max)` rounded to bf16 (`acc_s_cast`, `inference/kernel.py:
+/// 305, 340-343`), the normalizer and accumulation staying float32. The
+/// kernel takes its running max over 64-key blocks in its key order; this
+/// takes the row max over all keys (the kernel's final max).
+private func deepseekV4KernelWeights(_ weights: MLXArray) -> MLXArray {
+    weights.asType(.bfloat16).asType(.float32)
+}
+
 private func deepseekV4MaskScores(_ scores: MLXArray, _ mask: MLXArray?) -> MLXArray {
     guard let mask else { return scores }
     return MLX.where(mask, scores, MLXArray(deepseekV4FinfoMin(scores.dtype)).asType(scores.dtype))
@@ -276,7 +285,8 @@ private let deepseekV4LinearF32Kernel = MLXFast.metalKernel(
 /// `layer(x)` with float32 output, as the reference's float32 linears
 /// (`F.linear(x.float(), weight.float())`) compute it, without a float32
 /// copy of a bfloat16 weight: up to 8 rows on the GPU use the kernel above;
-/// longer inputs (prompt chunks) and the CPU widen the weight per call.
+/// longer inputs (prompt chunks) and the CPU widen the weight per call. Like
+/// the kernel, a decode row's result does not depend on the other rows.
 func deepseekV4LinearF32(_ layer: Linear, _ x: MLXArray) -> MLXArray {
     let x32 = x.asType(.float32)
     if let quantized = layer as? QuantizedLinear { return quantized(x32) }
@@ -295,6 +305,13 @@ func deepseekV4LinearF32(_ layer: Linear, _ x: MLXArray) -> MLXArray {
             outputShapes: [[rows, N]],
             outputDTypes: [.float32]
         )[0].reshaped(Array(x.shape.dropLast()) + [N])
+    } else if (2 ... 8).contains(rows), Device.defaultDevice().deviceType == .cpu {
+        // CPU GEMM rounds a row differently from the one-row GEMV; decode rows
+        // go one at a time so a batched row equals its serial self.
+        let widened = weight.asType(.float32).T
+        let flat = x32.reshaped(rows, K)
+        out = concatenated((0 ..< rows).map { matmul(flat[$0 ..< ($0 + 1)], widened) }, axis: 0)
+            .reshaped(Array(x.shape.dropLast()) + [N])
     } else {
         out = matmul(x32, weight.asType(.float32).T)
     }
@@ -697,6 +714,9 @@ final class DeepseekV4Indexer: Module {
     let block: Int
     let keep: Int
 
+    /// Bytes of float32 indexer scores one prefill tile may hold.
+    var scoreWorkspaceBytes = 512 << 20
+
     @ModuleInfo(key: "wq_b") var wqB: Linear
     @ModuleInfo(key: "weights_proj") var weightsProj: Linear
     @ModuleInfo(key: "compressor") var compressor: DeepseekV4Compressor
@@ -813,16 +833,32 @@ final class DeepseekV4Indexer: Module {
             return hisaPrefill(q: q, pooled: pooled, weights: weights, k: k, visible: visible)
         }
 
-        var scores = matmul(
-            q.asType(.float32), expandedDimensions(pooled, axis: 1).swappedAxes(-1, -2).asType(.float32))
-        scores = maximum(scores, 0) * scale
-        scores = (scores * expandedDimensions(weights.swappedAxes(-1, -2), axis: -1)).sum(axis: 1)
-        if let poolMask {
-            scores = MLX.where(
-                expandedDimensions(poolMask, axis: 0), scores,
-                MLXArray(-Float.greatestFiniteMagnitude))
+        let keys = expandedDimensions(pooled, axis: 1).swappedAxes(-1, -2).asType(.float32)
+        func exactTopK(_ q: MLXArray, _ weights: MLXArray, _ poolMask: MLXArray?) -> MLXArray {
+            var scores = maximum(matmul(q.asType(.float32), keys), 0) * scale
+            scores = (scores * expandedDimensions(weights.swappedAxes(-1, -2), axis: -1)).sum(axis: 1)
+            if let poolMask {
+                scores = MLX.where(
+                    expandedDimensions(poolMask, axis: 0), scores,
+                    MLXArray(-Float.greatestFiniteMagnitude))
+            }
+            return argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k]
         }
-        return argPartition(-scores, kth: k - 1, axis: -1)[.ellipsis, ..<k]
+        // The `[B, H, tile, P]` float32 scores stay within the workspace
+        // budget however long the context grows; each tile keeps only its
+        // selection.
+        let tile = max(1, scoreWorkspaceBytes / max(1, B * heads * poolCount * 4))
+        guard L > tile else { return exactTopK(q, weights, poolMask) }
+        var parts = [MLXArray]()
+        for start in stride(from: 0, to: L, by: tile) {
+            let end = min(start + tile, L)
+            let part = exactTopK(
+                q[0..., 0..., start ..< end], weights[0..., start ..< end],
+                poolMask.map { $0[start ..< end] })
+            eval(part)
+            parts.append(part)
+        }
+        return concatenated(parts, axis: 1)
     }
 
     /// `_hisa_select` (`language.py:672-710`): one query per row, every pooled
@@ -1133,30 +1169,29 @@ final class DeepseekV4Attention: Module {
     /// `[B, H, tile, S]` scores.
     static let queryTile = 512
 
-    /// Attention with the float32 sinks joining the softmax, all in float32
-    /// (`sparse_attn`, `inference/kernel.py:294-350`: float32 scores, running
-    /// max and sum, and accumulation). MLX's fused attention takes the sinks
-    /// in the queries' dtype, so it runs on float32 queries and keys. Long
-    /// prompt chunks run in query tiles.
+    /// Attention with the float32 sinks joining the softmax (`sparse_attn`,
+    /// `inference/kernel.py:294-350`): float32 scores, max and normalizer;
+    /// the unnormalized weights are rounded to bf16 before the value product
+    /// (`deepseekV4KernelWeights`), which accumulates in float32. Long prompt
+    /// chunks run in query tiles.
     private func sdpa(_ q: MLXArray, _ kv: MLXArray, mask: MLXArray?, sinks: MLXArray) -> MLXArray {
         let kv32 = kv.asType(.float32)
+        let sinkLogits = sinks.asType(.float32).reshaped(1, -1, 1, 1)
         func attend(_ q: MLXArray, _ mask: MLXArray?) -> MLXArray {
-            if let mask {
-                return MLXFast.scaledDotProductAttention(
-                    queries: q, keys: kv32, values: kv32, scale: scale, mask: .array(mask),
-                    sinks: sinks)
-            }
-            return MLXFast.scaledDotProductAttention(
-                queries: q, keys: kv32, values: kv32, scale: scale, mask: .none, sinks: sinks)
+            let scores = deepseekV4MaskScores(
+                matmul(q.asType(.float32) * scale, kv32.swappedAxes(-1, -2)), mask)
+            let peak = scores.max(axis: -1, keepDims: true)
+            let weights = exp(scores - peak)
+            let normalizer = weights.sum(axis: -1, keepDims: true) + exp(sinkLogits - peak)
+            return matmul(deepseekV4KernelWeights(weights), kv32) / normalizer
         }
-        let q32 = q.asType(.float32)
         let L = q.dim(2)
-        guard L > Self.queryTile else { return attend(q32, mask).asType(q.dtype) }
+        guard L > Self.queryTile else { return attend(q, mask).asType(q.dtype) }
         var tiles = [MLXArray]()
         for start in stride(from: 0, to: L, by: Self.queryTile) {
             let end = min(start + Self.queryTile, L)
             let tile = attend(
-                q32[0..., 0..., start ..< end], mask.map { $0[.ellipsis, start ..< end, 0...] })
+                q[0..., 0..., start ..< end], mask.map { $0[.ellipsis, start ..< end, 0...] })
                 .asType(q.dtype)
             eval(tile)
             tiles.append(tile)
@@ -1184,8 +1219,8 @@ final class DeepseekV4Attention: Module {
     }
 
     /// `_sparse_pooled_attention` (`language.py:438-473`): one softmax over the
-    /// local window, the gathered top-k pooled entries and the sink, in
-    /// float32 throughout (`sparse_attn`, `inference/kernel.py:294-350`).
+    /// local window, the gathered top-k pooled entries and the sink, with the
+    /// arithmetic of `sdpa` (`sparse_attn`, `inference/kernel.py:294-350`).
     /// Long prompt chunks run in query tiles.
     private func sparsePooledAttention(
         q: MLXArray, local: MLXArray, pooled: MLXArray, topk: MLXArray, localMask: MLXArray?,
@@ -1231,17 +1266,20 @@ final class DeepseekV4Attention: Module {
 
         let qScaled = q.asType(.float32) * scale
         let localScores = deepseekV4MaskScores(matmul(qScaled, local32.swappedAxes(-1, -2)), localMask)
-        var normalizer = logSumExp(localScores, axis: -1, keepDims: true)
-        let qByToken = qScaled.transposed(0, 2, 1, 3)
         let pooledScores = deepseekV4MaskScores(
-            matmul(qByToken, gathered32.swappedAxes(-1, -2)).transposed(0, 2, 1, 3), pooledMask)
-        normalizer = logAddExp(normalizer, logSumExp(pooledScores, axis: -1, keepDims: true))
-        normalizer = logAddExp(normalizer, sinks.asType(.float32).reshaped(1, -1, 1, 1))
-        let localWeights = exp(localScores - normalizer)
-        let pooledWeights = exp(pooledScores - normalizer)
+            matmul(qScaled.transposed(0, 2, 1, 3), gathered32.swappedAxes(-1, -2))
+                .transposed(0, 2, 1, 3), pooledMask)
+        let peak = maximum(
+            localScores.max(axis: -1, keepDims: true), pooledScores.max(axis: -1, keepDims: true))
+        let localWeights = exp(localScores - peak)
+        let pooledWeights = exp(pooledScores - peak)
+        let normalizer = localWeights.sum(axis: -1, keepDims: true)
+            + pooledWeights.sum(axis: -1, keepDims: true)
+            + exp(sinks.asType(.float32).reshaped(1, -1, 1, 1) - peak)
 
-        let out = matmul(localWeights, local32)
-            + matmul(pooledWeights.transposed(0, 2, 1, 3), gathered32).transposed(0, 2, 1, 3)
+        let out = (matmul(deepseekV4KernelWeights(localWeights), local32)
+            + matmul(deepseekV4KernelWeights(pooledWeights).transposed(0, 2, 1, 3), gathered32)
+                .transposed(0, 2, 1, 3)) / normalizer
         return out.asType(q.dtype)
     }
 }

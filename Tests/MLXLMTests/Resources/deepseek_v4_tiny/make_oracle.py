@@ -3,8 +3,10 @@
 `make_fixture.py` writes the weights (`config.json`, `model.safetensors`).
 This script writes `oracle.json` from the TensorFold MLX port of DeepSeek's
 `inference/model.py` + `kernel.py` (`deepseek_v4.py` in the
-`DeepSeek-V4-Flash-0731-MXFP4-MLX` repository): fp32 compressor with carried
-overlap state, exact flat top-k indexer, fp32 sparse attention and sinks,
+`DeepSeek-V4-Flash-0731-MXFP4-MLX` repository), with its `hc_post` stream mix
+and its sparse attention's bf16 weight rounding corrected to DeepSeek's: fp32
+compressor with carried overlap state, exact flat top-k indexer, sparse
+attention with fp32 scores and sinks,
 fp32 router, fp32 expert SwiGLU and combine, fp32 head logits. The fixture's
 bf16 tensors are widened to float32 (see `build`). Prefill is one call over
 the whole prompt, then one token per step, on the CPU.
@@ -58,6 +60,27 @@ def load_reference(path, qat):
         return y.astype(x.dtype)
 
     module.Block.hc_post = hc_post
+
+    # DeepSeek's sparse_attn kernel rounds the unnormalized weights exp(s - max)
+    # to bf16 before the value product (kernel.py:305, 340-343) and keeps the
+    # normalizer and accumulation in float32; the port keeps the weights in
+    # float32. Like the Swift port, this takes the row max over all keys.
+    def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
+        n = kv.shape[1]
+        safe = mx.clip(topk_idxs, 0, n - 1)
+        sel = mx.take_along_axis(
+            kv[:, None, :, :], mx.broadcast_to(safe[..., None], (*safe.shape, kv.shape[-1])), axis=2)
+        sel = sel.astype(mx.float32)
+        scores = mx.einsum("bshd,bskd->bhsk", q.astype(mx.float32), sel) * softmax_scale
+        valid = (topk_idxs != -1)[:, None, :, :]
+        scores = mx.where(valid, scores, mx.array(-float("inf"), mx.float32))
+        m = scores.max(axis=-1, keepdims=True)
+        p = mx.exp(scores - m)
+        denom = p.sum(axis=-1) + mx.exp(attn_sink.astype(mx.float32)[None, :, None] - m[..., 0])
+        o = mx.einsum("bhsk,bskd->bhsd", p.astype(mx.bfloat16).astype(mx.float32), sel)
+        return mx.swapaxes(o / denom[..., None], 1, 2).astype(q.dtype)
+
+    module.sparse_attn = sparse_attn
     return module
 
 
