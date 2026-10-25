@@ -460,6 +460,32 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
+    /// The float32 linear (compressor projections, head) on the GPU: the
+    /// bfloat16-weight kernel equals a float32 matmul over the widened weight
+    /// up to summation order, and a row's result does not depend on how many
+    /// rows share the call.
+    func testFloat32LinearKernelMatchesWidenedWeight() throws {
+        guard Device.defaultDevice().deviceType == .gpu else { throw XCTSkip("GPU only") }
+        MLXRandom.seed(272)
+        for (K, N) in [(64, 129), (4096, 1000)] {
+            let weight = MLXRandom.normal([N, K]).asType(.bfloat16)
+            let layer = Linear(weight: weight)
+            let x = MLXRandom.normal([8, 1, K]).asType(.bfloat16)
+            let expected = matmul(x.asType(.float32), weight.asType(.float32).T)
+            let full = deepseekV4LinearF32(layer, x)
+            XCTAssertEqual(full.dtype, .float32)
+            XCTAssertEqual(full.shape, [8, 1, N])
+            let scale = abs(expected).max().item(Float.self)
+            XCTAssertLessThan(
+                abs(full - expected).max().item(Float.self) / scale, 1e-5, "K=\(K) N=\(N)")
+            for rows in 1 ... 7 {
+                let part = deepseekV4LinearF32(layer, x[..<rows])
+                XCTAssertEqual(
+                    part.asArray(Float.self), full[..<rows].asArray(Float.self), "rows=\(rows)")
+            }
+        }
+    }
+
     func testContinuousBatchUsesKeysOnlyWindowsAndIndependentPoolSnapshots() throws {
         try Device.withDefaultDevice(.cpu) {
             let model = try loadTiny(indexBlock: 4, indexKeep: 2)

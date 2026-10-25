@@ -237,6 +237,71 @@ private func callMultiLinear(_ module: Module, _ x: MLXArray) -> MLXArray {
     }
 }
 
+// MARK: - Float32 linear
+
+/// `x @ w.T` as float32 for `M` rows of float32 `x` and a bfloat16 `w`
+/// `[N, K]`: each simdgroup reads one row of `w` once and accumulates every
+/// row of `x` in float32 (bfloat16 widens to float32 exactly). A row's sum
+/// does not depend on `M`, so batched decode rows match one-row calls.
+private let deepseekV4LinearF32Kernel = MLXFast.metalKernel(
+    name: "deepseek_v4_linear_f32",
+    inputNames: ["x", "w"],
+    outputNames: ["out"],
+    source: """
+        const uint n = threadgroup_position_in_grid.x * 8 + simdgroup_index_in_threadgroup;
+        const uint lane = thread_index_in_simdgroup;
+        if (n >= uint(N)) { return; }
+        const device uint4* row = reinterpret_cast<const device uint4*>(w) + n * uint(K / 8);
+        float acc[M];
+        for (int m = 0; m < M; ++m) { acc[m] = 0.0f; }
+        for (uint i = lane; i < uint(K / 8); i += 32) {
+            const uint4 p = row[i];
+            const float4 lo = float4(
+                as_type<float>(p.x << 16), as_type<float>(p.x & 0xFFFF0000u),
+                as_type<float>(p.y << 16), as_type<float>(p.y & 0xFFFF0000u));
+            const float4 hi = float4(
+                as_type<float>(p.z << 16), as_type<float>(p.z & 0xFFFF0000u),
+                as_type<float>(p.w << 16), as_type<float>(p.w & 0xFFFF0000u));
+            for (int m = 0; m < M; ++m) {
+                const device float4* xr = reinterpret_cast<const device float4*>(x + m * K) + 2 * i;
+                acc[m] += dot(xr[0], lo) + dot(xr[1], hi);
+            }
+        }
+        for (int m = 0; m < M; ++m) {
+            const float total = simd_sum(acc[m]);
+            if (lane == 0) { out[m * N + n] = total; }
+        }
+        """)
+
+/// `layer(x)` with float32 output, as the reference's float32 linears
+/// (`F.linear(x.float(), weight.float())`) compute it, without a float32
+/// copy of a bfloat16 weight: up to 8 rows on the GPU use the kernel above;
+/// longer inputs (prompt chunks) and the CPU widen the weight per call.
+func deepseekV4LinearF32(_ layer: Linear, _ x: MLXArray) -> MLXArray {
+    let x32 = x.asType(.float32)
+    if let quantized = layer as? QuantizedLinear { return quantized(x32) }
+    let weight = layer.weight
+    let (K, N) = (x.dim(-1), weight.dim(0))
+    let rows = x.size / max(K, 1)
+    var out: MLXArray
+    if weight.dtype == .bfloat16, (1 ... 8).contains(rows), K % 8 == 0,
+        Device.defaultDevice().deviceType == .gpu
+    {
+        out = deepseekV4LinearF32Kernel(
+            [x32.reshaped(rows, K), weight],
+            template: [("M", rows), ("K", K), ("N", N)],
+            grid: ((N + 7) / 8 * 256, 1, 1),
+            threadGroup: (256, 1, 1),
+            outputShapes: [[rows, N]],
+            outputDTypes: [.float32]
+        )[0].reshaped(Array(x.shape.dropLast()) + [N])
+    } else {
+        out = matmul(x32, weight.asType(.float32).T)
+    }
+    if let bias = layer.bias { out = out + bias.asType(.float32) }
+    return out
+}
+
 // MARK: - RoPE
 
 /// DeepSeek-V4 RoPE (`language.py:258-339`): traditional pairs on the last
@@ -424,10 +489,11 @@ final class DeepseekV4MoE: Module {
 
 // MARK: - Compressor and indexer
 
+/// Non-overlapping windows: float32 `softmax(gate + ape)`-weighted sum.
 private let deepseekV4SimpleCompress: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
     compile(shapeless: true) { kv, gate, ape in
-        let weights = softmax(gate.asType(.float32) + ape, axis: -2).asType(kv.dtype)
-        return (kv * weights).sum(axis: -2)
+        let weights = softmax(gate.asType(.float32) + ape.asType(.float32), axis: -2)
+        return (kv.asType(.float32) * weights).sum(axis: -2)
     }
 
 /// Ratio-4 overlapping windows (`Compressor.overlap_transform` and the decode
@@ -452,10 +518,11 @@ private func deepseekV4OverlapCompress(
     let gateA = concatenated(
         [previous.gate.reshaped(B, 1, R, D / 2).asType(gate.dtype), gateParts[0][0..., ..<(W - 1)]],
         axis: 1)
-    let mixedKV = concatenated([kvA, kvParts[1]], axis: 2)
+    let mixedKV = concatenated([kvA, kvParts[1]], axis: 2).asType(.float32)
     let mixedGate = concatenated(
         [gateA + apeParts[0].asType(gate.dtype), gateParts[1] + apeParts[1].asType(gate.dtype)],
-        axis: 2)
+        axis: 2
+    ).asType(.float32)
     let weights = softmax(mixedGate, axis: -2, precise: true)
     let last = (
         kv: kvParts[0][0..., W - 1].asType(.float32), gate: gateParts[0][0..., W - 1].asType(.float32)
@@ -472,8 +539,10 @@ private func deepseekV4OverlapStart(rows: Int, ratio: Int, width: Int) -> (kv: M
 }
 
 /// Pools every complete window of `ratio` tokens into one entry
-/// (`Compressor`, `language.py:598-654`): `softmax(gate + ape)`-weighted sum
-/// of the window's kv, RMSNorm, then RoPE at the window's start position.
+/// (`Compressor`, `inference/model.py:286-375`): `softmax(gate + ape)`-weighted
+/// sum of the window's kv, RMSNorm, then RoPE at the window's start position.
+/// The projections, buffered rows, `ape`, softmax and sum are float32; the
+/// entry returns to the activation dtype before the norm (`kv.to(dtype)`).
 final class DeepseekV4Compressor: Module {
     let ratio: Int
     let headDim: Int
@@ -509,8 +578,8 @@ final class DeepseekV4Compressor: Module {
 
     /// Projections and completed-window compression are shared across decode rows.
     func decodeBatch(_ x: MLXArray, caches: [DeepseekV4PoolCache], offsets: [Int]) -> [MLXArray] {
-        let kv = wkv(x)
-        let gate = wgate(x)
+        let kv = deepseekV4LinearF32(wkv, x)
+        let gate = deepseekV4LinearF32(wgate, x)
         var readyKV = [MLXArray]()
         var readyGate = [MLXArray]()
         var completed = [Int]()
@@ -546,7 +615,7 @@ final class DeepseekV4Compressor: Module {
                 entries = deepseekV4SimpleCompress(kv, gate, ape)
             }
             entries = rope(
-                expandedDimensions(norm(entries), axis: 1), offsets: MLXArray(bases))
+                expandedDimensions(norm(entries.asType(x.dtype)), axis: 1), offsets: MLXArray(bases))
                 .squeezed(axis: 1)
             for (slot, row) in completed.enumerated() {
                 _ = caches[row].appendPooled(entries[slot ..< (slot + 1)])
@@ -560,7 +629,8 @@ final class DeepseekV4Compressor: Module {
     /// `x` (`[B, L, hidden]`, tokens `offset ..< offset + L`) completes.
     func callAsFunction(_ x: MLXArray, cache: DeepseekV4PoolCache, offset: Int) -> MLXArray {
         let B = x.dim(0)
-        let ready = cache.accumulateWindows(kv: wkv(x), gate: wgate(x), offset: offset)
+        let ready = cache.accumulateWindows(
+            kv: deepseekV4LinearF32(wkv, x), gate: deepseekV4LinearF32(wgate, x), offset: offset)
         guard ready.kv.dim(1) > 0 else {
             return cache.appendPooled(MLXArray.zeros([B, 0, headDim], dtype: x.dtype))
         }
@@ -577,7 +647,7 @@ final class DeepseekV4Compressor: Module {
         } else {
             entries = deepseekV4SimpleCompress(kv, gate, ape)
         }
-        entries = norm(entries)
+        entries = norm(entries.asType(x.dtype))
         entries = rope(expandedDimensions(entries, axis: 1), offset: ready.base).squeezed(axis: 1)
         return cache.appendPooled(entries)
     }

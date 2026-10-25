@@ -19,7 +19,7 @@ import MLX
 public final class DeepseekV4PoolCache: BaseKVCache {
     public let ratio: Int
 
-    /// `[B, ratio, D]` raw rows; the first `remainder` are live.
+    /// `[B, ratio, D]` raw rows (float32 projections); the first `remainder` are live.
     var bufferKV: MLXArray?
     var bufferGate: MLXArray?
     public private(set) var remainder = 0
