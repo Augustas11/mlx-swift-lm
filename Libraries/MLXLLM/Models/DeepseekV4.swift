@@ -393,8 +393,11 @@ final class DeepseekV4MLP: Module, UnaryLayer {
         super.init()
     }
 
+    /// The SwiGLU in float32, back to the activation dtype for `w2`
+    /// (`Expert.forward`, `inference/model.py:601-611`).
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(activation(gateProj(x), upProj(x)))
+        downProj(
+            activation(gateProj(x).asType(.float32), upProj(x).asType(.float32)).asType(x.dtype))
     }
 }
 
@@ -463,13 +466,15 @@ final class DeepseekV4MoE: Module {
     @ModuleInfo(key: "gate") var gate: DeepseekV4MoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_experts") var sharedExperts: DeepseekV4MLP
+    private let activation: @Sendable (MLXArray, MLXArray) -> MLXArray
 
     init(_ config: DeepseekV4Configuration, layerIdx: Int) {
         _gate.wrappedValue = DeepseekV4MoEGate(config, layerIdx: layerIdx)
         let limit = config.swigluLimit > 0 ? config.swigluLimit : nil
+        self.activation = makeLimitedSwiGLU(limit: limit)
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize, hiddenDims: config.moeIntermediateSize,
-            numExperts: config.nRoutedExperts, activationProduct: makeLimitedSwiGLU(limit: limit))
+            numExperts: config.nRoutedExperts, activationProduct: activation)
         _sharedExperts.wrappedValue = DeepseekV4MLP(
             hiddenSize: config.hiddenSize,
             intermediateSize: config.moeIntermediateSize * config.nSharedExperts,
@@ -477,13 +482,38 @@ final class DeepseekV4MoE: Module {
         super.init()
     }
 
-    /// `SwitchGLU._combine`: routed outputs weighted in their dtype, summed, plus the shared expert.
+    /// `MoE.forward` (`inference/model.py:638-649`): each routed expert's
+    /// SwiGLU in float32, scaled by its routing weight before `w2`
+    /// (`Expert.forward`, model.py:601-611), the expert outputs summed in
+    /// float32 and the shared expert added in float32. The projections go
+    /// through `switch_mlp`'s gathered matmuls, sorted by expert for long
+    /// inputs as `SwitchGLU` does.
     func callAsFunction(_ x: MLXArray, inputIDs: MLXArray) -> MLXArray {
         let (indices, weights) = gate(x, inputIDs: inputIDs)
-        let routed = switchMLP(x, indices)
-        let combined = (routed * expandedDimensions(weights.asType(routed.dtype), axis: -1))
-            .sum(axis: -2)
-        return combined + sharedExperts(x)
+        let k = indices.dim(-1)
+        let sorted = indices.size >= 64
+        var inputs = expandedDimensions(x, axes: [-2, -3])
+        var experts = indices
+        var routeWeights = expandedDimensions(weights, axes: [-1, -2])
+        var inverseOrder: MLXArray?
+        if sorted {
+            let flat = indices.flattened()
+            let order = argSort(flat)
+            inverseOrder = argSort(order)
+            inputs = inputs.flattened(start: 0, end: -3)[order.floorDivide(k)]
+            experts = flat[order]
+            routeWeights = weights.flattened()[order].reshaped(-1, 1, 1)
+        }
+        let gateOut = switchMLP.gateProjection(inputs, experts, sortedIndices: sorted)
+        let up = switchMLP.upProjection(inputs, experts, sortedIndices: sorted)
+        let hidden = (activation(gateOut.asType(.float32), up.asType(.float32)) * routeWeights)
+            .asType(x.dtype)
+        var routed = switchMLP.downProjection(hidden, experts, sortedIndices: sorted)
+        if let inverseOrder {
+            routed = scatterUnsort(x: routed, invOrder: inverseOrder, shape: indices.shape)
+        }
+        let combined = routed.squeezed(axis: -2).asType(.float32).sum(axis: -2)
+        return (combined + sharedExperts(x).asType(.float32)).asType(x.dtype)
     }
 }
 
