@@ -346,6 +346,60 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
+    /// The pooled entries of a token stream do not depend on how it is split
+    /// into calls: one call, uneven chunks, one token at a time, and a
+    /// `copy()` / `state` snapshot resumed mid-stream all pool the same
+    /// entries (`inference/model.py:309-310, 336-338, 353-360` carry the
+    /// previous ratio-4 window across calls).
+    func testCompressorPoolsAreChunkingInvariant() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = try loadTiny(indexBlock: 0, indexKeep: 0)
+            for layer in model.layers where layer.attn.ratio > 0 {
+                let ratio = layer.attn.ratio
+                var compressors = [try XCTUnwrap(layer.attn.compressor)]
+                if let indexer = layer.attn.indexer { compressors.append(indexer.compressor) }
+                let total = ratio == 4 ? 4 * 13 + 3 : 2 * 128 + 5
+                let x = sin(MLXArray.arange(total * 64, dtype: .float32) / 7).reshaped(1, total, 64)
+                    .asType(.bfloat16)
+                for compressor in compressors {
+                    func pool(_ chunks: [Int], snapshotAfter: Int? = nil) -> DeepseekV4PoolCache {
+                        var cache = DeepseekV4PoolCache(ratio: ratio)
+                        var offset = 0
+                        for (i, n) in chunks.enumerated() {
+                            _ = compressor(x[0..., offset ..< (offset + n)], cache: cache, offset: offset)
+                            eval(cache.innerState())
+                            offset += n
+                            if i == snapshotAfter {
+                                let restored = DeepseekV4PoolCache(ratio: ratio)
+                                restored.state = (cache.copy() as! DeepseekV4PoolCache).state
+                                restored.metaState = cache.metaState
+                                cache = restored
+                            }
+                        }
+                        XCTAssertEqual(offset, total)
+                        return cache
+                    }
+                    let whole = pool([total])
+                    let expected = try XCTUnwrap(whole.pooled)
+                    XCTAssertEqual(expected.dim(1), total / ratio)
+                    let uneven = ratio == 4 ? [3, 6, 1, 17, 2, 26] : [100, 1, 60, 100]
+                    for (label, cache) in [
+                        ("uneven", pool(uneven)),
+                        ("one at a time", pool(Array(repeating: 1, count: total))),
+                        ("snapshot", pool(uneven, snapshotAfter: 2)),
+                    ] {
+                        let actual = try XCTUnwrap(cache.pooled, label)
+                        XCTAssertEqual(actual.shape, expected.shape, label)
+                        let diff = abs(actual.asType(.float32) - expected.asType(.float32)).max()
+                            .item(Float.self)
+                        XCTAssertLessThanOrEqual(diff, 1e-5, "ratio=\(ratio) \(label)")
+                        XCTAssertEqual(cache.remainder, whole.remainder, label)
+                    }
+                }
+            }
+        }
+    }
+
     func testContinuousBatchUsesKeysOnlyWindowsAndIndependentPoolSnapshots() throws {
         try Device.withDefaultDevice(.cpu) {
             let model = try loadTiny(indexBlock: 4, indexKeep: 2)

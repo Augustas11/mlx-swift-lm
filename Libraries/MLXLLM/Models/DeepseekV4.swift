@@ -426,29 +426,46 @@ private let deepseekV4SimpleCompress: @Sendable (MLXArray, MLXArray, MLXArray) -
         return (kv * weights).sum(axis: -2)
     }
 
-/// Ratio-4 overlapping windows (`_overlap_compress_kv`, `language.py:398-415`):
-/// each window also pools the first half-channels of the previous window in
-/// the same call. The first window of a call has none (zeros, gate `-inf`),
-/// as in the reference, which does not carry the previous half across calls.
-private let deepseekV4OverlapCompress: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
-    compile { kv, gate, ape in
-        let (B, W, R, D) = (kv.dim(0), kv.dim(1), kv.dim(2), kv.dim(3))
-        let gate = gate + ape.asType(gate.dtype)
-        let kvParts = split(kv, parts: 2, axis: -1)
-        let gateParts = split(gate, parts: 2, axis: -1)
-        let kvA = concatenated(
-            [MLXArray.zeros([B, 1, R, D / 2], dtype: kv.dtype), kvParts[0][0..., ..<(W - 1)]], axis: 1)
-        let gateA = concatenated(
-            [
-                MLXArray.full([B, 1, R, D / 2], values: MLXArray(-Float.infinity), type: Float.self)
-                    .asType(kv.dtype),
-                gateParts[0][0..., ..<(W - 1)],
-            ], axis: 1)
-        let mixedKV = concatenated([kvA, kvParts[1]], axis: 2)
-        let mixedGate = concatenated([gateA, gateParts[1]], axis: 2)
-        let weights = softmax(mixedGate, axis: -2, precise: true)
-        return (mixedKV * weights).sum(axis: -2)
-    }
+/// Ratio-4 overlapping windows (`Compressor.overlap_transform` and the decode
+/// state, `inference/model.py:316-323, 353-360`): window `w` pools its own
+/// second half-channels and the first half-channels of window `w - 1`. The
+/// first window of a call takes its predecessor from `previous`, the state
+/// carried across calls (zeros with gate `-inf` before any window, as at the
+/// start of a prompt), so the pooled entries do not depend on how the tokens
+/// were split into calls. `kv`/`gate` are `[B, W, ratio, D]`, `previous`
+/// `[B, ratio, D / 2]` without `ape`. Returns the entries and the call's last
+/// window as the next state.
+private func deepseekV4OverlapCompress(
+    kv: MLXArray, gate: MLXArray, ape: MLXArray, previous: (kv: MLXArray, gate: MLXArray)
+) -> (entries: MLXArray, last: (kv: MLXArray, gate: MLXArray)) {
+    let (B, W, R, D) = (kv.dim(0), kv.dim(1), kv.dim(2), kv.dim(3))
+    let kvParts = split(kv, parts: 2, axis: -1)
+    let gateParts = split(gate, parts: 2, axis: -1)
+    let apeParts = split(ape, parts: 2, axis: -1)
+    let kvA = concatenated(
+        [previous.kv.reshaped(B, 1, R, D / 2).asType(kv.dtype), kvParts[0][0..., ..<(W - 1)]],
+        axis: 1)
+    let gateA = concatenated(
+        [previous.gate.reshaped(B, 1, R, D / 2).asType(gate.dtype), gateParts[0][0..., ..<(W - 1)]],
+        axis: 1)
+    let mixedKV = concatenated([kvA, kvParts[1]], axis: 2)
+    let mixedGate = concatenated(
+        [gateA + apeParts[0].asType(gate.dtype), gateParts[1] + apeParts[1].asType(gate.dtype)],
+        axis: 2)
+    let weights = softmax(mixedGate, axis: -2, precise: true)
+    let last = (
+        kv: kvParts[0][0..., W - 1].asType(.float32), gate: gateParts[0][0..., W - 1].asType(.float32)
+    )
+    return ((mixedKV * weights).sum(axis: -2), last)
+}
+
+/// The overlap state before a row's first window: zeros, gate `-inf`.
+private func deepseekV4OverlapStart(rows: Int, ratio: Int, width: Int) -> (kv: MLXArray, gate: MLXArray) {
+    (
+        MLXArray.zeros([rows, ratio, width], dtype: .float32),
+        MLXArray.full([rows, ratio, width], values: MLXArray(-Float.infinity))
+    )
+}
 
 /// Pools every complete window of `ratio` tokens into one entry
 /// (`Compressor`, `language.py:598-654`): `softmax(gate + ape)`-weighted sum
@@ -479,6 +496,13 @@ final class DeepseekV4Compressor: Module {
         super.init()
     }
 
+    /// The carried overlap state of `cache`, `[1 or B, ratio, headDim]`.
+    private func overlapState(_ cache: DeepseekV4PoolCache) -> (kv: MLXArray, gate: MLXArray) {
+        if let kv = cache.overlapKV, let gate = cache.overlapGate { return (kv, gate) }
+        let rows = cache.bufferRows ?? 1
+        return deepseekV4OverlapStart(rows: rows, ratio: ratio, width: headDim)
+    }
+
     /// Projections and completed-window compression are shared across decode rows.
     func decodeBatch(_ x: MLXArray, caches: [DeepseekV4PoolCache], offsets: [Int]) -> [MLXArray] {
         let kv = wkv(x)
@@ -500,8 +524,23 @@ final class DeepseekV4Compressor: Module {
         if !completed.isEmpty {
             let kv = concatenated(readyKV, axis: 0).reshaped(completed.count, 1, ratio, -1)
             let gate = concatenated(readyGate, axis: 0).reshaped(completed.count, 1, ratio, -1)
-            var entries = overlap
-                ? deepseekV4OverlapCompress(kv, gate, ape) : deepseekV4SimpleCompress(kv, gate, ape)
+            var entries: MLXArray
+            if overlap {
+                let previous = completed.map { overlapState(caches[$0]) }
+                let compressed = deepseekV4OverlapCompress(
+                    kv: kv, gate: gate, ape: ape,
+                    previous: (
+                        concatenated(previous.map { $0.kv }, axis: 0),
+                        concatenated(previous.map { $0.gate }, axis: 0)
+                    ))
+                entries = compressed.entries
+                for (slot, row) in completed.enumerated() {
+                    caches[row].overlapKV = compressed.last.kv[slot ..< (slot + 1)]
+                    caches[row].overlapGate = compressed.last.gate[slot ..< (slot + 1)]
+                }
+            } else {
+                entries = deepseekV4SimpleCompress(kv, gate, ape)
+            }
             entries = rope(
                 expandedDimensions(norm(entries), axis: 1), offsets: MLXArray(bases))
                 .squeezed(axis: 1)
@@ -524,9 +563,16 @@ final class DeepseekV4Compressor: Module {
         let windows = ready.kv.dim(1) / ratio
         let kv = ready.kv.reshaped(B, windows, ratio, -1)
         let gate = ready.gate.reshaped(B, windows, ratio, -1)
-        var entries =
-            overlap
-            ? deepseekV4OverlapCompress(kv, gate, ape) : deepseekV4SimpleCompress(kv, gate, ape)
+        var entries: MLXArray
+        if overlap {
+            let compressed = deepseekV4OverlapCompress(
+                kv: kv, gate: gate, ape: ape, previous: overlapState(cache))
+            entries = compressed.entries
+            cache.overlapKV = compressed.last.kv
+            cache.overlapGate = compressed.last.gate
+        } else {
+            entries = deepseekV4SimpleCompress(kv, gate, ape)
+        }
         entries = norm(entries)
         entries = rope(expandedDimensions(entries, axis: 1), offset: ready.base).squeezed(axis: 1)
         return cache.appendPooled(entries)
@@ -1241,10 +1287,10 @@ public final class DeepseekV4Model: Module, LLMModel {
     /// Prefill as mlx-vlm `generate_step` does: chunks of
     /// `min(prefillStepSize, remaining - 1)` while more than one prompt token
     /// is left, each followed by a cache eval, then the last token alone in
-    /// the iterator's first forward. The ratio-4 overlap pools borrow the
-    /// previous window only within one call, so the pools depend on the chunk
-    /// plan; the model fixes the plan the parity oracles were made with and
-    /// ignores the caller's step size and chunking.
+    /// the iterator's first forward. The pooled entries no longer depend on
+    /// the chunk plan (the overlap window is carried across calls), but the
+    /// plan stays fixed, whatever step size and chunking the caller asks
+    /// for, so prompt snapshots taken at its boundaries resume bit for bit.
     public func prepare(
         _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
     ) throws -> PrepareResult {
