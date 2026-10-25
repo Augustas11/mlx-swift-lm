@@ -5,11 +5,10 @@ an 8-token window) with seeded random weights, quantizes it like the
 V4-Flash-0731 MXFP4 artifact (routed experts mxfp4, attention and shared
 experts mxfp8, gates/compressors/indexer weights unquantized), writes it in
 the checkpoint layout the artifact uses, reloads it through the reference
-sanitize, and records greedy decodes with mlx-vlm's own `generate_step`
-(chunked prefill, then one-token decode) on the CPU.
+sanitize. The oracles (`oracle.json`) come from `make_oracle.py` and a port
+of DeepSeek's reference, not from mlx-vlm.
 
-Outputs, next to this file: `config.json`, `model.safetensors`, and
-`oracle.json` with one case per (indexer mode, prompt length, prefill step).
+Outputs, next to this file: `config.json` and `model.safetensors`.
 
 Run with the reference venv: python make_fixture.py
 """
@@ -19,14 +18,11 @@ import os
 
 import mlx.core as mx
 
-# Before mlx_vlm is imported: `generate_step` runs on a stream it creates on
-# the default device at import time.
 mx.set_default_device(mx.cpu)
 
 import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten
-from mlx_vlm.generate.ar import generate_step
 from mlx_vlm.models.deepseek_v4.config import ModelConfig
 from mlx_vlm.models.deepseek_v4.deepseek_v4 import Model
 
@@ -83,8 +79,6 @@ CONFIG = {
 
 # (index_block, index_keep): HISA as configured, then the flat indexer.
 INDEXER_MODES = {"hisa": (4, 2), "flat": (0, 0)}
-CASES = [(300, 64), (300, 2048), (45, 16)]
-DECODE = 24
 
 
 def layer_quant(path):
@@ -146,7 +140,13 @@ def build(indexer_mode, weights=None):
         fresh = []
         for k, v in flat:
             if k.endswith("tid2eid"):
-                fresh.append((k, mx.random.randint(0, cfg["n_routed_experts"], v.shape).astype(mx.int32)))
+                # Distinct experts per token, as in the V4-Flash checkpoint
+                # (a repeated expert has no defined reference semantics).
+                # The committed fixture's tid2eid was redrawn this way after
+                # generation: numpy default_rng(11), argsort of uniform noise.
+                rows, picks = v.shape
+                noise = np.random.default_rng(11).random((rows, cfg["n_routed_experts"]))
+                fresh.append((k, mx.array(np.argsort(noise, axis=1)[:, :picks].astype(np.int32))))
                 continue
             noise = mx.random.normal(v.shape)
             if k.endswith("norm.weight"):
@@ -172,17 +172,6 @@ def build(indexer_mode, weights=None):
     return model, quant
 
 
-def run_case(model, prompt, step):
-    greedy, logits = [], []
-    for token, logprobs in generate_step(
-        mx.array([prompt]), model, None, None,
-        max_tokens=DECODE, temperature=0.0, prefill_step_size=step,
-    ):
-        greedy.append(int(token))
-        logits.append(np.array(logprobs.reshape(-1).astype(mx.float32)).tolist())
-    return greedy, logits
-
-
 def main():
     model, quant = build("hisa")
     params = dict(tree_flatten(model.language_model.parameters()))
@@ -200,28 +189,7 @@ def main():
     with open(os.path.join(HERE, "config.json"), "w") as f:
         json.dump(config, f, indent=1, sort_keys=True)
 
-    # The oracles come from the written checkpoint, through the reference loader.
-    loaded = mx.load(os.path.join(HERE, "model.safetensors"))
-    rng = np.random.default_rng(5)
-    cases = []
-    for mode in INDEXER_MODES:
-        reference, _ = build(mode, weights=dict(loaded))
-        for length, step in CASES:
-            prompt = rng.integers(2, CONFIG["vocab_size"], size=length).tolist()
-            greedy, logits = run_case(reference, prompt, step)
-            cases.append({
-                "indexer": mode,
-                "index_block": INDEXER_MODES[mode][0],
-                "index_keep": INDEXER_MODES[mode][1],
-                "prefill_step": step,
-                "prompt": prompt,
-                "greedy": greedy,
-                "logprobs": logits,
-            })
-            print(mode, length, step, greedy[:12])
-    with open(os.path.join(HERE, "oracle.json"), "w") as f:
-        json.dump({"decode": DECODE, "cases": cases}, f, separators=(",", ":"))
-
+    # oracle.json: python make_oracle.py --reference /path/to/deepseek_v4.py
 
 if __name__ == "__main__":
     main()
