@@ -1871,7 +1871,7 @@ final class GLM5NextTests: XCTestCase {
 
     func testMTPDrafterRollbackAndPackedAdvanceMatchSerialCommit() throws {
         let model = try fusedShapesModel(seed: 201)
-        let drafter = GLM5NextMTPDraftModel(model.configuration)
+        let drafter = GLM5NextMTPDraftModel(model.configuration, maximumDepth: 2)
         let sampler = GenerateParameters(temperature: 0).sampler()
         let D = model.configuration.hiddenSize
 
@@ -1965,6 +1965,49 @@ final class GLM5NextTests: XCTestCase {
                 sampler: sampler)
             assertBitwiseEqual(chained.proposals[r ..< (r + 1)], drafts, "chain row \(r)")
             assertDrafterStatesEqual(chained.states[r], state, "chain row \(r) state")
+        }
+        // The provider may discard copied chain states: committing from the
+        // unchanged base must equal serial chain+commit for every verdict.
+        let bases = Array(packed.states.prefix(2))
+        let snapshots = bases.map(copyState)
+        let depthOne = try drafter.chainPacked(
+            target: model, states: bases, depth: 1, sampler: sampler)
+        let depthTwo = try drafter.chainPacked(
+            target: model, states: bases, depth: 2, sampler: sampler)
+        XCTAssertEqual(drafter.maximumBlockSize, 3)
+        XCTAssertEqual(depthOne.proposals.shape, [2, 1])
+        XCTAssertEqual(depthTwo.proposals.shape, [2, 2])
+        let commitHidden = withRandomState(MLXRandom.RandomState(seed: 229)) {
+            MLXRandom.normal([2, 3, D]).asType(.bfloat16)
+        }
+        for acceptedCount in 0 ... 2 {
+            let advanced = try drafter.advanceAndProposePacked(
+                target: model, rows: (0 ..< 2).map { r in
+                    MTPPackedDrafterAdvanceRow(
+                        targetHidden: commitHidden[r ..< (r + 1)],
+                        acceptedTokens: depthTwo.proposals[r, ..<acceptedCount].asType(.int32).asArray(Int32.self).map(Int.init),
+                        finalToken: 9 + r, positionDeltas: nil, state: bases[r])
+                }, sampler: sampler)
+            for r in 0 ..< 2 {
+                var reference = copyState(bases[r])
+                let drafts = drafter.draftBlock(
+                    target: model, lastToken: MLXArray([Int32(0)]),
+                    lastHidden: commitHidden[r ..< (r + 1), ..<1], sharedKV: [:],
+                    positionDeltas: nil, queryOffset: 0, blockSize: 3,
+                    state: &reference, sampler: sampler)
+                assertBitwiseEqual(depthTwo.proposals[r ..< (r + 1)], drafts, "depth2 row \(r)")
+                assertBitwiseEqual(depthOne.proposals[r ..< (r + 1)], bases[r].seedToken, "depth1 seed \(r)")
+                drafter.commitDrafterState(
+                    target: model, targetHidden: commitHidden[r ..< (r + 1)], draftTokens: drafts,
+                    acceptedCount: acceptedCount, finalToken: MLXArray([Int32(9 + r)]),
+                    positionDeltas: nil, state: &reference, sampler: sampler)
+                assertDrafterStatesEqual(
+                    advanced.states[r], reference, "depth2 accepted \(acceptedCount) row \(r)")
+                assertBitwiseEqual(
+                    advanced.proposals[r ..< (r + 1)], reference.seedToken,
+                    "depth2 accepted \(acceptedCount) next seed \(r)")
+                assertDrafterStatesEqual(bases[r], snapshots[r], "unpublished chain/commit row \(r)")
+            }
         }
     }
 
