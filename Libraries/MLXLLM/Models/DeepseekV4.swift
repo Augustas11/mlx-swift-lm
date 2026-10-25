@@ -333,10 +333,12 @@ final class DeepseekV4MLP: Module, UnaryLayer {
     }
 }
 
-/// Router (`MoEGate`, `language.py:476-552`): `sqrt(softplus(logits))` scores;
-/// hash layers take the experts from `tid2eid[token]`, the others the top-k
-/// of `scores + bias` (no group restriction). The weights are the scores at
-/// the chosen experts, renormalized and scaled.
+/// Router (`Gate`, `inference/model.py:555-585`): `sqrt(softplus(logits))`
+/// scores; hash layers take the experts from `tid2eid[token]`, the others
+/// the top-k of `scores + bias` (no group restriction). The weights are the
+/// scores at the chosen experts, renormalized and scaled. The logits are
+/// float32 from a float32 weight (`linear(x.float(), weight.float())`;
+/// `sanitize` converts the checkpoint's bf16 gate once at load).
 final class DeepseekV4MoEGate: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     @ParameterInfo(key: "bias") var bias: MLXArray?
@@ -349,7 +351,7 @@ final class DeepseekV4MoEGate: Module {
 
     init(_ config: DeepseekV4Configuration, layerIdx: Int) {
         let experts = config.nRoutedExperts
-        _weight.wrappedValue = MLXArray.zeros([experts, config.hiddenSize])
+        _weight.wrappedValue = MLXArray.zeros([experts, config.hiddenSize], dtype: .float32)
         if layerIdx < config.numHashLayers {
             _tid2eid.wrappedValue = MLXArray.zeros(
                 [config.vocabularySize, config.numExpertsPerTok], dtype: .int32)
@@ -374,7 +376,7 @@ final class DeepseekV4MoEGate: Module {
     }
 
     func callAsFunction(_ x: MLXArray, inputIDs: MLXArray) -> (MLXArray, MLXArray) {
-        let logits = matmul(x, weight.T).asType(.float32)
+        let logits = matmul(x.asType(.float32), weight.asType(.float32).T)
         let scores = score(logits)
         let indices: MLXArray
         if let tid2eid {
@@ -1341,7 +1343,8 @@ enum DeepseekV4Weights {
     /// layout, `language.py:1297-1409`) to module paths: drop `mtp.*` and
     /// layers past `num_hidden_layers`, stack per-expert weights into
     /// `switch_mlp`, group `wo_a`, move hyper-connection tensors under
-    /// `attn_hc`/`ffn_hc`/`hc_head`, and make `tid2eid` int32.
+    /// `attn_hc`/`ffn_hc`/`hc_head`, make `tid2eid` int32 and the router
+    /// gate float32.
     static func sanitize(
         _ weights: [String: MLXArray], configuration: DeepseekV4Configuration
     ) -> [String: MLXArray] {
@@ -1383,6 +1386,10 @@ enum DeepseekV4Weights {
             var tensor = value
             if mapped.hasSuffix(".tid2eid") {
                 tensor = tensor.asType(.int32)
+            }
+            // The router computes float32 logits; convert its weight once here.
+            if mapped.hasSuffix(".ffn.gate.weight") {
+                tensor = tensor.asType(.float32)
             }
             if mapped.contains(".attn.wo_a."), tensor.ndim == 2 {
                 tensor = tensor.reshaped(configuration.oGroups, configuration.oLoraRank, -1)
