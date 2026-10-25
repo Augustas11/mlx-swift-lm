@@ -3,8 +3,10 @@
 //  mlx-swift-lm
 //
 //  The compressor state of one DeepSeek-V4 compressed-attention branch: the
-//  raw kv/gate rows of a window still filling up (fewer than `ratio`) and the
-//  growing pool of compressed entries, one per `ratio` tokens.
+//  raw kv/gate rows of a window still filling up (fewer than `ratio`), the
+//  growing pool of compressed entries, one per `ratio` tokens, and for the
+//  overlapping ratio-4 compressor the first half-channels of the last
+//  completed window, which the next window pools as well.
 //
 //  Port of mlx-vlm 0.7.10 `PoolingCache` (`mlx_vlm/models/cache.py:2693`),
 //  without its speculation transaction (MTP rewind comes with the DSpark
@@ -22,6 +24,15 @@ public final class DeepseekV4PoolCache: BaseKVCache {
     var bufferGate: MLXArray?
     public private(set) var remainder = 0
 
+    /// Ratio-4 overlap state (`kv_state[:, :ratio]` / `score_state[:, :ratio]`,
+    /// `inference/model.py:309-310, 336-338, 353-360`): the last completed
+    /// window's first half-channels of kv and of gate (without `ape`),
+    /// `[B, ratio, D / 2]` float32, or `nil` before the first window. It is
+    /// carried across calls, so a window pools its predecessor whether the
+    /// two arrived in one call or in two.
+    public var overlapKV: MLXArray?
+    public var overlapGate: MLXArray?
+
     /// `[B, P, D]` compressed entries in token order, or `nil` before the first window.
     private var pooledStorage: MLXArray?
     private var count = 0
@@ -37,11 +48,14 @@ public final class DeepseekV4PoolCache: BaseKVCache {
         super.init()
     }
 
+    /// Batch rows of the window buffers, `nil` before the first call.
+    public var bufferRows: Int? { bufferKV?.dim(0) }
+
     /// Compressed entries held (the reference's `offset`).
     public var pooledCount: Int { count }
 
     public override func innerState() -> [MLXArray] {
-        [bufferKV, bufferGate, pooledStorage].compactMap { $0 }
+        [bufferKV, bufferGate, pooledStorage, overlapKV, overlapGate].compactMap { $0 }
     }
 
     /// Rows of every window this call completes, `[B, W * ratio, D]` (empty
@@ -125,25 +139,34 @@ public final class DeepseekV4PoolCache: BaseKVCache {
         return poolIndex .< expandedDimensions(queryIndex.floorDivide(Int32(ratio)), axis: 1)
     }
 
-    /// `[]`, `[bufferKV, bufferGate]` or `[bufferKV, bufferGate, pooled]`: the
-    /// buffers exist from the first call on, before any entry is pooled.
+    /// `[]`, `[bufferKV, bufferGate]`, `[bufferKV, bufferGate, pooled]` or,
+    /// once an overlapping window completed, `[bufferKV, bufferGate, pooled,
+    /// overlapKV, overlapGate]`: the buffers exist from the first call on,
+    /// before any entry is pooled, and the overlap state with the first entry.
     public override var state: [MLXArray] {
-        get { [bufferKV, bufferGate, pooled].compactMap { $0 } }
+        get { [bufferKV, bufferGate, pooled, overlapKV, overlapGate].compactMap { $0 } }
         set {
-            guard [0, 2, 3].contains(newValue.count) else {
-                fatalError("DeepseekV4PoolCache state must have 0, 2 or 3 arrays")
+            guard [0, 2, 3, 5].contains(newValue.count) else {
+                fatalError("DeepseekV4PoolCache state must have 0, 2, 3 or 5 arrays")
             }
             bufferKV = newValue.count >= 2 ? newValue[0] : nil
             bufferGate = newValue.count >= 2 ? newValue[1] : nil
-            pooledStorage = newValue.count == 3 ? newValue[2] : nil
+            pooledStorage = newValue.count >= 3 ? newValue[2] : nil
             count = pooledStorage?.dim(1) ?? 0
+            overlapKV = newValue.count == 5 ? newValue[3] : nil
+            overlapGate = newValue.count == 5 ? newValue[4] : nil
         }
     }
 
     public override var metaState: [String] {
-        get { [String(ratio), String(remainder), String(bufferKV != nil), String(pooled != nil)] }
+        get {
+            [
+                String(ratio), String(remainder), String(bufferKV != nil), String(pooled != nil),
+                String(overlapKV != nil),
+            ]
+        }
         set {
-            guard newValue.count == 4, Int(newValue[0]) == ratio, let remainder = Int(newValue[1])
+            guard newValue.count == 5, Int(newValue[0]) == ratio, let remainder = Int(newValue[1])
             else { fatalError("DeepseekV4PoolCache metaState mismatch: \(newValue)") }
             self.remainder = remainder
         }
@@ -154,6 +177,8 @@ public final class DeepseekV4PoolCache: BaseKVCache {
         new.bufferKV = bufferKV?[.ellipsis]
         new.bufferGate = bufferGate?[.ellipsis]
         new.pooledStorage = pooledStorage?[.ellipsis]
+        new.overlapKV = overlapKV?[.ellipsis]
+        new.overlapGate = overlapGate?[.ellipsis]
         new.count = count
         new.remainder = remainder
         return new
