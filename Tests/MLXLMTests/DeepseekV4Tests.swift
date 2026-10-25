@@ -400,6 +400,66 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
+    /// The default indexer selects exactly the brute-force top `index_topk`
+    /// of `sum_h relu(q_h . k) * scale * w_h / sqrt(H)` over every pooled
+    /// entry, serially and in a ragged batch, at pool sizes of 2048 and more
+    /// (where mlx-vlm's HISA filter used to replace it).
+    func testIndexerSelectsExactTopKOverLargePools() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let json = """
+                {"model_type": "deepseek_v4", "num_hidden_layers": 2, "hidden_size": 64,
+                 "q_lora_rank": 32, "qk_rope_head_dim": 16, "index_n_heads": 4,
+                 "index_head_dim": 32, "index_topk": 512, "compress_ratios": [4, 4]}
+                """
+            let config = try JSONDecoder().decode(DeepseekV4Configuration.self, from: Data(json.utf8))
+            try config.validateModelConfiguration()
+            XCTAssertEqual(config.indexBlock, 0)
+            MLXRandom.seed(2111)
+            let indexer = DeepseekV4Indexer(config, ratio: 4)
+            let rope = DeepseekV4RoPE(dims: 16, base: 160000, scaling: nil)
+            func bruteForce(x: MLXArray, qResidual: MLXArray, pool: MLXArray, offset: Int) -> Set<Int32> {
+                let q = rope(
+                    indexer.wqB(qResidual).reshaped(1, 1, 4, 32).transposed(0, 2, 1, 3), offset: offset)
+                    .asType(.float32)
+                let w = indexer.weightsProj(x).asType(.float32).reshaped(4, 1, 1) * pow(Float(4), -0.5)
+                let dots = maximum(matmul(q[0], pool[0].asType(.float32).T), 0)  // [H, 1, P]
+                let scores = (dots * indexer.scale * w).sum(axis: 0).reshaped(-1)
+                let k = min(512, pool.dim(1))
+                return Set(argSort(-scores)[..<k].asArray(Int32.self))
+            }
+            var pools = [MLXArray]()
+            var inputs = [(MLXArray, MLXArray, Int)]()
+            for count in [2048, 3001, 4096] {
+                let pool = MLXRandom.normal([1, count, 32]).asType(.bfloat16)
+                let x = MLXRandom.normal([1, 1, 64]).asType(.bfloat16)
+                let qResidual = MLXRandom.normal([1, 1, 32]).asType(.bfloat16)
+                let offset = 4 * count + 1
+                let cache = DeepseekV4PoolCache(ratio: 4)
+                _ = cache.accumulateWindows(
+                    kv: MLXArray.zeros([1, 2, 64], dtype: .bfloat16),
+                    gate: MLXArray.zeros([1, 2, 64], dtype: .bfloat16), offset: offset - 2)
+                _ = cache.appendPooled(pool)
+                let expected = bruteForce(x: x, qResidual: qResidual, pool: pool, offset: offset)
+                XCTAssertEqual(expected.count, 512)
+                let serial = try XCTUnwrap(
+                    indexer(x, qResidual: qResidual, rope: rope, cache: cache, offset: offset))
+                XCTAssertEqual(Set(serial.reshaped(-1).asArray(Int32.self)), expected, "serial P=\(count)")
+                pools.append(pool)
+                inputs.append((x, qResidual, offset))
+            }
+            let batched = indexer.decodeBatch(
+                concatenated(inputs.map { $0.0 }, axis: 0),
+                qResidual: concatenated(inputs.map { $0.1 }, axis: 0), rope: rope, pools: pools,
+                offsets: MLXArray(inputs.map { Int32($0.2) }))
+            for row in pools.indices {
+                let expected = bruteForce(
+                    x: inputs[row].0, qResidual: inputs[row].1, pool: pools[row], offset: inputs[row].2)
+                XCTAssertEqual(
+                    Set(batched[row].reshaped(-1).asArray(Int32.self)), expected, "batched row=\(row)")
+            }
+        }
+    }
+
     func testContinuousBatchUsesKeysOnlyWindowsAndIndependentPoolSnapshots() throws {
         try Device.withDefaultDevice(.cpu) {
             let model = try loadTiny(indexBlock: 4, indexKeep: 2)
@@ -485,9 +545,9 @@ final class DeepseekV4Tests: XCTestCase {
         XCTAssertEqual(config.compressRatios.filter { $0 == 4 }.count, 21)
         XCTAssertEqual(config.compressRatios.filter { $0 == 128 }.count, 20)
         XCTAssertEqual(config.compressRatios.last, 4)
-        // The reference enables HISA by default; the artifact sets neither key.
-        XCTAssertEqual(config.indexBlock, 64)
-        XCTAssertEqual(config.indexKeep, 16)
+        // The artifact sets neither HISA key: exact flat top-k, as DeepSeek's reference.
+        XCTAssertEqual(config.indexBlock, 0)
+        XCTAssertEqual(config.indexKeep, 0)
 
         var bad = config
         bad.compressRatios[5] = 2
