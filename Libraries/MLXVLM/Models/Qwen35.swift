@@ -465,7 +465,12 @@ public enum Qwen35Language {
 
             let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
             if let mask {
-                attentionMask = .array(mask[.ellipsis, 0 ..< kvSeqLen])
+                if let cache, case .batch = cache.ropeOffset {
+                    // A packed mask describes the physical K/V extent, not the minimum row offset.
+                    attentionMask = .array(mask)
+                } else {
+                    attentionMask = .array(mask[.ellipsis, 0 ..< kvSeqLen])
+                }
             } else {
                 attentionMask = .none
             }

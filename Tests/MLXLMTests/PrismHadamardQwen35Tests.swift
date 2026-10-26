@@ -261,6 +261,55 @@ final class PrismHadamardQwen35Tests: XCTestCase {
         }
     }
 
+    func testRaggedAttentionPreservesPhysicalMaskWidthAcrossContinuation() throws {
+        let config = try decode().base.textConfiguration
+        let attention = Qwen35Language.Attention(config)
+        attention.train(false)
+        let outputEmbedding = Embedding(
+            embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)
+        // The two-token gap reproduces min-offset slicing being shorter than packed K/V.
+        let batchCache = PrismRaggedAttentionCache(offsets: [5, 3], batched: true)
+        let serialCaches = [5, 3].map { PrismRaggedAttentionCache(offsets: [$0], batched: false) }
+        for sequence in [1, 2, 1] {
+            let offsets = batchCache.offsets
+            let values = (0 ..< 2 * sequence * config.hiddenSize).map { Float($0 % 31 - 15) / 31 }
+            let input = MLXArray(values).reshaped(2, sequence, config.hiddenSize)
+            let positions = stacked(offsets.map { MLXArray($0 ..< ($0 + sequence)).asType(.int32) })
+            let positionIDs = broadcast(positions[.newAxis, 0..., 0...], to: [3, 2, sequence])
+            guard
+                case .array(let mask) = batchCache.makeMask(
+                    n: sequence, windowSize: nil, returnArray: true)
+            else {
+                return XCTFail("Expected a physical ragged mask")
+            }
+            XCTAssertEqual(mask.dim(-1), (offsets.max() ?? 0) + sequence)
+            XCTAssertGreaterThan(mask.dim(-1), batchCache.offset + sequence + 1)
+            let actual = attention(input, mask: mask, cache: batchCache, positionIds: positionIDs)
+            let expectedRows = serialCaches.enumerated().map { row, cache in
+                guard
+                    case .array(let rowMask) = cache.makeMask(
+                        n: sequence, windowSize: nil, returnArray: true)
+                else {
+                    preconditionFailure("Expected a serial causal mask")
+                }
+                return attention(
+                    input[row ..< (row + 1)], mask: rowMask, cache: cache,
+                    positionIds: positionIDs[0..., row ..< (row + 1), 0...])
+            }
+            let expected = concatenated(expectedRows, axis: 0)
+            XCTAssertTrue(allClose(actual, expected, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+            let actualLogits = outputEmbedding.asLinear(actual)
+            let expectedLogits = outputEmbedding.asLinear(expected)
+            XCTAssertTrue(
+                allClose(actualLogits, expectedLogits, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+            XCTAssertEqual(
+                actualLogits.argMax(axis: -1).asArray(Int32.self),
+                expectedLogits.argMax(axis: -1).asArray(Int32.self))
+            XCTAssertEqual(batchCache.offsets, offsets.map { $0 + sequence })
+            XCTAssertEqual(batchCache.presentedLength, (offsets.max() ?? 0) + sequence)
+        }
+    }
+
     private func configuration(_ changes: [String: Any] = [:]) throws -> Data {
         var object: [String: Any] = [
             "model_type": "prism_hadamard_qwen35", "schema_version": 2,
@@ -482,5 +531,60 @@ private final class PrismPositionProbeCache: BaseKVCache {
         rowOffsets = rowOffsets + keys.dim(2)
         offset += keys.dim(2)
         return result
+    }
+}
+
+/// Unequal row histories are stored without padding and padded only for attention presentation.
+private final class PrismRaggedAttentionCache: BaseKVCache {
+    private var rowKeys: [MLXArray]
+    private var rowValues: [MLXArray]
+    private let batched: Bool
+    private(set) var offsets: [Int]
+    private(set) var presentedLength = 0
+
+    init(offsets: [Int], batched: Bool) {
+        self.offsets = offsets
+        self.batched = batched
+        rowKeys = offsets.map { length in
+            MLXArray((0 ..< length * 128).map { Float($0 % 23 - 11) / 23 }).reshaped(
+                1, 1, length, 128)
+        }
+        rowValues = rowKeys.map { $0 * 0.5 }
+        super.init()
+        offset = offsets.min() ?? 0
+    }
+
+    override var ropeOffset: RoPEOffset {
+        batched ? .batch(MLXArray(offsets.map(Int32.init))) : .scalar(offset)
+    }
+
+    override func makeMask(n: Int, windowSize: Int?, returnArray: Bool)
+        -> MLXFast.ScaledDotProductAttentionMaskMode
+    {
+        let columns = MLXArray(0 ..< ((offsets.max() ?? 0) + n)).asType(.int32)
+        let masks = offsets.map { start in
+            let positions = MLXArray(start ..< (start + n)).asType(.int32)
+            return columns[.newAxis, 0...] .<= positions[0..., .newAxis]
+        }
+        return .array(stacked(masks, axis: 0).expandedDimensions(axis: 1))
+    }
+
+    override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        for row in offsets.indices {
+            rowKeys[row] = concatenated([rowKeys[row], keys[row ..< (row + 1)]], axis: 2)
+            rowValues[row] = concatenated([rowValues[row], values[row ..< (row + 1)]], axis: 2)
+            offsets[row] += keys.dim(2)
+        }
+        offset = offsets.min() ?? 0
+        presentedLength = offsets.max() ?? 0
+        func present(_ rows: [MLXArray]) -> MLXArray {
+            concatenated(
+                rows.map { row in
+                    let padding = presentedLength - row.dim(2)
+                    return concatenated(
+                        [row, MLXArray.zeros([1, 1, padding, 128], dtype: row.dtype)], axis: 2)
+                }, axis: 0)
+        }
+        return (present(rowKeys), present(rowValues))
     }
 }
