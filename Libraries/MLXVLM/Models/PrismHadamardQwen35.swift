@@ -268,9 +268,6 @@ public final class PrismHadamardQwen35: Qwen35 {
         }
         try languageModel.update(
             modules: ModuleChildren.unflattened(replacements), verify: [.noUnusedKeys])
-        for case let layer as Qwen35Language.DecoderLayer in loraLayers {
-            layer.linearAttn?.prismConvDecodeEnabled = true
-        }
     }
 
     public override func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
