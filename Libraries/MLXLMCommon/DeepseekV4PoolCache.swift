@@ -9,8 +9,7 @@
 //  completed window, which the next window pools as well.
 //
 //  Port of mlx-vlm 0.7.10 `PoolingCache` (`mlx_vlm/models/cache.py:2693`),
-//  without its speculation transaction (MTP rewind comes with the DSpark
-//  slice).
+//  with exact speculative prefix snapshots, including ratio-4 overlap state.
 //
 
 import Foundation
@@ -18,6 +17,75 @@ import MLX
 
 public final class DeepseekV4PoolCache: BaseKVCache {
     public let ratio: Int
+
+    private struct SpeculationSnapshot {
+        let bufferKV: MLXArray?
+        let bufferGate: MLXArray?
+        let pooledStorage: MLXArray?
+        let overlapKV: MLXArray?
+        let overlapGate: MLXArray?
+        let remainder: Int
+        let count: Int
+    }
+    private var speculation: [SpeculationSnapshot]?
+    private var speculationLimit = 0
+    private var speculationWritePending = false
+
+    public var speculationIsOpen: Bool { speculation != nil }
+
+    private func snapshot() -> SpeculationSnapshot {
+        SpeculationSnapshot(
+            bufferKV: bufferKV?[.ellipsis], bufferGate: bufferGate?[.ellipsis],
+            pooledStorage: pooledStorage?[.ellipsis], overlapKV: overlapKV?[.ellipsis],
+            overlapGate: overlapGate?[.ellipsis], remainder: remainder, count: count)
+    }
+
+    /// Open before a positionwise verify; every append records the complete
+    /// compressor state after that position, including an overlap boundary.
+    @discardableResult
+    public func beginSpeculation(maximumPositions: Int) -> Bool {
+        guard speculation == nil, (1 ... 8).contains(maximumPositions) else { return false }
+        speculation = [snapshot()]
+        speculationLimit = maximumPositions
+        speculationWritePending = false
+        return true
+    }
+
+    /// Restore an exact retained prefix. No rejected buffer, pool or overlap
+    /// state survives, even when a ratio-4/128 window completed in the tail.
+    @discardableResult
+    public func commitSpeculation(retaining: Int) -> Bool {
+        guard let snapshots = speculation, !speculationWritePending,
+            snapshots.indices.contains(retaining)
+        else { return false }
+        let saved = snapshots[retaining]
+        bufferKV = saved.bufferKV
+        bufferGate = saved.bufferGate
+        pooledStorage = saved.pooledStorage
+        overlapKV = saved.overlapKV
+        overlapGate = saved.overlapGate
+        remainder = saved.remainder
+        count = saved.count
+        speculation = nil
+        speculationLimit = 0
+        return true
+    }
+
+    @discardableResult
+    public func abortSpeculation() -> Bool {
+        guard let saved = speculation?.first else { return false }
+        bufferKV = saved.bufferKV
+        bufferGate = saved.bufferGate
+        pooledStorage = saved.pooledStorage
+        overlapKV = saved.overlapKV
+        overlapGate = saved.overlapGate
+        remainder = saved.remainder
+        count = saved.count
+        speculation = nil
+        speculationLimit = 0
+        speculationWritePending = false
+        return true
+    }
 
     /// `[B, ratio, D]` raw rows (float32 projections); the first `remainder` are live.
     var bufferKV: MLXArray?
@@ -69,6 +137,12 @@ public final class DeepseekV4PoolCache: BaseKVCache {
         -> (kv: MLXArray, gate: MLXArray, base: Int)
     {
         let (B, L) = (kv.dim(0), kv.dim(1))
+        if let snapshots = speculation {
+            precondition(L == 1 && !speculationWritePending,
+                "DeepSeek speculative compressors must advance one position at a time")
+            precondition(snapshots.count <= speculationLimit, "Speculative pool capacity exceeded")
+            speculationWritePending = true
+        }
         let (kvWidth, gateWidth) = (kv.dim(2), gate.dim(2))
         if bufferKV == nil {
             bufferKV = MLXArray.zeros([B, ratio, kvWidth], dtype: kv.dtype)
@@ -125,6 +199,11 @@ public final class DeepseekV4PoolCache: BaseKVCache {
             }
             pooledStorage![0..., count ..< (count + added)] = entries
             count += added
+        }
+        if speculation != nil {
+            precondition(speculationWritePending, "Pool append without a speculative input position")
+            speculation!.append(snapshot())
+            speculationWritePending = false
         }
         return pooled ?? entries
     }

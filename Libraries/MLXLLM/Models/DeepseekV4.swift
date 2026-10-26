@@ -392,6 +392,15 @@ func deepseekV4LinearF32(_ layer: Linear, _ x: MLXArray) -> MLXArray {
     return out
 }
 
+/// Small packed verification uses the decode kernel geometry. CPU dense
+/// GEMM is row-sensitive, so its reference tests retain one-row GEMV order.
+private func deepseekV4PackedLinear(_ layer: Linear, _ x: MLXArray) -> MLXArray {
+    if Device.defaultDevice().deviceType == .cpu, x.dim(0) > 1 {
+        return concatenated((0 ..< x.dim(0)).map { layer(x[$0 ..< ($0 + 1)]) }, axis: 0)
+    }
+    return layer(x)
+}
+
 // MARK: - RoPE
 
 /// DeepSeek-V4 RoPE (`language.py:258-339`): traditional pairs on the last
@@ -748,11 +757,21 @@ final class DeepseekV4Compressor: Module {
     /// The whole pool `[B, P, headDim]` after adding the windows that
     /// `x` (`[B, L, hidden]`, tokens `offset ..< offset + L`) completes.
     func callAsFunction(_ x: MLXArray, cache: DeepseekV4PoolCache, offset: Int) -> MLXArray {
-        let B = x.dim(0)
-        let ready = cache.accumulateWindows(
-            kv: deepseekV4LinearF32(wkv, x), gate: deepseekV4LinearF32(wgate, x), offset: offset)
+        appendProjected(
+            kv: deepseekV4LinearF32(wkv, x), gate: deepseekV4LinearF32(wgate, x),
+            dtype: x.dtype, cache: cache, offset: offset)
+    }
+
+    /// Consume one position's already-batched projections completely before
+    /// advancing another position of the same cache (including overlap carry).
+    func appendProjected(
+        kv projectedKV: MLXArray, gate projectedGate: MLXArray, dtype: DType,
+        cache: DeepseekV4PoolCache, offset: Int
+    ) -> MLXArray {
+        let B = projectedKV.dim(0)
+        let ready = cache.accumulateWindows(kv: projectedKV, gate: projectedGate, offset: offset)
         guard ready.kv.dim(1) > 0 else {
-            return cache.appendPooled(MLXArray.zeros([B, 0, headDim], dtype: x.dtype))
+            return cache.appendPooled(MLXArray.zeros([B, 0, headDim], dtype: dtype))
         }
         let windows = ready.kv.dim(1) / ratio
         let kv = ready.kv.reshaped(B, windows, ratio, -1)
@@ -853,9 +872,20 @@ final class DeepseekV4Indexer: Module {
 
         var q = wqB(qResidual).reshaped(B, L, heads, headDim).transposed(0, 2, 1, 3)
         q = rope(q, offset: offset)
+        let weights = weightsProj(x).asType(.float32) * pow(Float(heads), -0.5)
+        return selectProjected(q, weights: weights, pooled: pooled, cache: cache, offset: offset)
+    }
+
+    /// Selection sees only this position's committed pool prefix. Projections
+    /// may be shared with later verification positions, visibility may not.
+    func selectProjected(
+        _ q: MLXArray, weights: MLXArray, pooled: MLXArray,
+        cache: DeepseekV4PoolCache, offset: Int
+    ) -> MLXArray? {
+        let (B, L, poolCount) = (q.dim(0), q.dim(2), pooled.dim(1))
+        guard poolCount > 0 else { return nil }
         let k = min(topK, poolCount)
         let poolMask = cache.poolMask(queries: L, offset: offset)
-        let weights = weightsProj(x).asType(.float32) * pow(Float(heads), -0.5)
 
         if block > 0, poolCount >= block * keep, keep * block >= k {
             if L == 1 {
@@ -1157,6 +1187,74 @@ final class DeepseekV4Attention: Module {
         return woB(out.transposed(0, 2, 1, 3).reshaped(B, 1, -1))
     }
 
+    /// Flattened row-major verification positions. All weight-bound work is
+    /// projected once; only window/pool/indexer state advances positionwise,
+    /// as in mlx-vlm's `DECODE_BLOCK_SIZE` verification path.
+    func verifyPacked(
+        _ x: MLXArray, caches: [KVCache], rowLengths: [Int]
+    ) -> (output: MLXArray, prefixes: [[KVCache]]) {
+        let M = x.dim(0)
+        let layerCaches = caches.map { DeepseekV4LayerCache($0, ratio: ratio) }
+        let offsets = zip(layerCaches, rowLengths).flatMap { cache, count in
+            (0 ..< count).map { cache.local.offset + $0 }
+        }
+        let offsetArray = MLXArray(offsets.map(Int32.init))
+        let qResidual = qNorm(deepseekV4PackedLinear(wqA, x))
+        let q = rope(
+            MLXFast.rmsNorm(
+                deepseekV4PackedLinear(wqB, qResidual).reshaped(M, 1, heads, headDim),
+                weight: MLXArray.mlxNone, eps: normEps).transposed(0, 2, 1, 3),
+            offsets: offsetArray)
+        let kv = rope(
+            kvNorm(deepseekV4PackedLinear(wkv, x)).reshaped(M, 1, 1, headDim),
+            offsets: offsetArray)
+        let projectedPool = compressor.map {
+            (kv: deepseekV4LinearF32($0.wkv, x), gate: deepseekV4LinearF32($0.wgate, x))
+        }
+        let projectedIndex = indexer.map { indexer in
+            (
+                kv: deepseekV4LinearF32(indexer.compressor.wkv, x),
+                gate: deepseekV4LinearF32(indexer.compressor.wgate, x),
+                q: rope(
+                    deepseekV4PackedLinear(indexer.wqB, qResidual)
+                        .reshaped(M, 1, indexer.heads, indexer.headDim).transposed(0, 2, 1, 3),
+                    offsets: offsetArray),
+                weights: deepseekV4PackedLinear(indexer.weightsProj, x).asType(.float32)
+                    * pow(Float(indexer.heads), -0.5)
+            )
+        }
+        var attended = [MLXArray]()
+        var prefixes = rowLengths.map { _ in [KVCache]() }
+        var packed = 0
+        for row in rowLengths.indices {
+            for _ in 0 ..< rowLengths[row] {
+                let range = packed ..< (packed + 1)
+                let part = attend(
+                    x[range], q: q[range], kv: kv[range], qResidual: qResidual[range], mask: nil,
+                    cache: layerCaches[row], offset: offsets[packed],
+                    poolProjection: projectedPool.map { (kv: $0.kv[range], gate: $0.gate[range]) },
+                    indexProjection: projectedIndex.map {
+                        (kv: $0.kv[range], gate: $0.gate[range], q: $0.q[range], weights: $0.weights[range])
+                    })
+                attended.append(part)
+                prefixes[row].append(caches[row].copy())
+                packed += 1
+            }
+        }
+        var out = rope(concatenated(attended, axis: 0), offsets: offsetArray, inverse: true)
+        out = out.reshaped(M, groups, heads / groups, 1, headDim).transposed(0, 1, 3, 2, 4)
+            .reshaped(M, groups, 1, heads / groups * headDim)
+        if Device.defaultDevice().deviceType == .cpu, M > 1 {
+            out = concatenated((0 ..< M).map { callMultiLinear(woA, out[$0 ..< ($0 + 1)]) }, axis: 0)
+        } else {
+            out = callMultiLinear(woA, out)
+        }
+        return (
+            deepseekV4PackedLinear(woB, out.transposed(0, 2, 1, 3).reshaped(M, 1, -1)),
+            prefixes
+        )
+    }
+
     /// `RotatingKVCache` returns a one-token update in storage (ring) order;
     /// the window list needs temporal order. Multi-token updates already are.
     static func temporal(_ window: MLXArray, cache: RotatingKVCache) -> MLXArray {
@@ -1213,7 +1311,9 @@ final class DeepseekV4Attention: Module {
     /// receives them.
     private func attend(
         _ x: MLXArray, q: MLXArray, kv: MLXArray, qResidual: MLXArray, mask: MLXArray?,
-        cache: DeepseekV4LayerCache, offset: Int
+        cache: DeepseekV4LayerCache, offset: Int,
+        poolProjection: (kv: MLXArray, gate: MLXArray)? = nil,
+        indexProjection: (kv: MLXArray, gate: MLXArray, q: MLXArray, weights: MLXArray)? = nil
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
         let (updated, _) = cache.local.update(
@@ -1406,6 +1506,24 @@ final class DeepseekV4Block: Module {
         return glm5NextHCExpand(ffn(ffnInput, inputIDs: inputIDs), h, ffnPost, ffnComb)
     }
 
+    func verifyPacked(
+        _ h: MLXArray, caches: [KVCache], rowLengths: [Int], inputIDs: MLXArray
+    ) -> (output: MLXArray, prefixes: [[KVCache]]) {
+        let (attnInput, attnPost, attnComb) = decodeBranchInput(attnHC, h, norm: attnNorm)
+        let attention = attn.verifyPacked(attnInput, caches: caches, rowLengths: rowLengths)
+        let h = glm5NextHCExpand(attention.output, h, attnPost, attnComb)
+        let (ffnInput, ffnPost, ffnComb) = decodeBranchInput(ffnHC, h, norm: ffnNorm)
+        let projected: MLXArray
+        if Device.defaultDevice().deviceType == .cpu, h.dim(0) > 1 {
+            projected = concatenated((0 ..< h.dim(0)).map {
+                ffn(ffnInput[$0 ..< ($0 + 1)], inputIDs: inputIDs[$0 ..< ($0 + 1)])
+            }, axis: 0)
+        } else {
+            projected = ffn(ffnInput, inputIDs: inputIDs)
+        }
+        return (glm5NextHCExpand(projected, h, ffnPost, ffnComb), attention.prefixes)
+    }
+
     private func decodeBranchInput(
         _ hc: GLM5NextHyperConnection, _ h: MLXArray, norm: RMSNorm
     ) -> (MLXArray, MLXArray, MLXArray) {
@@ -1577,6 +1695,52 @@ public final class DeepseekV4Model: Module, LLMModel {
         return output(
             logits: logits(norm(hcHead.decodeBatch(h))), captured: captured,
             emitMTPState: emitMTPState)
+    }
+
+    /// Exact ragged verification with at most eight total positions, keeping
+    /// every projection on the batch-invariant small-M decode kernel route.
+    /// Logits/hidden are `[1, sum(lengths), D]` in row-major order; prefix
+    /// snapshots include every layer after each input position. Input caches
+    /// remain committed until the caller selects a returned prefix.
+    public func verifyBatchOutput(
+        _ inputs: [[Int]], rowCaches: [[KVCache]], emitMTPState: Bool = true
+    ) -> (output: LMOutput, cachePrefixes: [[[KVCache]]], rowOffsets: [Int]) {
+        let lengths = inputs.map { $0.count }
+        let M = lengths.reduce(0, +)
+        precondition(batchesExactly, "DeepSeek V4 with a HISA indexer does not verify in a batch")
+        precondition(!inputs.isEmpty && lengths.allSatisfy { $0 > 0 })
+        precondition((1 ... 8).contains(M), "DeepSeek V4 packed verify supports 1...8 positions")
+        precondition(rowCaches.count == inputs.count)
+        precondition(rowCaches.allSatisfy { $0.count == layers.count })
+        let working = rowCaches.map { $0.map { $0.copy() } }
+        let tokens = MLXArray(inputs.flatMap { $0 }.map(Int32.init)).reshaped(M, 1)
+        var h = repeated(
+            expandedDimensions(embed(tokens), axis: 2), count: configuration.hcMult, axis: 2)
+        var captured = [Int: MLXArray]()
+        var prefixes = lengths.map { length in (0 ..< length).map { _ in [KVCache]() } }
+        for (index, layer) in layers.enumerated() {
+            let result = layer.verifyPacked(
+                h, caches: working.map { $0[index] }, rowLengths: lengths, inputIDs: tokens)
+            h = result.output
+            for row in lengths.indices {
+                for column in 0 ..< lengths[row] {
+                    prefixes[row][column].append(result.prefixes[row][column])
+                }
+            }
+            if emitMTPState, configuration.dsparkTargetLayerIDs.contains(index) {
+                captured[index] = h.mean(axis: 2).reshaped(1, M, configuration.hiddenSize)
+            }
+        }
+        var offsets = [Int]()
+        var offset = 0
+        for length in lengths {
+            offsets.append(offset)
+            offset += length
+        }
+        let result = output(
+            logits: logits(norm(hcHead.decodeBatch(h))).reshaped(1, M, vocabularySize),
+            captured: captured, emitMTPState: emitMTPState)
+        return (result, prefixes, offsets)
     }
 
     /// Float32 logits (`ParallelHead`, `inference/model.py:728-735`:
