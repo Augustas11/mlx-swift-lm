@@ -27,7 +27,7 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
         try JSONDecoder().decode(
             Qwen35Configuration.TextConfiguration.self,
             from: Data("""
-                {"hidden_size":32,"linear_num_value_heads":1,"linear_num_key_heads":1,
+                {"hidden_size":32,"linear_num_value_heads":32,"linear_num_key_heads":16,
                  "linear_key_head_dim":128,"linear_value_head_dim":128,
                  "linear_conv_kernel_dim":4}
                 """.utf8))
@@ -36,6 +36,7 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
     private func model(_ dtype: DType) throws -> Qwen35Language.GatedDeltaNet {
         let result = Qwen35Language.GatedDeltaNet(try configuration())
         result.update(parameters: result.parameters().mapValues { $0.asType(dtype) })
+        result.conv1d.update(parameters: result.conv1d.parameters().mapValues { $0.asType(.float32) })
         result.train(false)
         return result
     }
@@ -47,9 +48,9 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
         return result
     }
 
-    func testCompiledConvMatchesOriginalAndReadsCurrentWeights() throws {
+    func testMetalConvMatchesOriginalAndReadsCurrentWeights() throws {
         try XCTSkipIf(Device.defaultDevice().deviceType != .gpu, "GPU parity test")
-        for dtype in [DType.float16, .bfloat16] {
+        for dtype in [DType.float16, .float32] {
             // C8192 is the 4B artifact width: 2 * 16 * 128 + 32 * 128.
             for channels in [384, 8192] {
                 for seed in [11, 29, 71] {
@@ -62,16 +63,17 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
                             let state = (MLXRandom.normal([1, 3, channels]) * scale).asType(dtype)
                             // Replacing weights after each trace must change its explicit input.
                             conv.update(parameters: ModuleParameters.unflattened([
-                                ("weight", MLXRandom.normal([channels, 4, 1]).asType(dtype))
+                                ("weight", MLXRandom.normal([channels, 4, 1]))
                             ]))
                             let got = prismConv4Decode(qkv: qkv, state: state, weight: conv.weight)
+                            assertIdentical(got.conv, conv(concatenated([state, qkv], axis: 1)))
                             assertIdentical(got.activated, silu(conv(concatenated([state, qkv], axis: 1))))
                             assertIdentical(
                                 got.state, contiguous(concatenated([state[0..., 1..., 0...], qkv], axis: 1)))
                         }
                         let signs = broadcast(
                             MLXArray([Float(1), -1, 1, -1]).reshaped(1, 4, 1),
-                            to: [channels, 4, 1]).asType(dtype)
+                            to: [channels, 4, 1])
                         conv.update(parameters: ModuleParameters.unflattened([("weight", signs)]))
                         let state = MLXArray.ones([1, 3, channels], dtype: dtype)
                         let qkv = MLXArray.ones([1, 1, channels], dtype: dtype)
@@ -84,10 +86,10 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
         }
     }
 
-    func testSignedZeroAndNegativeCastUnderflowMatchConvolution() throws {
+    func testSignedZeroAndUnderflowMatchConvolution() throws {
         try XCTSkipIf(Device.defaultDevice().deviceType != .gpu, "GPU signed-zero parity test")
         let channels = 384
-        for dtype in [DType.float16, .bfloat16] {
+        for dtype in [DType.float16, .float32] {
             let tiny: Float = dtype == .float16 ? 0.000000059604645 : 1e-20
             var stateValues = [Float](repeating: 0, count: 3 * channels)
             var qkvValues = [Float](repeating: 0, count: channels)
@@ -106,13 +108,12 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
                 inputChannels: channels, outputChannels: channels, kernelSize: 4,
                 groups: channels, bias: false)
             conv.update(parameters: ModuleParameters.unflattened([
-                ("weight", MLXArray(weights).reshaped(channels, 4, 1).asType(dtype))
+                ("weight", MLXArray(weights).reshaped(channels, 4, 1))
             ]))
             let got = prismConv4Decode(qkv: qkv, state: state, weight: conv.weight)
-            let expected = silu(conv(concatenated([state, qkv], axis: 1)))
-            if dtype == .float16 {
-                XCTAssertEqual(expected.asType(.float32).asArray(Float.self)[3].bitPattern, Float(-0.0).bitPattern)
-            }
+            let rawExpected = conv(concatenated([state, qkv], axis: 1))
+            assertIdentical(got.conv, rawExpected)
+            let expected = silu(rawExpected)
             assertIdentical(got.activated, expected)
             assertIdentical(got.state, contiguous(concatenated([state[0..., 1..., 0...], qkv], axis: 1)))
         }
@@ -147,9 +148,103 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
         XCTAssertTrue(ordinaryLayers.compactMap(\.linearAttn).allSatisfy { !$0.prismConvDecodeEnabled })
     }
 
+    func testMixedSourceTypesAndStridedInputsMatchConvolution() throws {
+        try XCTSkipIf(Device.defaultDevice().deviceType != .gpu, "GPU mixed-type parity test")
+        let channels = 8192
+        for (qkvType, stateType) in [(DType.float16, DType.float32), (.float32, .float16)] {
+            let qkv = MLXRandom.normal([1, 1, channels * 2]).asType(qkvType)[0..., 0..., 0..<channels]
+            let state = MLXRandom.normal([1, 3, channels * 2]).asType(stateType)[0..., 0..., 0..<channels]
+            let conv = Conv1d(
+                inputChannels: channels, outputChannels: channels, kernelSize: 4,
+                groups: channels, bias: false)
+            let got = prismConv4Decode(qkv: qkv, state: state, weight: conv.weight)
+            let expected = conv(concatenated([state, qkv], axis: 1))
+            assertIdentical(got.conv, expected)
+            assertIdentical(got.activated, silu(expected))
+            assertIdentical(got.state, contiguous(concatenated([state[0..., 1..., 0...], qkv], axis: 1)))
+        }
+    }
+
+    #if DEBUG
+        func testRealArtifactConvDecodeIsAdmittedForAllGDNLayerIDs() throws {
+            try XCTSkipIf(Device.defaultDevice().deviceType != .gpu, "GPU artifact admission test")
+            guard let path = ProcessInfo.processInfo.environment["MLX_PRISM_PARITY_FIXTURE"],
+                !path.isEmpty
+            else { throw XCTSkip("MLX_PRISM_PARITY_FIXTURE is not set") }
+            struct Case: Decodable {
+                let inputIDs: [Int32]
+                enum CodingKeys: String, CodingKey { case inputIDs = "input_ids" }
+            }
+            struct Fixture: Decodable {
+                let modelDirectory: String
+                let cases: [Case]
+                enum CodingKeys: String, CodingKey {
+                    case modelDirectory = "model_directory"
+                    case cases
+                }
+            }
+            let decoder = JSONDecoder()
+            let fixture = try decoder.decode(
+                Fixture.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+            let item = try XCTUnwrap(fixture.cases.first)
+            XCTAssertFalse(item.inputIDs.isEmpty)
+            let directory = URL(fileURLWithPath: fixture.modelDirectory, isDirectory: true)
+            let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+            let config = try decoder.decode(PrismHadamardQwen35Configuration.self, from: data)
+            XCTAssertEqual(config.base.textConfiguration.hiddenLayers, 32)
+            XCTAssertEqual(config.base.textConfiguration.fullAttentionInterval, 4)
+            let base = try decoder.decode(BaseConfiguration.self, from: data)
+            let model = try PrismHadamardQwen35(config)
+            try loadWeights(
+                modelDirectory: directory, model: model,
+                quantization: base.perLayerQuantization?.quantization,
+                perLayerQuantization: base.perLayerQuantization)
+            model.train(false)
+            let cache = try model.newCache(parameters: nil)
+            let prepared = try model.prepare(
+                LMInput(tokens: MLXArray(item.inputIDs).expandedDimensions(axis: 0)),
+                cache: cache, state: nil, prefill: PrefillParameters(stepSize: 512))
+            let output: LMOutput
+            switch prepared {
+            case .logits(let result): output = result
+            case .tokens(let remaining): output = model(remaining, cache: cache, state: nil)
+            }
+            let expectedIDs = Set((0..<32).filter { ($0 + 1) % 4 != 0 })
+            XCTAssertEqual(expectedIDs.count, 24)
+            var observations = [Int: PrismConvDecodeObservation]()
+            var installedIDs = Set<Int>()
+            for (id, module) in model.loraLayers.enumerated() {
+                guard let layer = module as? Qwen35Language.DecoderLayer,
+                    let gdn = layer.linearAttn
+                else { continue }
+                installedIDs.insert(id)
+                gdn.prismConvDecodeObserver = { observations[id] = $0 }
+            }
+            XCTAssertEqual(installedIDs, expectedIDs)
+            let token = argMax(output.logits[0..., -1, 0...], axis: -1).item(Int.self)
+            let decoded = model(
+                LMInput.Text(tokens: MLXArray([Int32(token)]).reshaped(1, 1)),
+                cache: cache, state: output.state)
+            eval(decoded.logits)
+            XCTAssertEqual(Set(observations.keys), expectedIDs)
+            for id in expectedIDs.sorted() {
+                let observed = try XCTUnwrap(observations[id], "Missing GDN layer \(id)")
+                XCTAssertTrue(observed.admitted, "GDN layer \(id)")
+                XCTAssertEqual(observed.weightType, .float32, "GDN layer \(id)")
+                XCTAssertTrue([DType.float16, .float32].contains(observed.qkvType))
+                XCTAssertTrue([DType.float16, .float32].contains(observed.stateType))
+                let state = try XCTUnwrap(cache[id] as? MambaCache)
+                let promoted: DType = observed.qkvType == .float32 || observed.stateType == .float32
+                    ? .float32 : .float16
+                XCTAssertEqual(state[0]?.dtype, promoted, "GDN layer \(id) next-state promotion")
+            }
+            print("Prism conv decode: \(observations.values.filter(\.admitted).count)/24 GDN layers admitted")
+        }
+    #endif
+
     func testMultiStepOutputAndBothStatesMatchUnchangedPath() throws {
         try XCTSkipIf(Device.defaultDevice().deviceType != .gpu, "GPU parity test")
-        for dtype in [DType.float16, .bfloat16] {
+        for dtype in [DType.float16, .float32] {
             let reference = try model(dtype)
             let candidate = try model(dtype)
             try candidate.update(parameters: reference.parameters(), verify: [.all])
@@ -163,7 +258,7 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
                     let replacement = Conv1d(
                         inputChannels: reference.convDim, outputChannels: reference.convDim,
                         kernelSize: 4, groups: reference.convDim, bias: false)
-                    replacement.update(parameters: replacement.parameters().mapValues { $0.asType(dtype) })
+                    replacement.update(parameters: replacement.parameters().mapValues { $0.asType(.float32) })
                     try reference.updateModule(key: "conv1d", replacement)
                     try candidate.updateModule(key: "conv1d", replacement)
                 }
@@ -208,7 +303,13 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
                 convState: state[0]!, mask: nil, cache: state, checkpointAfter: nil))
         }
         XCTAssertFalse(gdn.canUsePrismConvDecode(
-            inputs: input.asType(.float32), qkv: qkv, convState: state[0]!,
+            inputs: input.asType(.bfloat16), qkv: qkv, convState: state[0]!,
+            mask: nil, cache: state, checkpointAfter: nil))
+        XCTAssertFalse(gdn.canUsePrismConvDecode(
+            inputs: input, qkv: qkv.asType(.bfloat16), convState: state[0]!,
+            mask: nil, cache: state, checkpointAfter: nil))
+        XCTAssertFalse(gdn.canUsePrismConvDecode(
+            inputs: input, qkv: qkv, convState: state[0]!.asType(.bfloat16),
             mask: nil, cache: state, checkpointAfter: nil))
         state.saveSpeculativeCheckpoint(convState: state[0]!, recurrentState: state[1]!, advancedBy: 1)
         XCTAssertFalse(eligible())
@@ -235,7 +336,7 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
         for (batch, length, dtype, training, masked, checkpoint, padded) in [
             (2, 1, DType.float16, false, false, false, false),
             (1, 2, .float16, false, false, false, false),
-            (1, 1, .float32, false, false, false, false),
+            (1, 1, .bfloat16, false, false, false, false),
             (1, 1, .float16, true, false, false, false),
             (1, 1, .float16, false, true, false, false),
             (1, 2, .float16, false, false, true, false),
@@ -286,7 +387,7 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
             let conv = Conv1d(
                 inputChannels: gdn.convDim, outputChannels: gdn.convDim, kernelSize: 4,
                 stride: stride, padding: padding, dilation: dilation, groups: groups, bias: bias)
-            conv.update(parameters: conv.parameters().mapValues { $0.asType(.float16) })
+            conv.update(parameters: conv.parameters().mapValues { $0.asType(.float32) })
             try gdn.updateModule(key: "conv1d", conv)
             XCTAssertFalse(gdn.canUsePrismConvDecode(
                 inputs: MLXArray.zeros([1, 1, gdn.hiddenSize], dtype: .float16),

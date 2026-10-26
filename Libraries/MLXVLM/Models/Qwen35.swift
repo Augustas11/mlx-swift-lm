@@ -534,6 +534,9 @@ public enum Qwen35Language {
         var fusedInputProjectionEnabled = qwen35FourGDNEnabled
         // Only the full-artifact Prism constructor opts into this decode slice.
         var prismConvDecodeEnabled = false
+        #if DEBUG
+            var prismConvDecodeObserver: ((PrismConvDecodeObservation) -> Void)?
+        #endif
 
         @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
         @ParameterInfo(key: "A_log") var aLog: MLXArray
@@ -666,10 +669,12 @@ public enum Qwen35Language {
         ) -> Bool {
             guard prismConvDecodeEnabled, Device.defaultDevice().deviceType == .gpu,
                 !training, inputs.shape == [1, 1, hiddenSize],
+                convDim == 8192, numKHeads == 16, numVHeads == 32,
                 headKDim == 128, headVDim == 128, convKernelSize == 4,
-                inputs.dtype == .float16 || inputs.dtype == .bfloat16,
-                qkv.dtype == inputs.dtype, convState.dtype == inputs.dtype,
-                conv1d.weight.dtype == inputs.dtype,
+                inputs.dtype == .float16 || inputs.dtype == .float32,
+                qkv.dtype == .float16 || qkv.dtype == .float32,
+                convState.dtype == .float16 || convState.dtype == .float32,
+                conv1d.weight.dtype == .float32,
                 qkv.shape == [1, 1, convDim], convState.shape == [1, 3, convDim],
                 conv1d.weight.shape == [convDim, 4, 1],
                 conv1d.bias == nil, conv1d.stride == 1, conv1d.padding == 0,
@@ -706,11 +711,17 @@ public enum Qwen35Language {
             let usePrismConv = canUsePrismConvDecode(
                 inputs: inputs, qkv: mixedQKV, convState: convState,
                 mask: mask, cache: cache, checkpointAfter: checkpointAfter)
+            #if DEBUG
+                prismConvDecodeObserver?(.init(
+                    admitted: usePrismConv, inputType: inputs.dtype, qkvType: mixedQKV.dtype,
+                    stateType: convState.dtype, weightType: conv1d.weight.dtype))
+            #endif
             if let mask {
                 mixedQKV = MLX.where(mask[.ellipsis, .newAxis], mixedQKV, 0)
             }
 
-            let convInput = concatenated([convState, mixedQKV], axis: 1)
+            // Checkpoints are excluded from the route that reads both sources directly.
+            let convInput = usePrismConv ? mixedQKV : concatenated([convState, mixedQKV], axis: 1)
             if !usePrismConv, let cache, convKernelSize > 1 {
                 cache[0] = contiguous(convInput[0..., (-(convKernelSize - 1))..., 0...])
             }
