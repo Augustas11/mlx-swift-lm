@@ -110,11 +110,6 @@ private let prismSignedFloat32Input: @Sendable (MLXArray, MLXArray) -> MLXArray 
 func prismHadamardTransform(
     _ input: MLXArray, block: Int, signs: MLXArray, inverse: Bool = false
 ) -> MLXArray {
-    if let output = PrismSignedHadamardKernel.apply(
-        input, block: block, signs: signs, inverse: inverse)
-    {
-        return output
-    }
     var x = inverse ? input.asType(.float32) : prismSignedFloat32Input(input, signs)
     x = hadamardTransform(x.reshaped(-1, block), scale: 1 / sqrt(Float(block)))
         .reshaped(input.shape)
