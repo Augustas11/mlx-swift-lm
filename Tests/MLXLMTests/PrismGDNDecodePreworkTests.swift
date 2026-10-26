@@ -57,9 +57,9 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
                             let qkv = (MLXRandom.normal([1, 1, channels]) * scale).asType(dtype)
                             let state = (MLXRandom.normal([1, 3, channels]) * scale).asType(dtype)
                             // Replacing weights after each trace must change its explicit input.
-                            conv.update(parameters: [
-                                "weight": MLXRandom.normal([channels, 4, 1]).asType(dtype)
-                            ])
+                            conv.update(parameters: ModuleParameters.unflattened([
+                                ("weight", MLXRandom.normal([channels, 4, 1]).asType(dtype))
+                            ]))
                             let got = prismConv4Decode(qkv: qkv, state: state, weight: conv.weight)
                             assertIdentical(got.activated, silu(conv(concatenated([state, qkv], axis: 1))))
                             assertIdentical(
@@ -68,7 +68,7 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
                         let signs = broadcast(
                             MLXArray([Float(1), -1, 1, -1]).reshaped(1, 4, 1),
                             to: [channels, 4, 1]).asType(dtype)
-                        conv.update(parameters: ["weight": signs])
+                        conv.update(parameters: ModuleParameters.unflattened([("weight", signs)]))
                         let state = MLXArray.ones([1, 3, channels], dtype: dtype)
                         let qkv = MLXArray.ones([1, 1, channels], dtype: dtype)
                         assertIdentical(
