@@ -1,9 +1,9 @@
 import Foundation
 import MLX
-import MLXLMCommon
 import MLXNN
 import XCTest
 
+@testable import MLXLMCommon
 @testable import MLXVLM
 
 final class PrismHadamardQwen35Tests: XCTestCase {
