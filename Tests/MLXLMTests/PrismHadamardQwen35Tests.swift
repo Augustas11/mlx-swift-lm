@@ -211,6 +211,24 @@ final class PrismHadamardQwen35Tests: XCTestCase {
         XCTAssertEqual(upper[batchDeltaKey]?.asArray(Int32.self), [1])
     }
 
+    func testBatchOutputAcceptsImmutableIdentityAndChecksReplacementValues() throws {
+        let model = try PrismHadamardQwen35(decode())
+        let merged = try model.batchDecodeState([rowState(2), rowState(-3)], cacheOffsets: [9, 3])
+        let expected = try XCTUnwrap(merged[batchDeltaKey])
+        let identical = merged
+        XCTAssertTrue(identical[batchDeltaKey] === expected)
+        try model.validateBatchDecodeState(identical, against: merged)
+        var replacement = LMOutput.State()
+        replacement[batchDeltaKey] = expected + 0
+        XCTAssertFalse(replacement[batchDeltaKey] === expected)
+        try model.validateBatchDecodeState(replacement, against: merged)
+        replacement[batchDeltaKey] = expected + 1
+        XCTAssertThrowsError(try model.validateBatchDecodeState(replacement, against: merged))
+        replacement = identical
+        replacement[LMOutput.Key<Bool>("unknown")] = false
+        XCTAssertThrowsError(try model.validateBatchDecodeState(replacement, against: merged))
+    }
+
     func testBatchOutputMustRetainExactImmutableState() throws {
         let model = try PrismHadamardQwen35(decode())
         let merged = try model.batchDecodeState([rowState(2), rowState(-3)], cacheOffsets: [9, 3])
@@ -395,6 +413,35 @@ final class PrismHadamardQwen35Tests: XCTestCase {
         invalid = record
         invalid["block"] = 1024
         XCTAssertThrowsError(try PrismHadamardQwen35(decode(["modules": [invalid]])))
+    }
+
+    func testFusedSignedRotationIsBitwiseReferenceAcrossShapesAndChangedSigns() {
+        for dtype in [DType.float16, .float32] {
+            for shape in [[1, 512], [2, 3, 1024], [2, 9216]] {
+                let count = shape.reduce(1, *)
+                let input = MLXArray((0 ..< count).map { Float($0 % 41 - 20) / 32 })
+                    .reshaped(shape).asType(dtype)
+                let width = shape.last!
+                for signPattern in [0, 1] {
+                    let signs = MLXArray(
+                        (0 ..< width).map {
+                            Float(($0 + signPattern) % 3 == 0 ? -1 : 1)
+                        })
+                    let expected = hadamardTransform(
+                        (input.asType(.float32) * signs).reshaped(-1, 512),
+                        scale: 1 / sqrt(Float(512))
+                    )
+                    .reshaped(shape).asType(dtype)
+                    let actual = prismHadamardTransform(input, block: 512, signs: signs)
+                    XCTAssertEqual(actual.dtype, dtype)
+                    XCTAssertEqual(actual.shape, shape)
+                    XCTAssertEqual(
+                        actual.asType(.float32).asArray(Float.self).map(\.bitPattern),
+                        expected.asType(.float32).asArray(Float.self).map(\.bitPattern),
+                        "dtype=\(dtype), shape=\(shape), signPattern=\(signPattern)")
+                }
+            }
+        }
     }
 
     func testSignedRotationUsesFloat32AndInverseOrder() {

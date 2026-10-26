@@ -99,12 +99,18 @@ public struct PrismHadamardQwen35Configuration: Decodable, Sendable {
     }
 }
 
+// Explicit arguments keep every loaded sign vector live when the pointwise trace is reused.
+private let prismSignedFloat32Input: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { input, signs in
+    input.asType(.float32) * signs
+}
+
 /// The reference calibrates in float32, then restores the activation dtype.
 func prismHadamardTransform(
     _ input: MLXArray, block: Int, signs: MLXArray, inverse: Bool = false
 ) -> MLXArray {
-    var x = input.asType(.float32)
-    if !inverse { x = x * signs }
+    var x = inverse ? input.asType(.float32) : prismSignedFloat32Input(input, signs)
     x = hadamardTransform(x.reshaped(-1, block), scale: 1 / sqrt(Float(block)))
         .reshaped(input.shape)
     if inverse { x = x * signs }

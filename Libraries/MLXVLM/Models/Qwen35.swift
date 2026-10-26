@@ -59,9 +59,13 @@ enum Qwen35BatchDecodeState {
         guard input.keys == expectedKeys, let expected = input[ropeDeltasKey],
             expected.ndim == 1, expected.size > 0, expected.dtype == .int32,
             let output, output.keys == expectedKeys, let actual = output[ropeDeltasKey],
-            actual.shape == expected.shape, actual.dtype == expected.dtype,
-            (actual .== expected).all().item(Bool.self)
+            actual.shape == expected.shape, actual.dtype == expected.dtype
         else { throw Qwen35BatchDecodeStateError.changedState }
+        // Prism carries the same immutable delta array through decode; avoid a GPU fence.
+        if actual === expected { return }
+        guard (actual .== expected).all().item(Bool.self) else {
+            throw Qwen35BatchDecodeStateError.changedState
+        }
     }
 
     static func positions(
