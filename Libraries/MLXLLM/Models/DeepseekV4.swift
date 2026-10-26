@@ -1103,8 +1103,16 @@ final class DeepseekV4Attention: Module {
     /// positions `0...p` followed by invalid slots early on. `local` is
     /// `[S, D]` in temporal order, `local[0]` at position `first`. Returns
     /// `[L, W, D]` keys and `[L, W]` validity.
-    private func windowList(_ local: MLXArray, first: Int, positions: [Int]) -> (MLXArray, MLXArray) {
+    func windowList(_ local: MLXArray, first: Int, positions: [Int]) -> (MLXArray, MLXArray) {
         let S = local.dim(0)
+        // A wrapped one-token window already has the reference temporal order.
+        // Reusing it avoids a gather and host index construction per layer/row.
+        if positions.count == 1, S == window, first == positions[0] - window + 1 {
+            return (
+                expandedDimensions(local, axis: 0),
+                MLXArray.ones([1, window], dtype: .bool)
+            )
+        }
         var index = [Int32]()
         var valid = [Bool]()
         for p in positions {
@@ -1419,6 +1427,9 @@ public final class DeepseekV4Model: Module, LLMModel {
         precondition((1 ... 8).contains(inputs.dim(0)), "DeepSeek V4 decode supports 1...8 rows")
         precondition(rowCaches.count == inputs.dim(0))
         precondition(rowCaches.allSatisfy { $0.count == layers.count })
+        // The serial forward has the same cache geometry without row slicing,
+        // stacking or padding when the scheduler currently owns one row.
+        if rowCaches.count == 1 { return self(inputs, cache: rowCaches[0]) }
         var h = repeated(
             expandedDimensions(embed(inputs), axis: 2), count: configuration.hcMult, axis: 2)
         for (i, layer) in layers.enumerated() {
