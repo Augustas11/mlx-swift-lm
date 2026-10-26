@@ -47,7 +47,7 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
     func testCompiledConvMatchesOriginalAndReadsCurrentWeights() throws {
         try XCTSkipIf(Device.defaultDevice().deviceType != .gpu, "GPU parity test")
         for dtype in [DType.float16, .bfloat16] {
-            // Both the tiny fixture and a wide depthwise convolution exercise the same trace.
+            // C8192 is the 4B artifact width: 2 * 16 * 128 + 32 * 128.
             for channels in [384, 8192] {
                 for seed in [11, 29, 71] {
                     withRandomState(MLXRandom.RandomState(seed: UInt64(seed))) {
@@ -79,6 +79,35 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
                 }
             }
         }
+    }
+
+    func testOnlyPrismConstructorEnablesConvDecode() throws {
+        let data = Data("""
+            {"model_type":"prism_hadamard_qwen35","schema_version":2,
+             "base_model_type":"qwen3_5","tensor_namespace":"mlx-vlm-qwen3_5",
+             "gdn_activation_layout":"grouped",
+             "quantization":{"bits":2,"group_size":128,"mode":"affine"},
+             "modules":[{"path":"model.embed_tokens","block":512,
+                         "embedding":true,"dtype":"float16"}],
+             "text_config":{"model_type":"qwen3_5_text","hidden_size":512,
+               "num_hidden_layers":2,"intermediate_size":512,"num_attention_heads":1,
+               "num_key_value_heads":1,"head_dim":128,"linear_num_value_heads":1,
+               "linear_num_key_heads":1,"linear_key_head_dim":128,
+               "linear_value_head_dim":128,"linear_conv_kernel_dim":4,
+               "vocab_size":4,"full_attention_interval":2,"tie_word_embeddings":true},
+             "vision_config":{"model_type":"qwen3_5","depth":1,"hidden_size":8,
+               "intermediate_size":16,"out_hidden_size":512,"num_heads":1,
+               "patch_size":16,"spatial_merge_size":1,"temporal_patch_size":1,
+               "num_position_embeddings":8}}
+            """.utf8)
+        let config = try JSONDecoder().decode(PrismHadamardQwen35Configuration.self, from: data)
+        let prism = try PrismHadamardQwen35(config)
+        let ordinary = Qwen35(config.base)
+        let prismLayers = prism.loraLayers.compactMap { $0 as? Qwen35Language.DecoderLayer }
+        let ordinaryLayers = ordinary.loraLayers.compactMap { $0 as? Qwen35Language.DecoderLayer }
+        XCTAssertEqual(prismLayers.compactMap(\.linearAttn).count, 1)
+        XCTAssertTrue(prismLayers.compactMap(\.linearAttn).allSatisfy(\.prismConvDecodeEnabled))
+        XCTAssertTrue(ordinaryLayers.compactMap(\.linearAttn).allSatisfy { !$0.prismConvDecodeEnabled })
     }
 
     func testMultiStepOutputAndBothStatesMatchUnchangedPath() throws {
