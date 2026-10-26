@@ -246,6 +246,9 @@ public struct LMOutput {
             self.contents = [:]
         }
 
+        /// Names present in this state, without exposing its stored values.
+        public var keys: Set<String> { Set(contents.keys) }
+
         init(serializedArrays: [String: MLXArray]) {
             self.contents = serializedArrays.mapValues { $0 as Any }
         }
@@ -372,6 +375,15 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
     /// Models may override with a zero-allocation declarative path, but must stay
     /// consistent with ``newCache(parameters:)``.
     func cacheStatus(parameters: GenerateParameters?) throws -> KVCacheStatus
+}
+
+/// Opt-in contract for packing immutable per-row decode state without discarding state.
+/// Metadata must remain immutable throughout decode. Callers retain each row's original
+/// state and merge only warmed rows in cache order. After every packed forward, validation
+/// must enforce exact output identity (keys, types, shapes, and values) before accepting logits.
+public protocol BatchInvariantDecodeStateModel: LanguageModel {
+    func batchDecodeState(_ states: [LMOutput.State?], cacheOffsets: [Int]) throws -> LMOutput.State
+    func validateBatchDecodeState(_ output: LMOutput.State?, against input: LMOutput.State) throws
 }
 
 extension LanguageModel {

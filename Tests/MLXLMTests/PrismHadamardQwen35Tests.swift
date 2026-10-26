@@ -77,6 +77,8 @@ final class PrismHadamardQwen35Tests: XCTestCase {
             modelDirectory: directory, model: model,
             quantization: baseConfig.perLayerQuantization?.quantization,
             perLayerQuantization: baseConfig.perLayerQuantization)
+        // ModelContext switches serving models to inference mode after loading.
+        model.train(false)
         for item in fixture.cases {
             let cache = try model.newCache(parameters: nil)
             let prepared = try model.prepare(
@@ -115,6 +117,147 @@ final class PrismHadamardQwen35Tests: XCTestCase {
                     "first mismatch at output index \($0.offset): native=\($0.element.0), vendor=\($0.element.1)"
                 } ?? "all output IDs match"
             XCTAssertEqual(generated, item.expectedOutputIDs, "\(item.name): \(detail)")
+        }
+    }
+
+    private var batchDeltaKey: LMOutput.Key<MLXArray> { .init("qwen35.ropeDeltas") }
+    private var batchPositionsKey: LMOutput.Key<MLXArray> { .init("qwen35.precomputedPositionIds") }
+
+    private func rowState(_ delta: Int32, positions: MLXArray? = nil) -> LMOutput.State {
+        var state = LMOutput.State()
+        state[batchDeltaKey] = MLXArray([delta])
+        state[batchPositionsKey] = positions
+        return state
+    }
+
+    func testBatchStatePreservesOrderAcrossReorderAndRemoval() throws {
+        let model = try PrismHadamardQwen35(decode())
+        let states = [
+            rowState(2, positions: .zeros([3, 1, 9], dtype: .int32)),
+            rowState(-3), rowState(7),
+        ]
+        for (indices, expected) in [
+            ([0, 1, 2], [Int32(2), -3, 7]), ([2, 0], [Int32(7), 2]), ([1], [Int32(-3)]),
+        ] {
+            let merged = try model.batchDecodeState(
+                indices.map { states[$0] }, cacheOffsets: indices.map { [9, 3, 12][$0] })
+            XCTAssertEqual(merged.keys, [batchDeltaKey.id])
+            XCTAssertEqual(merged[batchDeltaKey]?.asArray(Int32.self), expected)
+            try model.validateBatchDecodeState(merged, against: merged)
+        }
+        // Merging drops only validated prefill positions and leaves original row state intact.
+        XCTAssertEqual(states[0].keys, [batchDeltaKey.id, batchPositionsKey.id])
+        XCTAssertEqual(states[0][batchPositionsKey]?.shape, [3, 1, 9])
+        XCTAssertFalse(
+            (Qwen35(try decode().base) as any LanguageModel) is any BatchInvariantDecodeStateModel)
+    }
+
+    func testBatchStateRejectsColdMissingMalformedAndUnknownState() throws {
+        let model = try PrismHadamardQwen35(decode())
+        let valid = rowState(2)
+        XCTAssertThrowsError(try model.batchDecodeState([], cacheOffsets: []))
+        XCTAssertThrowsError(try model.batchDecodeState([valid], cacheOffsets: []))
+        XCTAssertThrowsError(try model.batchDecodeState([valid], cacheOffsets: [0]))
+        XCTAssertThrowsError(try model.batchDecodeState([valid], cacheOffsets: [-1]))
+        XCTAssertThrowsError(try model.batchDecodeState([nil], cacheOffsets: [2]))
+        XCTAssertThrowsError(try model.batchDecodeState([LMOutput.State()], cacheOffsets: [2]))
+        var differentDType = valid
+        differentDType[batchDeltaKey] = MLXArray([Int64(2)])
+        XCTAssertThrowsError(
+            try model.batchDecodeState([valid, differentDType], cacheOffsets: [2, 2]))
+        for delta in [MLXArray(Int32(2)), MLXArray([Int32(1), 2]), MLXArray([Float(2)])] {
+            var invalid = valid
+            invalid[batchDeltaKey] = delta
+            XCTAssertThrowsError(try model.batchDecodeState([invalid], cacheOffsets: [2]))
+        }
+        for positions in [
+            MLXArray.zeros([3, 1, 0], dtype: .int32),
+            MLXArray.zeros([3, 2, 4], dtype: .int32), MLXArray.zeros([3, 1, 4]),
+            MLXArray.zeros([3, 4], dtype: .int32),
+        ] {
+            XCTAssertThrowsError(
+                try model.batchDecodeState(
+                    [rowState(2, positions: positions)], cacheOffsets: [4]))
+        }
+        for key in ["unknown", "qwen35.mtpEmitFlag"] {
+            var invalid = valid
+            invalid[LMOutput.Key<Bool>(key)] = false
+            XCTAssertThrowsError(try model.batchDecodeState([invalid], cacheOffsets: [2]))
+        }
+        var wrongType = valid
+        wrongType[LMOutput.Key<String>(batchPositionsKey.id)] = "not an array"
+        XCTAssertThrowsError(try model.batchDecodeState([wrongType], cacheOffsets: [2]))
+    }
+
+    func testBatchStateRejectsTruncatingDTypesAndEffectivePositionOverflow() throws {
+        let model = try PrismHadamardQwen35(decode())
+        for array in [MLXArray([Int64.max]), MLXArray([UInt64.max]), MLXArray([Int16(2)])] {
+            var invalid = rowState(2)
+            invalid[batchDeltaKey] = array
+            XCTAssertThrowsError(try model.batchDecodeState([invalid], cacheOffsets: [2]))
+        }
+        let widePositions = MLXArray([Int64.max]).reshaped(1, 1, 1)
+        XCTAssertThrowsError(
+            try model.batchDecodeState(
+                [rowState(2, positions: broadcast(widePositions, to: [3, 1, 1]))], cacheOffsets: [2]
+            ))
+        XCTAssertThrowsError(try model.batchDecodeState([rowState(0)], cacheOffsets: [Int.max]))
+        XCTAssertThrowsError(try model.batchDecodeState([rowState(Int32.max)], cacheOffsets: [1]))
+        XCTAssertThrowsError(try model.batchDecodeState([rowState(-3)], cacheOffsets: [2]))
+        // Both boundaries remain representable; there is no wrap or clipping.
+        let lower = try model.batchDecodeState([rowState(-2)], cacheOffsets: [2])
+        XCTAssertEqual(lower[batchDeltaKey]?.asArray(Int32.self), [-2])
+        let upper = try model.batchDecodeState([rowState(1)], cacheOffsets: [Int(Int32.max) - 1])
+        XCTAssertEqual(upper[batchDeltaKey]?.asArray(Int32.self), [1])
+    }
+
+    func testBatchOutputMustRetainExactImmutableState() throws {
+        let model = try PrismHadamardQwen35(decode())
+        let merged = try model.batchDecodeState([rowState(2), rowState(-3)], cacheOffsets: [9, 3])
+        XCTAssertThrowsError(try model.validateBatchDecodeState(nil, against: merged))
+        XCTAssertThrowsError(try model.validateBatchDecodeState(LMOutput.State(), against: merged))
+        for delta in [
+            MLXArray([Int32(2), -2]), MLXArray([Int64(2), -3]),
+            MLXArray([Int32(2)]), MLXArray([Int32(2), -3]).reshaped(2, 1),
+        ] {
+            var output = LMOutput.State()
+            output[batchDeltaKey] = delta
+            XCTAssertThrowsError(try model.validateBatchDecodeState(output, against: merged))
+        }
+        var unknown = merged
+        unknown[LMOutput.Key<Bool>("qwen35.mtpEmitFlag")] = false
+        XCTAssertThrowsError(try model.validateBatchDecodeState(unknown, against: merged))
+        var positions = merged
+        positions[batchPositionsKey] = .zeros([3, 2, 1], dtype: .int32)
+        XCTAssertThrowsError(try model.validateBatchDecodeState(positions, against: merged))
+    }
+
+    func testPackedWarmPositionsMatchExplicitRowPositionsBeforeCacheMutation() throws {
+        let config = try decode().base
+        let model = Qwen35(config)
+        model.train(false)
+        let allOffsets = [9, 3, 12]
+        let allDeltas: [Int32] = [2, -1, 7]
+        for selected in [[0, 1, 2], [2, 0], [1]] {
+            let offsets = selected.map { allOffsets[$0] }
+            let deltas = selected.map { allDeltas[$0] }
+            let state = try Qwen35BatchDecodeState.merge(
+                deltas.map { rowState($0) }, cacheOffsets: offsets)
+            let actualCache = PrismPositionProbeCache(offsets: offsets)
+            let referenceCache = PrismPositionProbeCache(offsets: offsets)
+            let tokens = MLXArray(selected.map { Int32($0 + 1) }).reshaped(selected.count, 1)
+            let expectedPositions = MLXArray(zip(offsets, deltas).map { Int32($0.0) + $0.1 })
+                .reshaped(1, selected.count, 1)
+            let positions = broadcast(expectedPositions, to: [3, selected.count, 1])
+            let actual = model.languageModel(
+                tokens, cache: [MambaCache(), actualCache], state: state)
+            let reference = model.languageModel(
+                tokens, cache: [MambaCache(), referenceCache], state: state,
+                positionIds: positions)
+            XCTAssertEqual(actual.logits.asArray(Float.self), reference.logits.asArray(Float.self))
+            XCTAssertEqual(
+                actualCache.rowOffsets.asArray(Int32.self), offsets.map { Int32($0 + 1) })
+            try Qwen35BatchDecodeState.validate(actual.state, against: state)
         }
     }
 
@@ -310,5 +453,34 @@ final class PrismHadamardQwen35Tests: XCTestCase {
             uniqueKeysWithValues: model.languageModel.leafModules().flattened())
         XCTAssertTrue(modules["model.layers.0.linear_attn.in_proj_a"] is Linear)
         XCTAssertFalse(modules["model.layers.0.linear_attn.in_proj_a"] is Quantized)
+    }
+}
+
+/// Synthetic history makes a wrong absolute query position observable in attention.
+private final class PrismPositionProbeCache: BaseKVCache {
+    var rowOffsets: MLXArray
+    private let priorKeys: MLXArray
+    private let priorValues: MLXArray
+
+    init(offsets: [Int]) {
+        rowOffsets = MLXArray(offsets.map(Int32.init))
+        let values = offsets.flatMap { offset in
+            (0 ..< 3 * 128).map { Float(($0 + offset) % 29 - 14) / 29 }
+        }
+        priorKeys = MLXArray(values).reshaped(offsets.count, 1, 3, 128)
+        priorValues = priorKeys * 0.5
+        super.init()
+        offset = offsets.max() ?? 0
+    }
+
+    override var ropeOffset: RoPEOffset { .batch(rowOffsets) }
+
+    override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let result = (
+            concatenated([priorKeys, keys], axis: 2), concatenated([priorValues, values], axis: 2)
+        )
+        rowOffsets = rowOffsets + keys.dim(2)
+        offset += keys.dim(2)
+        return result
     }
 }

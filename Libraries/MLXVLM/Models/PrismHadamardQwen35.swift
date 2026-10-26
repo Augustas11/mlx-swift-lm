@@ -272,3 +272,17 @@ public final class PrismHadamardQwen35: Qwen35 {
         weights
     }
 }
+
+extension PrismHadamardQwen35: BatchInvariantDecodeStateModel {
+    public func batchDecodeState(_ states: [LMOutput.State?], cacheOffsets: [Int]) throws
+        -> LMOutput.State
+    {
+        try Qwen35BatchDecodeState.merge(states, cacheOffsets: cacheOffsets)
+    }
+
+    public func validateBatchDecodeState(_ output: LMOutput.State?, against input: LMOutput.State)
+        throws
+    {
+        try Qwen35BatchDecodeState.validate(output, against: input)
+    }
+}
