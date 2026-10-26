@@ -82,6 +82,11 @@ public struct DeepseekV4Configuration: Codable, Sendable {
     var indexBlock: Int
     var indexKeep: Int
     var tieWordEmbeddings: Bool
+    var dsparkBlockSize: Int
+    var dsparkNoiseTokenID: Int
+    var dsparkTargetLayerIDs: [Int]
+    var dsparkMarkovRank: Int
+    var dsparkStageCount: Int = 0
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -120,6 +125,10 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         case indexBlock = "index_block"
         case indexKeep = "index_keep"
         case tieWordEmbeddings = "tie_word_embeddings"
+        case dsparkBlockSize = "dspark_block_size"
+        case dsparkNoiseTokenID = "dspark_noise_token_id"
+        case dsparkTargetLayerIDs = "dspark_target_layer_ids"
+        case dsparkMarkovRank = "dspark_markov_rank"
     }
 
     public init(from decoder: Decoder) throws {
@@ -160,16 +169,73 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         indexBlock = try c.decodeIfPresent(Int.self, forKey: .indexBlock) ?? 0
         indexKeep = try c.decodeIfPresent(Int.self, forKey: .indexKeep) ?? 0
         tieWordEmbeddings = try c.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
+        dsparkBlockSize = try c.decodeIfPresent(Int.self, forKey: .dsparkBlockSize) ?? 5
+        dsparkNoiseTokenID = try c.decodeIfPresent(Int.self, forKey: .dsparkNoiseTokenID) ?? 128799
+        dsparkTargetLayerIDs = try c.decodeIfPresent([Int].self, forKey: .dsparkTargetLayerIDs) ?? []
+        dsparkMarkovRank = try c.decodeIfPresent(Int.self, forKey: .dsparkMarkovRank) ?? 256
 
         // The checkpoint lists one ratio per layer plus the MTP stages; the
         // text model takes the first `num_hidden_layers` (config.py:72-80).
         if let ratios = try c.decodeIfPresent([Int].self, forKey: .compressRatios), !ratios.isEmpty {
             compressRatios = Array(ratios.prefix(hiddenLayers))
+            if !dsparkTargetLayerIDs.isEmpty {
+                let stages = ratios.dropFirst(hiddenLayers)
+                guard !stages.isEmpty, stages.allSatisfy({ $0 == 0 }) else {
+                    throw DecodingError.dataCorruptedError(
+                        forKey: .compressRatios, in: c,
+                        debugDescription: "DSpark needs uncompressed stage ratios after the target layers")
+                }
+                dsparkStageCount = stages.count
+            }
         } else {
             let n = hiddenLayers
             compressRatios =
                 [0] + (0 ..< max(n - 2, 0)).map { $0 % 2 == 1 ? 4 : 128 } + (n >= 2 ? [0] : [])
         }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(modelType, forKey: .modelType)
+        try c.encode(vocabularySize, forKey: .vocabularySize)
+        try c.encode(hiddenSize, forKey: .hiddenSize)
+        try c.encode(moeIntermediateSize, forKey: .moeIntermediateSize)
+        try c.encode(hiddenLayers, forKey: .hiddenLayers)
+        try c.encode(attentionHeads, forKey: .attentionHeads)
+        try c.encode(nSharedExperts, forKey: .nSharedExperts)
+        try c.encode(nRoutedExperts, forKey: .nRoutedExperts)
+        try c.encode(routedScalingFactor, forKey: .routedScalingFactor)
+        try c.encode(qLoraRank, forKey: .qLoraRank)
+        try c.encode(qkRopeHeadDim, forKey: .qkRopeHeadDim)
+        try c.encode(numExpertsPerTok, forKey: .numExpertsPerTok)
+        try c.encode(normTopkProb, forKey: .normTopkProb)
+        try c.encode(maxPositionEmbeddings, forKey: .maxPositionEmbeddings)
+        try c.encode(rmsNormEps, forKey: .rmsNormEps)
+        try c.encode(ropeTheta, forKey: .ropeTheta)
+        try c.encodeIfPresent(ropeScaling, forKey: .ropeScaling)
+        try c.encode(attentionBias, forKey: .attentionBias)
+        try c.encode(headDim, forKey: .headDim)
+        try c.encode(scoringFunc, forKey: .scoringFunc)
+        try c.encode(compressRatios + Array(repeating: 0, count: dsparkStageCount), forKey: .compressRatios)
+        try c.encode(compressRopeTheta, forKey: .compressRopeTheta)
+        try c.encode(hcMult, forKey: .hcMult)
+        try c.encode(hcSinkhornIters, forKey: .hcSinkhornIters)
+        try c.encode(hcEps, forKey: .hcEps)
+        try c.encode(numHashLayers, forKey: .numHashLayers)
+        try c.encode(swigluLimit, forKey: .swigluLimit)
+        try c.encode(slidingWindow, forKey: .slidingWindow)
+        try c.encode(oGroups, forKey: .oGroups)
+        try c.encode(oLoraRank, forKey: .oLoraRank)
+        try c.encode(indexNHeads, forKey: .indexNHeads)
+        try c.encode(indexHeadDim, forKey: .indexHeadDim)
+        try c.encode(indexTopk, forKey: .indexTopk)
+        try c.encode(indexBlock, forKey: .indexBlock)
+        try c.encode(indexKeep, forKey: .indexKeep)
+        try c.encode(tieWordEmbeddings, forKey: .tieWordEmbeddings)
+        try c.encode(dsparkBlockSize, forKey: .dsparkBlockSize)
+        try c.encode(dsparkNoiseTokenID, forKey: .dsparkNoiseTokenID)
+        try c.encode(dsparkTargetLayerIDs, forKey: .dsparkTargetLayerIDs)
+        try c.encode(dsparkMarkovRank, forKey: .dsparkMarkovRank)
     }
 
     func ratio(layer: Int) -> Int { compressRatios[layer] }
@@ -198,6 +264,13 @@ extension DeepseekV4Configuration: ModelConfigurationValidating {
         guard numExpertsPerTok > 0, numExpertsPerTok <= nRoutedExperts, hcMult > 0,
             slidingWindow > 0, indexTopk > 0, indexBlock >= 0, indexKeep >= 0
         else { throw fail("invalid expert, hc, window or indexer sizes") }
+        if !dsparkTargetLayerIDs.isEmpty {
+            guard dsparkStageCount == 3, (1 ... 7).contains(dsparkBlockSize),
+                dsparkNoiseTokenID >= 0, dsparkNoiseTokenID < vocabularySize,
+                dsparkMarkovRank > 0, Set(dsparkTargetLayerIDs).count == dsparkTargetLayerIDs.count,
+                dsparkTargetLayerIDs.allSatisfy({ (0 ..< hiddenLayers).contains($0) })
+            else { throw fail("invalid DSpark stages, target layers, block size or Markov head") }
+        }
         if let scaling = ropeScaling {
             let kind = scaling.type ?? scaling.ropeType ?? "default"
             guard ["yarn", "deepseek_yarn", "default"].contains(kind) else {
@@ -694,7 +767,7 @@ final class DeepseekV4Compressor: Module {
         } else {
             entries = deepseekV4SimpleCompress(kv, gate, ape)
         }
-        entries = norm(entries.asType(x.dtype))
+        entries = norm(entries.asType(dtype))
         entries = rope(expandedDimensions(entries, axis: 1), offset: ready.base).squeezed(axis: 1)
         return cache.appendPooled(entries)
     }
@@ -1151,11 +1224,30 @@ final class DeepseekV4Attention: Module {
         // [B, L, C] compressed indices and validity, or nil without a pool.
         var list: (indices: MLXArray, valid: MLXArray, pooled: MLXArray)?
         if let compressor, let poolCache = cache.pool {
-            let pooled = compressor(x, cache: poolCache, offset: offset)
+            let pooled: MLXArray
+            if let projected = poolProjection {
+                pooled = compressor.appendProjected(
+                    kv: projected.kv, gate: projected.gate, dtype: x.dtype,
+                    cache: poolCache, offset: offset)
+            } else {
+                pooled = compressor(x, cache: poolCache, offset: offset)
+            }
             let visible = MLXArray((offset ..< (offset + L)).map { Int32(($0 + 1) / ratio) })
                 .reshaped(1, L, 1)
             if let indexer, let indexCache = cache.indexPool {
-                if let topk = indexer(x, qResidual: qResidual, rope: rope, cache: indexCache, offset: offset) {
+                let topk: MLXArray?
+                if let projected = indexProjection {
+                    let indexPool = indexer.compressor.appendProjected(
+                        kv: projected.kv, gate: projected.gate, dtype: x.dtype,
+                        cache: indexCache, offset: offset)
+                    topk = indexer.selectProjected(
+                        projected.q, weights: projected.weights, pooled: indexPool,
+                        cache: indexCache, offset: offset)
+                } else {
+                    topk = indexer(
+                        x, qResidual: qResidual, rope: rope, cache: indexCache, offset: offset)
+                }
+                if let topk {
                     let topk = topk.asType(.int32)
                     list = (topk, topk .< visible, pooled)
                 }
@@ -1357,6 +1449,7 @@ struct DeepseekV4LayerCache {
 
 public final class DeepseekV4Model: Module, LLMModel {
     public let vocabularySize: Int
+    public var hasMTPWeights: Bool { !mtp.isEmpty }
     let configuration: DeepseekV4Configuration
 
     @ModuleInfo(key: "embed") var embed: Embedding
@@ -1364,6 +1457,7 @@ public final class DeepseekV4Model: Module, LLMModel {
     @ModuleInfo(key: "norm") var norm: RMSNorm
     @ModuleInfo(key: "hc_head") var hcHead: DeepseekV4HyperHead
     @ModuleInfo(key: "head") var head: Linear
+    @ModuleInfo(key: "mtp") var mtp: [DeepseekV4DSparkStage]
 
     public init(_ configuration: DeepseekV4Configuration) {
         self.configuration = configuration
@@ -1378,6 +1472,10 @@ public final class DeepseekV4Model: Module, LLMModel {
         _hcHead.wrappedValue = DeepseekV4HyperHead(configuration)
         _head.wrappedValue = Linear(
             configuration.hiddenSize, configuration.vocabularySize, bias: false)
+        _mtp.wrappedValue = (0 ..< configuration.dsparkStageCount).map {
+            DeepseekV4DSparkStage(
+                configuration, stageID: $0, stageCount: configuration.dsparkStageCount)
+        }
         super.init()
     }
 
@@ -1385,6 +1483,12 @@ public final class DeepseekV4Model: Module, LLMModel {
     /// call runs on fresh caches (the reference's no-cache pool path skips
     /// the pool's causal mask, so it is not reproduced).
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        forward(inputs, cache: cache, emitMTPState: false).logits
+    }
+
+    private func forward(
+        _ inputs: MLXArray, cache: [KVCache]?, emitMTPState: Bool
+    ) -> LMOutput {
         let caches = try! cache ?? newCache(parameters: nil)
         let layerCaches = zip(caches, layers).map {
             DeepseekV4LayerCache($0, ratio: $1.attn.ratio)
@@ -1403,10 +1507,32 @@ public final class DeepseekV4Model: Module, LLMModel {
             mask = array
         }
 
-        for (layer, layerCache) in zip(layers, layerCaches) {
-            h = layer(h, mask: mask, cache: layerCache, inputIDs: inputs)
+        var captured = [Int: MLXArray]()
+        for (index, item) in zip(layers, layerCaches).enumerated() {
+            h = item.0(h, mask: mask, cache: item.1, inputIDs: inputs)
+            if emitMTPState, configuration.dsparkTargetLayerIDs.contains(index) {
+                captured[index] = h.mean(axis: 2)
+            }
         }
-        return logits(norm(hcHead(h)))
+        return output(logits: logits(norm(hcHead(h))), captured: captured, emitMTPState: emitMTPState)
+    }
+
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        forward(input.tokens, cache: cache, emitMTPState: state?[mtpEmitFlagKey] ?? false)
+    }
+
+    private func output(
+        logits: MLXArray, captured: [Int: MLXArray], emitMTPState: Bool
+    ) -> LMOutput {
+        guard emitMTPState, !configuration.dsparkTargetLayerIDs.isEmpty else {
+            return LMOutput(logits: logits)
+        }
+        var state = LMOutput.State()
+        state[mtpLastHiddenStatesKey] = concatenated(
+            configuration.dsparkTargetLayerIDs.map { captured[$0]! }, axis: -1)
+        return LMOutput(logits: logits, state: state)
     }
 
     /// One token per independently prefetched row. Each row owns ordinary
@@ -1422,6 +1548,12 @@ public final class DeepseekV4Model: Module, LLMModel {
     }
 
     public func decodeBatch(_ inputs: MLXArray, rowCaches: [[KVCache]]) -> MLXArray {
+        decodeBatchOutput(inputs, rowCaches: rowCaches, emitMTPState: false).logits
+    }
+
+    public func decodeBatchOutput(
+        _ inputs: MLXArray, rowCaches: [[KVCache]], emitMTPState: Bool
+    ) -> LMOutput {
         precondition(batchesExactly, "DeepSeek V4 with a HISA indexer does not batch")
         precondition(inputs.ndim == 2 && inputs.dim(1) == 1)
         precondition((1 ... 8).contains(inputs.dim(0)), "DeepSeek V4 decode supports 1...8 rows")
@@ -1429,20 +1561,28 @@ public final class DeepseekV4Model: Module, LLMModel {
         precondition(rowCaches.allSatisfy { $0.count == layers.count })
         // The serial forward has the same cache geometry without row slicing,
         // stacking or padding when the scheduler currently owns one row.
-        if rowCaches.count == 1 { return self(inputs, cache: rowCaches[0]) }
+        if rowCaches.count == 1 {
+            return forward(inputs, cache: rowCaches[0], emitMTPState: emitMTPState)
+        }
+        var captured = [Int: MLXArray]()
         var h = repeated(
             expandedDimensions(embed(inputs), axis: 2), count: configuration.hcMult, axis: 2)
         for (i, layer) in layers.enumerated() {
             let caches = rowCaches.map { DeepseekV4LayerCache($0[i], ratio: layer.attn.ratio) }
             h = layer.decodeBatch(h, caches: caches, inputIDs: inputs)
+            if emitMTPState, configuration.dsparkTargetLayerIDs.contains(i) {
+                captured[i] = h.mean(axis: 2)
+            }
         }
-        return logits(norm(hcHead.decodeBatch(h)))
+        return output(
+            logits: logits(norm(hcHead.decodeBatch(h))), captured: captured,
+            emitMTPState: emitMTPState)
     }
 
     /// Float32 logits (`ParallelHead`, `inference/model.py:728-735`:
     /// `F.linear(x.float(), weight)` with a float32 head) from the bf16 head
     /// weight, without a resident float32 copy.
-    private func logits(_ x: MLXArray) -> MLXArray {
+    func logits(_ x: MLXArray) -> MLXArray {
         deepseekV4LinearF32(head, x)
     }
 
@@ -1500,8 +1640,8 @@ public final class DeepseekV4Model: Module, LLMModel {
 
 enum DeepseekV4Weights {
     /// Map the MLX artifact (`TensorFold/DeepSeek-V4-Flash-0731-MXFP4-MLX`
-    /// layout, `language.py:1297-1409`) to module paths: drop `mtp.*` and
-    /// layers past `num_hidden_layers`, stack per-expert weights into
+    /// layout, `language.py:1297-1409`) to module paths: retain configured
+    /// DSpark stages, drop layers past `num_hidden_layers`, stack experts into
     /// `switch_mlp`, group `wo_a`, move hyper-connection tensors under
     /// `attn_hc`/`ffn_hc`/`hc_head`, make `tid2eid` int32 and the router
     /// gate float32.
@@ -1513,8 +1653,12 @@ enum DeepseekV4Weights {
         let projections = ["w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"]
 
         for (key, value) in weights {
-            if key.hasPrefix("mtp.") { continue }
             let parts = key.split(separator: ".").map(String.init)
+            if parts.first == "mtp" {
+                guard parts.count > 1, let stage = Int(parts[1]),
+                    (0 ..< configuration.dsparkStageCount).contains(stage)
+                else { continue }
+            }
             if parts.count > 1, parts[0] == "layers", let layer = Int(parts[1]),
                 layer >= configuration.hiddenLayers
             {
@@ -1522,10 +1666,11 @@ enum DeepseekV4Weights {
             }
 
             // layers.N.ffn.experts.E.wK.suffix
-            if parts.count == 7, parts[0] == "layers", parts[2] == "ffn", parts[3] == "experts",
+            if parts.count == 7, ["layers", "mtp"].contains(parts[0]),
+                parts[2] == "ffn", parts[3] == "experts",
                 let expert = Int(parts[4]), let projection = projections[parts[5]]
             {
-                let stacked = "layers.\(parts[1]).ffn.switch_mlp.\(projection).\(parts[6])"
+                let stacked = "\(parts[0]).\(parts[1]).ffn.switch_mlp.\(projection).\(parts[6])"
                 experts[stacked, default: [:]][expert] = value
                 continue
             }
@@ -1536,6 +1681,10 @@ enum DeepseekV4Weights {
             case "hc_head_base": mapped = "hc_head.base"
             case "hc_head_scale": mapped = "hc_head.scale"
             default:
+                for parameter in ["fn", "base", "scale"] {
+                    mapped = mapped.replacingOccurrences(
+                        of: ".hc_head_\(parameter)", with: ".hc_head.\(parameter)")
+                }
                 for branch in ["attn", "ffn"] {
                     for parameter in ["fn", "base", "scale"] {
                         mapped = mapped.replacingOccurrences(
