@@ -13,10 +13,14 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
     ) {
         XCTAssertEqual(actual.dtype, expected.dtype, file: file, line: line)
         XCTAssertEqual(actual.shape, expected.shape, file: file, line: line)
-        XCTAssertEqual(
-            actual.asType(.float32).asArray(Float.self).map(\.bitPattern),
-            expected.asType(.float32).asArray(Float.self).map(\.bitPattern),
-            file: file, line: line)
+        let actualBits = actual.asType(.float32).asArray(Float.self).map(\.bitPattern)
+        let expectedBits = expected.asType(.float32).asArray(Float.self).map(\.bitPattern)
+        let mismatches = zip(actualBits, expectedBits).enumerated().filter { $0.element.0 != $0.element.1 }
+        let first = mismatches.first.map {
+            "first at \($0.offset): actual=\($0.element.0), expected=\($0.element.1)"
+        } ?? "none"
+        XCTAssertEqual(actualBits.count, expectedBits.count, file: file, line: line)
+        XCTAssertEqual(mismatches.count, 0, "\(mismatches.count) bit mismatches; \(first)", file: file, line: line)
     }
 
     private func configuration() throws -> Qwen35Configuration.TextConfiguration {
@@ -77,6 +81,40 @@ final class PrismGDNDecodePreworkTests: XCTestCase {
                     }
                 }
             }
+        }
+    }
+
+    func testSignedZeroAndNegativeCastUnderflowMatchConvolution() throws {
+        try XCTSkipIf(Device.defaultDevice().deviceType != .gpu, "GPU signed-zero parity test")
+        let channels = 384
+        for dtype in [DType.float16, .bfloat16] {
+            let tiny: Float = dtype == .float16 ? 0.000000059604645 : 1e-20
+            var stateValues = [Float](repeating: 0, count: 3 * channels)
+            var qkvValues = [Float](repeating: 0, count: channels)
+            var weights = [Float](repeating: 1, count: 4 * channels)
+            for channel in 0..<channels {
+                for tap in 0..<3 {
+                    stateValues[tap * channels + channel] =
+                        channel % 4 == 1 || (channel % 4 == 2 && tap % 2 == 0) ? -Float.zero : 0
+                }
+                qkvValues[channel] = channel % 4 == 3 ? -tiny : -Float.zero
+                if channel % 4 == 3 { weights[channel * 4 + 3] = tiny }
+            }
+            let state = MLXArray(stateValues).reshaped(1, 3, channels).asType(dtype)
+            let qkv = MLXArray(qkvValues).reshaped(1, 1, channels).asType(dtype)
+            let conv = Conv1d(
+                inputChannels: channels, outputChannels: channels, kernelSize: 4,
+                groups: channels, bias: false)
+            conv.update(parameters: ModuleParameters.unflattened([
+                ("weight", MLXArray(weights).reshaped(channels, 4, 1).asType(dtype))
+            ]))
+            let got = prismConv4Decode(qkv: qkv, state: state, weight: conv.weight)
+            let expected = silu(conv(concatenated([state, qkv], axis: 1)))
+            if dtype == .float16 {
+                XCTAssertEqual(expected.asType(.float32).asArray(Float.self)[3].bitPattern, Float(-0.0).bitPattern)
+            }
+            assertIdentical(got.activated, expected)
+            assertIdentical(got.state, contiguous(concatenated([state[0..., 1..., 0...], qkv], axis: 1)))
         }
     }
 
