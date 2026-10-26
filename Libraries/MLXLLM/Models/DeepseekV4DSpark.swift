@@ -102,7 +102,7 @@ final class DeepseekV4DSparkStage: Module {
         let (batch, width) = (x.dim(0), x.dim(1))
         var q = attn.wqB(attn.qNorm(attn.wqA(x)))
             .reshaped(batch, width, attn.heads, attn.headDim)
-        q = MLXFast.rmsNorm(q, weight: nil, eps: attn.normEps).transposed(0, 2, 1, 3)
+        q = MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: attn.normEps).transposed(0, 2, 1, 3)
         let offsets = MLXArray(caches.map { Int32($0.offset) })
         q = attn.rope(q, offsets: offsets)
         var blockKV = attn.kvNorm(attn.wkv(x)).reshaped(batch, 1, width, attn.headDim)
