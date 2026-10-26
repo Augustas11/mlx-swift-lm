@@ -328,6 +328,94 @@ final class PrismHadamardQwen35Tests: XCTestCase {
         }
     }
 
+    func testOwnedSnapshotRetainsFullCheckpointAndTextThenImageParity() throws {
+        let manager = FileManager.default
+        let directory = manager.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? manager.removeItem(at: directory) }
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: configuration()) as? [String: Any])
+        object["image_token_id"] = 1
+        object["video_token_id"] = 1
+        object["vision_start_token_id"] = 2
+        object["vision_end_token_id"] = 3
+        var vision = try XCTUnwrap(object["vision_config"] as? [String: Any])
+        vision["num_position_embeddings"] = 16
+        object["vision_config"] = vision
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let config = try JSONDecoder().decode(PrismHadamardQwen35Configuration.self, from: data)
+        let source = try PrismHadamardQwen35(config)
+        XCTAssertNil(source.initialInferenceModules, "Manual loading must stay fully eager")
+        var weights = Dictionary(uniqueKeysWithValues: source.parameters().flattened())
+        // Nonzero, distinct packed rows exercise the tied head and image merge.
+        weights["language_model.model.embed_tokens.weight"] = MLXArray(
+            (0 ..< 128).map { UInt32($0) &* 0x1357_9BDF }
+        ).reshaped(4, 32)
+        weights["language_model.model.embed_tokens.scales"] = MLXArray.full(
+            [4, 4], values: MLXArray(Float(0.02)), dtype: .float16)
+        weights["language_model.model.embed_tokens.biases"] = MLXArray.full(
+            [4, 4], values: MLXArray(Float(0.01)), dtype: .float16)
+        let weightURL = directory.appendingPathComponent("model.safetensors")
+        try save(arrays: weights, url: weightURL)
+        try data.write(to: directory.appendingPathComponent("config.json"))
+        let eager = try PrismHadamardQwen35(config)
+        try loadWeights(modelDirectory: directory, model: eager)
+        eager.train(false)
+        let deferred = try PrismHadamardQwen35(config)
+        deferred.ownedSnapshot = try OwnedPrismArtifactSnapshot(source: directory)
+        let snapshot = try XCTUnwrap(deferred.ownedSnapshot)
+        XCTAssertEqual(
+            Set(try XCTUnwrap(deferred.initialInferenceModules).keys), ["language_model"])
+        try loadWeights(modelDirectory: snapshot.directory, model: deferred)
+        deferred.train(false)
+        XCTAssertEqual(Set(deferred.parameters().flattened().map(\.0)), Set(weights.keys))
+
+        func logits(_ model: PrismHadamardQwen35, _ input: LMInput) throws -> MLXArray {
+            let cache = try model.newCache(parameters: nil)
+            switch try model.prepare(input, cache: cache, state: nil, prefill: .init()) {
+            case .logits(let output): return output.logits
+            case .tokens: throw PrismHadamardError.invalidModule("Expected prepared logits")
+            }
+        }
+        let text = LMInput(tokens: MLXArray([Int32(0), 0]).expandedDimensions(axis: 0))
+        let eagerText = try logits(eager, text)
+        let deferredText = try logits(deferred, text)
+        XCTAssertTrue(allClose(eagerText, deferredText, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+        // Corrupt the original backing in place BEFORE any snapshot vision evaluation.
+        let writer = try FileHandle(forWritingTo: weightURL)
+        try writer.truncate(atOffset: 0)
+        try writer.close()
+        let image = LMInput(
+            text: .init(
+                tokens: MLXArray([Int32(2), 1, 1, 1, 1, 3, 0]).expandedDimensions(axis: 0)),
+            image: .init(pixels: MLXArray.ones([4, 3 * 16 * 16]), frames: [THW(1, 2, 2)]))
+        let eagerImage = try logits(eager, image)
+        let deferredImage = try logits(deferred, image)
+        XCTAssertTrue(allClose(eagerImage, deferredImage, rtol: 1e-5, atol: 1e-5).item(Bool.self))
+        XCTAssertEqual(
+            eagerImage.argMax(axis: -1).asArray(Int32.self),
+            deferredImage.argMax(axis: -1).asArray(Int32.self))
+
+        // Deferred vision is still covered by full model key and shape validation.
+        let visionKey = "vision_tower.patch_embed.proj.weight"
+        XCTAssertNotNil(weights[visionKey])
+        for malformedShape in [false, true] {
+            var invalid = weights
+            if malformedShape {
+                invalid[visionKey] = MLXArray.zeros([1])
+            } else {
+                invalid.removeValue(forKey: visionKey)
+            }
+            try save(arrays: invalid, url: weightURL)
+            let rejected = try PrismHadamardQwen35(config)
+            rejected.ownedSnapshot = try OwnedPrismArtifactSnapshot(source: directory)
+            XCTAssertThrowsError(
+                try loadWeights(
+                    modelDirectory: try XCTUnwrap(rejected.ownedSnapshot).directory,
+                    model: rejected))
+        }
+    }
+
     private func configuration(_ changes: [String: Any] = [:]) throws -> Data {
         var object: [String: Any] = [
             "model_type": "prism_hadamard_qwen35", "schema_version": 2,

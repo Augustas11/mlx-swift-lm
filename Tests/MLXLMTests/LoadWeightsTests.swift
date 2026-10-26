@@ -168,6 +168,38 @@ final class LoadWeightsTests: XCTestCase {
         XCTAssertEqual(weights["shared.weight"]?.asArray(Float.self), [1, 1, 1, 1])
     }
 
+    func testInitialMaterializationMatchesOnlyNamespaceSubtrees() {
+        for name in ["language_model.weight", "language_model.layers.0.weight"] {
+            XCTAssertTrue(initiallyMaterializesWeight(name, prefixes: ["language_model"]))
+        }
+        for name in ["vision_tower.weight", "language_model_extra.weight", "language_model"] {
+            XCTAssertFalse(initiallyMaterializesWeight(name, prefixes: ["language_model"]))
+            XCTAssertTrue(initiallyMaterializesWeight(name, prefixes: nil))
+        }
+    }
+
+    func testWholeFileFallbackRetainsDeferredAndSimilarlyNamedWeights() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("model.safetensors")
+        let arrays = [
+            "language_model.weight": MLXArray([Float(1), 2]),
+            "language_model_extra.weight": MLXArray([Float(3), 4]),
+            "vision_tower.weight": MLXArray([Float(5), 6]),
+        ]
+        try save(arrays: arrays, url: url)
+        // nil names is the actual worker path used when span parsing falls back.
+        let selections: [[String]?] = [nil, ["language_model"]]
+        for prefixes in selections {
+            let (loaded, _) = try loadWeightArrayGroup(
+                url: url, names: nil, initialMaterializationPrefixes: prefixes)
+            XCTAssertEqual(Set(loaded.keys), Set(arrays.keys))
+            for (name, expected) in arrays {
+                XCTAssertEqual(loaded[name]?.asArray(Float.self), expected.asArray(Float.self))
+            }
+        }
+    }
+
     func testLoadWeightArraysSurfacesAMissingFile() {
         let missing = FileManager.default.temporaryDirectory
             .appendingPathComponent("LoadWeightsTests-missing-\(UUID().uuidString).safetensors")

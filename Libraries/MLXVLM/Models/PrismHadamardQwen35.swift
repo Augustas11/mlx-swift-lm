@@ -243,6 +243,9 @@ final class PrismHadamardEmbedding: Embedding, Quantized {
 
 /// Full-artifact model: the vision tower and unlisted FP16 projections stay intact.
 public final class PrismHadamardQwen35: Qwen35 {
+    // Retains isolated checkpoint backing for deferred vision arrays.
+    var ownedSnapshot: OwnedPrismArtifactSnapshot?
+
     public init(_ config: PrismHadamardQwen35Configuration) throws {
         super.init(config.base)
         let original = Dictionary(uniqueKeysWithValues: languageModel.leafModules().flattened())
@@ -290,5 +293,11 @@ extension PrismHadamardQwen35: BatchInvariantDecodeStateModel {
         throws
     {
         try Qwen35BatchDecodeState.validate(output, against: input)
+    }
+}
+
+extension PrismHadamardQwen35: InitialInferenceMaterializationProviding {
+    package var initialInferenceModules: [String: Module]? {
+        ownedSnapshot == nil ? nil : ["language_model": languageModel]
     }
 }
