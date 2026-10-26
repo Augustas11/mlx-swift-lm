@@ -532,6 +532,8 @@ public enum Qwen35Language {
         // remain as views so checkpoint and adapter paths stay unchanged.
         private let fusedInputProjection = FusedQuantizedLinearProjectionCache()
         var fusedInputProjectionEnabled = qwen35FourGDNEnabled
+        // Only the full-artifact Prism constructor opts into this decode slice.
+        var prismConvDecodeEnabled = false
 
         @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
         @ParameterInfo(key: "A_log") var aLog: MLXArray
@@ -658,6 +660,29 @@ public enum Qwen35Language {
             )
         }
 
+        func canUsePrismConvDecode(
+            inputs: MLXArray, qkv: MLXArray, convState: MLXArray,
+            mask: MLXArray?, cache: MambaCache?, checkpointAfter: Int?
+        ) -> Bool {
+            guard prismConvDecodeEnabled, Device.defaultDevice().deviceType == .gpu,
+                !training, inputs.shape == [1, 1, hiddenSize],
+                headKDim == 128, headVDim == 128, convKernelSize == 4,
+                inputs.dtype == .float16 || inputs.dtype == .bfloat16,
+                qkv.dtype == inputs.dtype, convState.dtype == inputs.dtype,
+                conv1d.weight.dtype == inputs.dtype,
+                qkv.shape == [1, 1, convDim], convState.shape == [1, 3, convDim],
+                conv1d.weight.shape == [convDim, 4, 1],
+                conv1d.bias == nil, conv1d.stride == 1, conv1d.padding == 0,
+                conv1d.dilation == 1, conv1d.groups == convDim,
+                mask == nil, checkpointAfter == nil, let cache,
+                cache[0] != nil,
+                !cache.hasSpeculativeCheckpoint, cache.makeMask(N: 1) == nil,
+                let recurrentState = cache[1], recurrentState.dtype == .float32,
+                recurrentState.shape == [1, numVHeads, 128, 128]
+            else { return false }
+            return true
+        }
+
         open func callAsFunction(
             _ inputs: MLXArray,
             mask: MLXArray? = nil,
@@ -678,16 +703,29 @@ public enum Qwen35Language {
                     [B, max(0, convKernelSize - 1), convDim], dtype: inputs.dtype)
             }
 
+            let usePrismConv = canUsePrismConvDecode(
+                inputs: inputs, qkv: mixedQKV, convState: convState,
+                mask: mask, cache: cache, checkpointAfter: checkpointAfter)
             if let mask {
                 mixedQKV = MLX.where(mask[.ellipsis, .newAxis], mixedQKV, 0)
             }
 
             let convInput = concatenated([convState, mixedQKV], axis: 1)
-            if let cache, convKernelSize > 1 {
+            if !usePrismConv, let cache, convKernelSize > 1 {
                 cache[0] = contiguous(convInput[0..., (-(convKernelSize - 1))..., 0...])
             }
 
-            let convOut = silu(conv1d(convInput))
+            let convOut: MLXArray
+            let nextPrismConvState: MLXArray?
+            if usePrismConv {
+                let result = prismConv4Decode(
+                    qkv: mixedQKV, state: convState, weight: conv1d.weight)
+                convOut = result.activated
+                nextPrismConvState = result.state
+            } else {
+                convOut = silu(conv1d(convInput))
+                nextPrismConvState = nil
+            }
             let split = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
             let q = split[0].reshaped(B, S, numKHeads, headKDim)
             let k = split[1].reshaped(B, S, numKHeads, headKDim)
@@ -761,13 +799,19 @@ public enum Qwen35Language {
                     useKernel: !training)
             }
 
-            if let cache {
+            if !usePrismConv, let cache {
                 cache[1] = state
                 cache.advance(S)
             }
 
             let gated = norm(out, gate: z)
-            return outProj(gated.reshaped(B, S, -1))
+            let output = outProj(gated.reshaped(B, S, -1))
+            if usePrismConv, let cache, let nextPrismConvState {
+                cache[0] = nextPrismConvState
+                cache[1] = state
+                cache.advance(S)
+            }
+            return output
         }
     }
 
