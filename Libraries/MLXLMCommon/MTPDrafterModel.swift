@@ -119,18 +119,24 @@ public struct MTPDrafterState {
     /// Number of tentative cache entries appended by the current proposal.
     public var proposalAppended: Int
 
+    /// Conditional acceptance probabilities for a block proposal, `[B, depth]`.
+    /// Confidence controls verify work only; target token equality decides acceptance.
+    public var proposalConfidence: MLXArray?
+
     public init(
         cache: [KVCache],
         nextPosition: Int = 0,
         seedToken: MLXArray? = nil,
         seedHidden: MLXArray? = nil,
-        proposalAppended: Int = 0
+        proposalAppended: Int = 0,
+        proposalConfidence: MLXArray? = nil
     ) {
         self.cache = cache
         self.nextPosition = nextPosition
         self.seedToken = seedToken
         self.seedHidden = seedHidden
         self.proposalAppended = proposalAppended
+        self.proposalConfidence = proposalConfidence
     }
 }
 
@@ -177,10 +183,10 @@ public struct MTPPackedDrafterAdvanceRow {
 /// target's row transactions) and read the proposals back with one transfer.
 public struct MTPPackedDrafterAdvanceResult {
     /// Advanced row states in input order. Each state's `seedToken` is the
-    /// row's next depth-one proposal, shaped `[1, 1]`.
+    /// row's next proposal block, shaped `[1, proposalDepth]`.
     public let states: [MTPDrafterState]
 
-    /// Every row's next proposal, shaped `[rows, 1]`, in input order.
+    /// Every row's next proposal block, shaped `[rows, proposalDepth]`, in input order.
     public let proposals: MLXArray
 
     public init(states: [MTPDrafterState], proposals: MLXArray) {
