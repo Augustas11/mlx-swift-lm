@@ -1400,6 +1400,16 @@ final class DeepseekV4Attention: Module {
     /// product, and the float32 accumulator and normalizer rescaled when the
     /// max rises; the float32 sink joins the normalizer at the end.
     func referenceAttention(_ q: MLXArray, keys: MLXArray, valid: MLXArray) -> MLXArray {
+        if let fused = deepseekV4SparseAttention(
+            q, keys: keys, valid: valid, sink: attnSink, scale: scale)
+        {
+            return fused
+        }
+        return graphAttention(q, keys: keys, valid: valid)
+    }
+
+    /// Float32 graph oracle and fallback for prefill, CPU and unsupported shapes.
+    func graphAttention(_ q: MLXArray, keys: MLXArray, valid: MLXArray) -> MLXArray {
         let (B, H, L) = (q.dim(0), q.dim(1), q.dim(2))
         let K = keys.dim(2)
         let block = 64
