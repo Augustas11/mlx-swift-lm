@@ -151,7 +151,7 @@ private final class ConcurrentLoadState: @unchecked Sendable {
 /// range's I/O inside the work item), and the results are merged in file order. A file whose
 /// header cannot be parsed is loaded whole by one work item, which is exactly the serial
 /// loader's behavior for that file.
-func loadWeightArrays(urls: [URL]) throws -> (
+func loadWeightArrays(urls: [URL], initialMaterializationPrefixes: [String]? = nil) throws -> (
     weights: [String: MLXArray], metadata: [String: String]
 ) {
     struct WorkItem {
@@ -194,22 +194,9 @@ func loadWeightArrays(urls: [URL]) throws -> (
     DispatchQueue.concurrentPerform(iterations: items.count) { index in
         let item = items[index]
         do {
-            // Explicitly the CPU stream: `Load` has no GPU implementation and the arrays
-            // land in unified memory either way. The concurrency comes from evaluating
-            // disjoint groups from many threads, not from the stream itself.
-            let (all, metadata) = try loadArraysAndMetadata(url: item.url, stream: .cpu)
-
-            var selected = [String: MLXArray]()
-            if let names = item.names {
-                for name in names {
-                    if let array = all[name] { selected[name] = array }
-                }
-            } else {
-                selected = all
-            }
-
-            // force this range's I/O here, on this stream, in file-offset order
-            if !selected.isEmpty { eval(Array(selected.values)) }
+            let (selected, metadata) = try loadWeightArrayGroup(
+                url: item.url, names: item.names,
+                initialMaterializationPrefixes: initialMaterializationPrefixes)
             state.merge(file: item.file, weights: selected, metadata: metadata)
         } catch {
             state.record(error: error)
@@ -379,7 +366,10 @@ public func loadWeights(
         in: modelDirectory,
         selection: weightFileSelection,
         additionalFiles: additionalFiles ?? [])
-    (weights, metadata) = try loadWeightArrays(urls: weightURLs)
+    let initialModules = (model as? any InitialInferenceMaterializationProviding)?
+        .initialInferenceModules
+    (weights, metadata) = try loadWeightArrays(
+        urls: weightURLs, initialMaterializationPrefixes: initialModules.map { Array($0.keys) })
 
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
@@ -406,6 +396,28 @@ public func loadWeights(
     // Build derived inference-only state and realize the model while the loader
     // still has exclusive access. Forward passes must remain read-only.
     materializeModelForInference(model)
+}
+
+/// Load a contiguous group, or the whole-file fallback, without discarding deferred arrays.
+func loadWeightArrayGroup(
+    url: URL, names: [String]?, initialMaterializationPrefixes: [String]? = nil
+) throws -> (weights: [String: MLXArray], metadata: [String: String]) {
+    // Load has no GPU implementation; evaluation on this CPU stream realizes
+    // selected bytes in unified memory while other groups load concurrently.
+    let (all, metadata) = try loadArraysAndMetadata(url: url, stream: .cpu)
+    var selected = [String: MLXArray]()
+    if let names {
+        for name in names {
+            if let array = all[name] { selected[name] = array }
+        }
+    } else {
+        selected = all
+    }
+    let eager = selected.filter {
+        initiallyMaterializesWeight($0.key, prefixes: initialMaterializationPrefixes)
+    }
+    if !eager.isEmpty { eval(Array(eager.values)) }
+    return (selected, metadata)
 }
 
 /// Async variant of

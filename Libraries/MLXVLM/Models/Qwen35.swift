@@ -21,6 +21,65 @@ private let precomputedPositionIdsKey = LMOutput.Key<MLXArray>(
 private let ropeDeltasKey = LMOutput.Key<MLXArray>(
     "qwen35.ropeDeltas")
 
+enum Qwen35BatchDecodeStateError: Error {
+    case invalidRows, invalidState, invalidPositions, changedState
+}
+
+/// Schema-2 Prism state is immutable once each row's prompt has been consumed.
+enum Qwen35BatchDecodeState {
+    static func merge(_ states: [LMOutput.State?], cacheOffsets: [Int]) throws -> LMOutput.State {
+        guard !states.isEmpty, states.count == cacheOffsets.count,
+            cacheOffsets.allSatisfy({ $0 > 0 && $0 <= Int(Int32.max) })
+        else { throw Qwen35BatchDecodeStateError.invalidRows }
+        let allowed: Set<String> = [ropeDeltasKey.id, precomputedPositionIdsKey.id]
+        var deltas = [MLXArray]()
+        for (optionalState, offset) in zip(states, cacheOffsets) {
+            guard let state = optionalState, state.keys.isSubset(of: allowed),
+                let delta = state[ropeDeltasKey], delta.shape == [1], delta.dtype == .int32
+            else { throw Qwen35BatchDecodeStateError.invalidState }
+            let effectivePosition = offset + Int(delta.item(Int32.self))
+            guard effectivePosition >= 0, effectivePosition <= Int(Int32.max) else {
+                throw Qwen35BatchDecodeStateError.invalidPositions
+            }
+            if state.keys.contains(precomputedPositionIdsKey.id) {
+                guard let positions = state[precomputedPositionIdsKey], positions.ndim == 3,
+                    positions.dim(0) == 3, positions.dim(1) == 1, positions.dim(2) > 0,
+                    positions.dtype == .int32
+                else { throw Qwen35BatchDecodeStateError.invalidPositions }
+            }
+            deltas.append(delta)
+        }
+        var merged = LMOutput.State()
+        merged[ropeDeltasKey] = concatenated(deltas, axis: 0)
+        return merged
+    }
+
+    static func validate(_ output: LMOutput.State?, against input: LMOutput.State) throws {
+        let expectedKeys: Set<String> = [ropeDeltasKey.id]
+        guard input.keys == expectedKeys, let expected = input[ropeDeltasKey],
+            expected.ndim == 1, expected.size > 0, expected.dtype == .int32,
+            let output, output.keys == expectedKeys, let actual = output[ropeDeltasKey],
+            actual.shape == expected.shape, actual.dtype == expected.dtype
+        else { throw Qwen35BatchDecodeStateError.changedState }
+        // Prism carries the same immutable delta array through decode; avoid a GPU fence.
+        if actual === expected { return }
+        guard (actual .== expected).all().item(Bool.self) else {
+            throw Qwen35BatchDecodeStateError.changedState
+        }
+    }
+
+    static func positions(
+        offsets: MLXArray, deltas: MLXArray, batch: Int, sequence: Int
+    ) -> MLXArray {
+        precondition(offsets.shape == [batch] && offsets.dtype.isInteger)
+        precondition(deltas.shape == [batch] && deltas.dtype == .int32)
+        let starts = offsets.asType(.int32) + deltas.asType(.int32)
+        let positions =
+            starts[0..., .newAxis] + MLXArray(0 ..< sequence).asType(.int32)[.newAxis, 0...]
+        return broadcast(positions[.newAxis, 0..., 0...], to: [3, batch, sequence])
+    }
+}
+
 // MARK: - Configuration
 
 public struct Qwen35Configuration: Codable, Sendable {
@@ -410,7 +469,12 @@ public enum Qwen35Language {
 
             let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
             if let mask {
-                attentionMask = .array(mask[.ellipsis, 0 ..< kvSeqLen])
+                if let cache, case .batch = cache.ropeOffset {
+                    // A packed mask describes the physical K/V extent, not the minimum row offset.
+                    attentionMask = .array(mask)
+                } else {
+                    attentionMask = .array(mask[.ellipsis, 0 ..< kvSeqLen])
+                }
             } else {
                 attentionMask = .none
             }
@@ -939,8 +1003,13 @@ public enum Qwen35Language {
             let ropeDeltas = state[ropeDeltasKey]
 
             var cacheOffset = 0
+            var batchCacheOffsets: MLXArray?
             if let cache, let faCache = cache[model.faIdx] {
                 cacheOffset = faCache.offset
+                if case .batch(let offsets) = faCache.ropeOffset {
+                    // Capture before the first layer mutates the packed cache.
+                    batchCacheOffsets = offsets + 0
+                }
             }
 
             var ropeMask = mask
@@ -973,6 +1042,10 @@ public enum Qwen35Language {
                         state[precomputedPositionIdsKey] = computed
                         state[ropeDeltasKey] = deltas
                     }
+                } else if let batchCacheOffsets, let ropeDeltas {
+                    positionIds = Qwen35BatchDecodeState.positions(
+                        offsets: batchCacheOffsets, deltas: ropeDeltas,
+                        batch: inputs.dim(0), sequence: inputs.dim(1))
                 } else {
                     let batchSize = inputs.dim(0)
                     let seqLength = inputs.dim(1)

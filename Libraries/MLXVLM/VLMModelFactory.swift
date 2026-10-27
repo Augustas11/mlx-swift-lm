@@ -93,6 +93,10 @@ public enum VLMTypeRegistry {
         "qwen3_vl": create(Qwen3VLConfiguration.self, Qwen3VL.init),
         "qwen3_vl_moe": create(Qwen3VLMoEConfiguration.self, Qwen3VLMoE.init),
         "qwen3_5": create(Qwen35Configuration.self, Qwen35.init),
+        "prism_hadamard_qwen35": { data in
+            try PrismHadamardQwen35(
+                JSONDecoder.json5().decode(PrismHadamardQwen35Configuration.self, from: data))
+        },
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "gemma3": create(Gemma3Configuration.self, Gemma3.init),
@@ -371,6 +375,39 @@ public final class VLMModelFactory: GenericModelFactory {
         configuration: ResolvedModelConfiguration,
         tokenizerLoader: any TokenizerLoader
     ) async throws -> sending ModelContext {
+        struct TypeProbe: Decodable {
+            let modelType: String
+            enum CodingKeys: String, CodingKey { case modelType = "model_type" }
+        }
+        let configURL = configuration.modelDirectory.appendingPathComponent("config.json")
+        let probe = try? JSONDecoder.json5().decode(
+            TypeProbe.self, from: Data(contentsOf: configURL))
+        if probe?.modelType == "prism_hadamard_qwen35" {
+            do {
+                guard configuration.tokenizerDirectory == configuration.modelDirectory else {
+                    throw OwnedPrismArtifactSnapshot.SnapshotError.externalTokenizer
+                }
+                let snapshot = try OwnedPrismArtifactSnapshot(source: configuration.modelDirectory)
+                var isolated = configuration
+                isolated.modelDirectory = snapshot.directory
+                isolated.tokenizerDirectory = snapshot.directory
+                return try await loadResolved(
+                    configuration: isolated, tokenizerLoader: tokenizerLoader, snapshot: snapshot)
+            } catch let error as OwnedPrismArtifactSnapshot.SnapshotError {
+                NSLog(
+                    "Prism snapshot unavailable; loading all original weights eagerly: %@",
+                    String(describing: error))
+            }
+        }
+        return try await loadResolved(
+            configuration: configuration, tokenizerLoader: tokenizerLoader, snapshot: nil)
+    }
+
+    private func loadResolved(
+        configuration: ResolvedModelConfiguration,
+        tokenizerLoader: any TokenizerLoader,
+        snapshot: OwnedPrismArtifactSnapshot?
+    ) async throws -> sending ModelContext {
         let modelDirectory = configuration.modelDirectory
 
         // Load config.json once and decode for both base config and model-specific config
@@ -397,6 +434,13 @@ public final class VLMModelFactory: GenericModelFactory {
         } catch let error as DecodingError {
             throw ModelFactoryError.configurationDecodingError(
                 configurationURL.lastPathComponent, configuration.name, error)
+        }
+
+        if let snapshot {
+            guard let prism = model as? PrismHadamardQwen35 else {
+                throw OwnedPrismArtifactSnapshot.SnapshotError.modelTypeChanged
+            }
+            prism.ownedSnapshot = snapshot
         }
 
         // Load EOS token IDs from config.json, with optional override from generation_config.json
