@@ -60,6 +60,14 @@ final class LFM2MoeRoutingTests: XCTestCase {
         return Dictionary(uniqueKeysWithValues: zip(idx, w))
     }
 
+    func testExpertOrderMatchesOfficialPositivePartition() throws {
+        // Frozen mlx-lm 0.32.2 argpartition suffix order, not a sorted top-k.
+        let plain = try makeBlock(useExpertBias: false).route(x())
+        XCTAssertEqual(plain.indices.reshaped(-1).asArray(Int32.self), [1, 0])
+        let biased = try makeBlock(useExpertBias: true, expertBias: [0, 0, 1, 0]).route(x())
+        XCTAssertEqual(biased.indices.reshaped(-1).asArray(Int32.self), [0, 2])
+    }
+
     func testExpertBiasSteersSelectionOnly() throws {
         let block = try makeBlock(useExpertBias: true, expertBias: [0, 0, 1, 0])
         let m = routed(block)
