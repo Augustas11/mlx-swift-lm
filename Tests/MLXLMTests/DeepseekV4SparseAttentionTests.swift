@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXNN
 import XCTest
 
 @testable import MLXLLM
@@ -29,7 +30,9 @@ final class DeepseekV4SparseAttentionTests: XCTestCase {
             let H = 3
             let L = 3
             let attn = try attention(dim: dim, heads: H)
-            attn.attnSink = MLXArray([Float(-2), 0.5, 3])
+            try attn.update(parameters: ModuleParameters.unflattened([
+                ("attn_sink", MLXArray([Float(-2), 0.5, 3]))
+            ]), verify: .none)
             for count in [1, 63, 64, 65, 137] {
                 let q = MLXArray(
                     (0 ..< B * H * L * dim).map {

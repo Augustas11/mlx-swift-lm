@@ -123,4 +123,32 @@ final class DeepseekV4PackedVerifyTests: XCTestCase {
             try checkEveryPrefix(model, starts: [2047], widths: [8])
         }
     }
+
+    func testGPUEveryAcceptPrefixAcrossRatioFourAndRatio128Boundaries() throws {
+        guard Device.defaultDevice().deviceType == .gpu else { throw XCTSkip("GPU only") }
+        try Device.withDefaultDevice(.gpu) {
+            let model = try loadTiny()
+            for start in [0, 3, 7, 127, 128] {
+                try checkEveryPrefix(model, starts: [start], widths: [8])
+            }
+        }
+    }
+
+    func testGPURaggedRowsKeepTheirOwnOverlapAndWrappedWindows() throws {
+        guard Device.defaultDevice().deviceType == .gpu else { throw XCTSkip("GPU only") }
+        try Device.withDefaultDevice(.gpu) {
+            let model = try loadTiny()
+            try checkEveryPrefix(model, starts: [3, 127], widths: [5, 3])
+            try checkEveryPrefix(model, starts: [128, 7, 0], widths: [3, 4, 1])
+            try checkEveryPrefix(model, starts: [0, 3, 7, 127], widths: [2, 2, 2, 2])
+        }
+    }
+
+    func testGPUIndexerPoolCrosses512EntriesInsideVerify() throws {
+        guard Device.defaultDevice().deviceType == .gpu else { throw XCTSkip("GPU only") }
+        try Device.withDefaultDevice(.gpu) {
+            let model = try loadTiny(indexTopK: 512)
+            try checkEveryPrefix(model, starts: [2047], widths: [8])
+        }
+    }
 }

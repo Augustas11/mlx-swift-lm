@@ -112,31 +112,41 @@ final class DeepseekV4DSparkLoadingTests: XCTestCase {
     }
     func testPackedHiddenCaptureMatchesEverySerialPosition() throws {
         try Device.withDefaultDevice(.cpu) {
-            let configuration = try decode(configurationObject())
-            let model = DeepseekV4Model(configuration)
-            let inputs = [[17, 23, 31, 47], [5, 7]]
-            let caches = try inputs.map { _ in try model.newCache(parameters: nil) }
-            let verified = model.verifyBatchOutput(inputs, rowCaches: caches)
-            let actualHidden = try XCTUnwrap(verified.output.state?[mtpLastHiddenStatesKey])
-            XCTAssertEqual(actualHidden.shape, [1, 6, 192])
-            var emit = LMOutput.State()
-            emit[mtpEmitFlagKey] = true
-            for row in inputs.indices {
-                let serial = try model.newCache(parameters: nil)
-                for column in inputs[row].indices {
-                    let token = MLXArray([Int32(inputs[row][column])]).reshaped(1, 1)
-                    let expected = model(LMInput.Text(tokens: token), cache: serial, state: emit)
-                    let expectedHidden = try XCTUnwrap(expected.state?[mtpLastHiddenStatesKey])
-                    let position = verified.rowOffsets[row] + column
-                    XCTAssertEqual(
-                        actualHidden[0..., position ..< (position + 1)].asArray(Float.self),
-                        expectedHidden.asArray(Float.self), "row=\(row) column=\(column)")
-                    XCTAssertEqual(
-                        verified.output.logits[0..., position ..< (position + 1)].asArray(Float.self),
-                        expected.logits.asArray(Float.self), "row=\(row) column=\(column)")
-                }
-            }
+            try checkPackedHiddenCaptureMatchesEverySerialPosition()
         }
     }
 
+    func testGPUPackedHiddenCaptureMatchesEverySerialPosition() throws {
+        guard Device.defaultDevice().deviceType == .gpu else { throw XCTSkip("GPU only") }
+        try Device.withDefaultDevice(.gpu) {
+            try checkPackedHiddenCaptureMatchesEverySerialPosition()
+        }
+    }
+
+    private func checkPackedHiddenCaptureMatchesEverySerialPosition() throws {
+        let configuration = try decode(configurationObject())
+        let model = DeepseekV4Model(configuration)
+        let inputs = [[17, 23, 31, 47], [5, 7]]
+        let caches = try inputs.map { _ in try model.newCache(parameters: nil) }
+        let verified = model.verifyBatchOutput(inputs, rowCaches: caches)
+        let actualHidden = try XCTUnwrap(verified.output.state?[mtpLastHiddenStatesKey])
+        XCTAssertEqual(actualHidden.shape, [1, 6, 192])
+        var emit = LMOutput.State()
+        emit[mtpEmitFlagKey] = true
+        for row in inputs.indices {
+            let serial = try model.newCache(parameters: nil)
+            for column in inputs[row].indices {
+                let token = MLXArray([Int32(inputs[row][column])]).reshaped(1, 1)
+                let expected = model(LMInput.Text(tokens: token), cache: serial, state: emit)
+                let expectedHidden = try XCTUnwrap(expected.state?[mtpLastHiddenStatesKey])
+                let position = verified.rowOffsets[row] + column
+                XCTAssertEqual(
+                    actualHidden[0..., position ..< (position + 1)].asArray(Float.self),
+                    expectedHidden.asArray(Float.self), "row=\(row) column=\(column)")
+                XCTAssertEqual(
+                    verified.output.logits[0..., position ..< (position + 1)].asArray(Float.self),
+                    expected.logits.asArray(Float.self), "row=\(row) column=\(column)")
+            }
+        }
+    }
 }
