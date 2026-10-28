@@ -115,16 +115,18 @@ final class DeepseekV4SparseAttentionTests: XCTestCase {
         let L = 8
         let D = 512
         let K = 65
-        let q = MLXArray(
-            (0 ..< B * H * L * D).map {
-                Float(($0 * 7 % 23) - 11) / 16
-            }
-        ).reshaped(B, H, L, D).asType(.bfloat16)
-        let keys = MLXArray(
-            (0 ..< B * L * K * D).map {
-                Float(($0 * 3 % 19) - 9) / 16
-            }
-        ).reshaped(B, L, K, D).asType(.bfloat16)
+        let queryCount = B * H * L * D
+        let queryValues: [Float] = (0 ..< queryCount).map { index in
+            let value = (index * 7 % 23) - 11
+            return Float(value) / 16
+        }
+        let q = MLXArray(queryValues).reshaped(B, H, L, D).asType(.bfloat16)
+        let keyCount = B * L * K * D
+        let keyValues: [Float] = (0 ..< keyCount).map { index in
+            let value = (index * 3 % 19) - 9
+            return Float(value) / 16
+        }
+        let keys = MLXArray(keyValues).reshaped(B, L, K, D).asType(.bfloat16)
         let valid = MLXArray.ones([B, L, K], dtype: .bool)
         let sink = MLXArray.zeros([H])
         let full = try XCTUnwrap(
