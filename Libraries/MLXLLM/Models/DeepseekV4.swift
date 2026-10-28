@@ -1707,12 +1707,51 @@ public final class DeepseekV4Model: Module, LLMModel {
             emitMTPState: emitMTPState)
     }
 
-    /// Exact ragged verification with at most eight total positions, keeping
-    /// every projection on the batch-invariant small-M decode kernel route.
-    /// Logits/hidden are `[1, sum(lengths), D]` in row-major order; prefix
-    /// snapshots include every layer after each input position. Input caches
-    /// remain committed until the caller selects a returned prefix.
+    /// Exact ragged verification of at most eight total positions. Until the
+    /// packed path is bitwise qualified, advance each position through ordinary
+    /// decode: tiny batched rounding changes can alter indexer selection and
+    /// retained cache state. Ordinary continuous-batch decode remains batched.
     public func verifyBatchOutput(
+        _ inputs: [[Int]], rowCaches: [[KVCache]], emitMTPState: Bool = true
+    ) -> (output: LMOutput, cachePrefixes: [[[KVCache]]], rowOffsets: [Int]) {
+        let lengths = inputs.map { $0.count }
+        let count = lengths.reduce(0, +)
+        precondition(batchesExactly, "DeepSeek V4 with a HISA indexer does not verify in a batch")
+        precondition(!inputs.isEmpty && lengths.allSatisfy { $0 > 0 })
+        precondition((1 ... 8).contains(count), "DeepSeek V4 packed verify supports 1...8 positions")
+        precondition(rowCaches.count == inputs.count)
+        precondition(rowCaches.allSatisfy { $0.count == layers.count })
+        var logits = [MLXArray]()
+        var hidden = [MLXArray]()
+        var prefixes = [[[KVCache]]]()
+        var offsets = [Int]()
+        for row in inputs.indices {
+            offsets.append(logits.count)
+            let working = rowCaches[row].map { $0.copy() }
+            var rowPrefixes = [[KVCache]]()
+            for token in inputs[row] {
+                let result = forward(
+                    MLXArray([Int32(token)]).reshaped(1, 1), cache: working,
+                    emitMTPState: emitMTPState)
+                logits.append(result.logits)
+                if let captured = result.state?[mtpLastHiddenStatesKey] {
+                    hidden.append(captured)
+                }
+                rowPrefixes.append(working.map { $0.copy() })
+            }
+            prefixes.append(rowPrefixes)
+        }
+        var state: LMOutput.State?
+        if !hidden.isEmpty {
+            state = LMOutput.State()
+            state?[mtpLastHiddenStatesKey] = concatenated(hidden, axis: 1)
+        }
+        return (LMOutput(logits: concatenated(logits, axis: 1), state: state), prefixes, offsets)
+    }
+
+    /// Candidate packed implementation retained for future qualification.
+    /// It must pass the scalar prefix/state oracle before serving verification.
+    private func verifyPackedBatchOutput(
         _ inputs: [[Int]], rowCaches: [[KVCache]], emitMTPState: Bool = true
     ) -> (output: LMOutput, cachePrefixes: [[[KVCache]]], rowOffsets: [Int]) {
         let lengths = inputs.map { $0.count }

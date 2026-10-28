@@ -33,8 +33,9 @@ private let deepseekV4SparseAttentionKernel = MLXFast.metalKernel(
                 const bool present = k < K && valid[ki + k];
                 if (present) {
                     for (uint d = lane; d < D; d += 32) {
+                        // MLX lowers the rank-zero scale input to a scalar value.
                         // Scale q in float32 before multiplication, as in the oracle.
-                        const float query = float(q[qi + d]) * scale[0];
+                        const float query = float(q[qi + d]) * scale;
                         dot += query * float(keys[(ki + k) * D + d]);
                     }
                 }
