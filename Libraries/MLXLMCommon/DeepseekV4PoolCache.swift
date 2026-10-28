@@ -3,12 +3,13 @@
 //  mlx-swift-lm
 //
 //  The compressor state of one DeepSeek-V4 compressed-attention branch: the
-//  raw kv/gate rows of a window still filling up (fewer than `ratio`) and the
-//  growing pool of compressed entries, one per `ratio` tokens.
+//  raw kv/gate rows of a window still filling up (fewer than `ratio`), the
+//  growing pool of compressed entries, one per `ratio` tokens, and for the
+//  overlapping ratio-4 compressor the first half-channels of the last
+//  completed window, which the next window pools as well.
 //
 //  Port of mlx-vlm 0.7.10 `PoolingCache` (`mlx_vlm/models/cache.py:2693`),
-//  without its speculation transaction (MTP rewind comes with the DSpark
-//  slice).
+//  with exact speculative prefix snapshots, including ratio-4 overlap state.
 //
 
 import Foundation
@@ -17,10 +18,88 @@ import MLX
 public final class DeepseekV4PoolCache: BaseKVCache {
     public let ratio: Int
 
-    /// `[B, ratio, D]` raw rows; the first `remainder` are live.
+    private struct SpeculationSnapshot {
+        let bufferKV: MLXArray?
+        let bufferGate: MLXArray?
+        let pooledStorage: MLXArray?
+        let overlapKV: MLXArray?
+        let overlapGate: MLXArray?
+        let remainder: Int
+        let count: Int
+    }
+    private var speculation: [SpeculationSnapshot]?
+    private var speculationLimit = 0
+    private var speculationWritePending = false
+
+    public var speculationIsOpen: Bool { speculation != nil }
+
+    private func snapshot() -> SpeculationSnapshot {
+        SpeculationSnapshot(
+            bufferKV: bufferKV?[.ellipsis], bufferGate: bufferGate?[.ellipsis],
+            pooledStorage: pooledStorage?[.ellipsis], overlapKV: overlapKV?[.ellipsis],
+            overlapGate: overlapGate?[.ellipsis], remainder: remainder, count: count)
+    }
+
+    /// Open before a positionwise verify; every append records the complete
+    /// compressor state after that position, including an overlap boundary.
+    @discardableResult
+    public func beginSpeculation(maximumPositions: Int) -> Bool {
+        guard speculation == nil, (1 ... 8).contains(maximumPositions) else { return false }
+        speculation = [snapshot()]
+        speculationLimit = maximumPositions
+        speculationWritePending = false
+        return true
+    }
+
+    /// Restore an exact retained prefix. No rejected buffer, pool or overlap
+    /// state survives, even when a ratio-4/128 window completed in the tail.
+    @discardableResult
+    public func commitSpeculation(retaining: Int) -> Bool {
+        guard let snapshots = speculation, !speculationWritePending,
+            snapshots.indices.contains(retaining)
+        else { return false }
+        let saved = snapshots[retaining]
+        bufferKV = saved.bufferKV
+        bufferGate = saved.bufferGate
+        pooledStorage = saved.pooledStorage
+        overlapKV = saved.overlapKV
+        overlapGate = saved.overlapGate
+        remainder = saved.remainder
+        count = saved.count
+        speculation = nil
+        speculationLimit = 0
+        return true
+    }
+
+    @discardableResult
+    public func abortSpeculation() -> Bool {
+        guard let saved = speculation?.first else { return false }
+        bufferKV = saved.bufferKV
+        bufferGate = saved.bufferGate
+        pooledStorage = saved.pooledStorage
+        overlapKV = saved.overlapKV
+        overlapGate = saved.overlapGate
+        remainder = saved.remainder
+        count = saved.count
+        speculation = nil
+        speculationLimit = 0
+        speculationWritePending = false
+        return true
+    }
+
+    /// `[B, ratio, D]` raw rows (float32 projections); the first `remainder` are live.
     var bufferKV: MLXArray?
     var bufferGate: MLXArray?
     public private(set) var remainder = 0
+
+    /// Ratio-4 overlap state (`kv_state[:, :ratio]` / `score_state[:, :ratio]`,
+    /// `inference/model.py:309-310, 336-338, 353-360`): the last completed
+    /// window's first half-channels of kv and of gate (without `ape`),
+    /// `[B, ratio, D / 2]` float32, or `nil` before the first window. It is
+    /// carried across calls, so a window pools its predecessor whether the
+    /// two arrived in one call or in two.
+    public var overlapKV: MLXArray?
+    public var overlapGate: MLXArray?
 
     /// `[B, P, D]` compressed entries in token order, or `nil` before the first window.
     private var pooledStorage: MLXArray?
@@ -37,11 +116,14 @@ public final class DeepseekV4PoolCache: BaseKVCache {
         super.init()
     }
 
+    /// Batch rows of the window buffers, `nil` before the first call.
+    public var bufferRows: Int? { bufferKV?.dim(0) }
+
     /// Compressed entries held (the reference's `offset`).
     public var pooledCount: Int { count }
 
     public override func innerState() -> [MLXArray] {
-        [bufferKV, bufferGate, pooledStorage].compactMap { $0 }
+        [bufferKV, bufferGate, pooledStorage, overlapKV, overlapGate].compactMap { $0 }
     }
 
     /// Rows of every window this call completes, `[B, W * ratio, D]` (empty
@@ -55,6 +137,12 @@ public final class DeepseekV4PoolCache: BaseKVCache {
         -> (kv: MLXArray, gate: MLXArray, base: Int)
     {
         let (B, L) = (kv.dim(0), kv.dim(1))
+        if let snapshots = speculation {
+            precondition(L == 1 && !speculationWritePending,
+                "DeepSeek speculative compressors must advance one position at a time")
+            precondition(snapshots.count <= speculationLimit, "Speculative pool capacity exceeded")
+            speculationWritePending = true
+        }
         let (kvWidth, gateWidth) = (kv.dim(2), gate.dim(2))
         if bufferKV == nil {
             bufferKV = MLXArray.zeros([B, ratio, kvWidth], dtype: kv.dtype)
@@ -112,6 +200,11 @@ public final class DeepseekV4PoolCache: BaseKVCache {
             pooledStorage![0..., count ..< (count + added)] = entries
             count += added
         }
+        if speculation != nil {
+            precondition(speculationWritePending, "Pool append without a speculative input position")
+            speculation!.append(snapshot())
+            speculationWritePending = false
+        }
         return pooled ?? entries
     }
 
@@ -125,25 +218,34 @@ public final class DeepseekV4PoolCache: BaseKVCache {
         return poolIndex .< expandedDimensions(queryIndex.floorDivide(Int32(ratio)), axis: 1)
     }
 
-    /// `[]`, `[bufferKV, bufferGate]` or `[bufferKV, bufferGate, pooled]`: the
-    /// buffers exist from the first call on, before any entry is pooled.
+    /// `[]`, `[bufferKV, bufferGate]`, `[bufferKV, bufferGate, pooled]` or,
+    /// once an overlapping window completed, `[bufferKV, bufferGate, pooled,
+    /// overlapKV, overlapGate]`: the buffers exist from the first call on,
+    /// before any entry is pooled, and the overlap state with the first entry.
     public override var state: [MLXArray] {
-        get { [bufferKV, bufferGate, pooled].compactMap { $0 } }
+        get { [bufferKV, bufferGate, pooled, overlapKV, overlapGate].compactMap { $0 } }
         set {
-            guard [0, 2, 3].contains(newValue.count) else {
-                fatalError("DeepseekV4PoolCache state must have 0, 2 or 3 arrays")
+            guard [0, 2, 3, 5].contains(newValue.count) else {
+                fatalError("DeepseekV4PoolCache state must have 0, 2, 3 or 5 arrays")
             }
             bufferKV = newValue.count >= 2 ? newValue[0] : nil
             bufferGate = newValue.count >= 2 ? newValue[1] : nil
-            pooledStorage = newValue.count == 3 ? newValue[2] : nil
+            pooledStorage = newValue.count >= 3 ? newValue[2] : nil
             count = pooledStorage?.dim(1) ?? 0
+            overlapKV = newValue.count == 5 ? newValue[3] : nil
+            overlapGate = newValue.count == 5 ? newValue[4] : nil
         }
     }
 
     public override var metaState: [String] {
-        get { [String(ratio), String(remainder), String(bufferKV != nil), String(pooled != nil)] }
+        get {
+            [
+                String(ratio), String(remainder), String(bufferKV != nil), String(pooled != nil),
+                String(overlapKV != nil),
+            ]
+        }
         set {
-            guard newValue.count == 4, Int(newValue[0]) == ratio, let remainder = Int(newValue[1])
+            guard newValue.count == 5, Int(newValue[0]) == ratio, let remainder = Int(newValue[1])
             else { fatalError("DeepseekV4PoolCache metaState mismatch: \(newValue)") }
             self.remainder = remainder
         }
@@ -154,6 +256,8 @@ public final class DeepseekV4PoolCache: BaseKVCache {
         new.bufferKV = bufferKV?[.ellipsis]
         new.bufferGate = bufferGate?[.ellipsis]
         new.pooledStorage = pooledStorage?[.ellipsis]
+        new.overlapKV = overlapKV?[.ellipsis]
+        new.overlapGate = overlapGate?[.ellipsis]
         new.count = count
         new.remainder = remainder
         return new

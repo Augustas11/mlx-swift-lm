@@ -6,13 +6,14 @@ import XCTest
 
 @testable import MLXLLM
 
-/// DeepSeek-V4 against the mlx-vlm 0.7.10 reference. The fixture
-/// (`Resources/deepseek_v4_tiny`, made by its `make_fixture.py`) is a 4-layer
-/// model with every V4 path: a hash-routed layer, local, ratio-4 (indexer,
-/// HISA and flat selection) and ratio-128 attention, an 8-token window, and
-/// the artifact's MXFP4/MXFP8 per-layer quantization. Everything runs on the
-/// CPU; the oracle is mlx-vlm's `generate_step` on the CPU, so the expected
-/// tokens and log-probabilities are those of the same op graph.
+/// DeepSeek-V4 against a port of DeepSeek's reference (`inference/model.py`
+/// + `kernel.py`). The fixture (`Resources/deepseek_v4_tiny`, weights from
+/// its `make_fixture.py`) is a 4-layer model with every V4 path: a
+/// hash-routed layer, local, ratio-4 (indexer) and ratio-128 attention, an
+/// 8-token window, and the artifact's MXFP4/MXFP8 per-layer quantization.
+/// Everything runs on the CPU. The oracle (`make_oracle.py`) prefills the
+/// whole prompt in one call with float32 activations, so the parity test
+/// loads the fixture with its bf16 tensors widened to float32 as well.
 final class DeepseekV4Tests: XCTestCase {
 
     private struct Oracle: Decodable {
@@ -42,7 +43,9 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
-    private func loadTiny(indexBlock: Int, indexKeep: Int) throws -> DeepseekV4Model {
+    private func loadTiny(indexBlock: Int, indexKeep: Int, float32: Bool = false) throws
+        -> DeepseekV4Model
+    {
         let dir = try fixture
         let data = try Data(contentsOf: dir.appendingPathComponent("config.json"))
         var config = try JSONDecoder().decode(DeepseekV4Configuration.self, from: data)
@@ -53,6 +56,12 @@ final class DeepseekV4Tests: XCTestCase {
         let model = DeepseekV4Model(config)
         try loadWeights(
             modelDirectory: dir, model: model, perLayerQuantization: base.perLayerQuantization)
+        if float32 {
+            let widened = model.parameters().flattened().map { key, value in
+                (key, value.dtype == .bfloat16 ? value.asType(.float32) : value)
+            }
+            try model.update(parameters: ModuleParameters.unflattened(widened), verify: [.all])
+        }
         model.train(false)
         return model
     }
@@ -91,13 +100,10 @@ final class DeepseekV4Tests: XCTestCase {
             let dir = try fixture
             let oracle = try JSONDecoder().decode(
                 Oracle.self, from: Data(contentsOf: dir.appendingPathComponent("oracle.json")))
-            XCTAssertEqual(oracle.cases.count, 6)
-            var models = [String: DeepseekV4Model]()
+            XCTAssertEqual(oracle.cases.count, 3)
+            let model = try loadTiny(indexBlock: 0, indexKeep: 0, float32: true)
             for item in oracle.cases {
-                let model =
-                    try models[item.indexer]
-                    ?? loadTiny(indexBlock: item.indexBlock, indexKeep: item.indexKeep)
-                models[item.indexer] = model
+                XCTAssertEqual(item.indexer, "flat")
                 let (tokens, logprobs) = try greedy(
                     model, prompt: item.prompt, step: item.prefillStep, count: oracle.decode)
                 let label = "\(item.indexer) prompt=\(item.prompt.count) step=\(item.prefillStep)"
@@ -106,15 +112,16 @@ final class DeepseekV4Tests: XCTestCase {
                     zip(mine, theirs).map { abs($0 - $1) }.max() ?? 0
                 }.max() ?? 0
                 print("deepseek_v4 parity \(label): max |dlogprob| = \(diff)")
-                // Same MLX core and the same CPU op graph: equal up to reduction order.
+                // Float32 activations on both sides: equal up to reduction order
+                // and the oracle's single-call prefill against this chunk plan.
                 XCTAssertLessThan(diff, 1e-3, label)
             }
         }
     }
 
     /// The serving path (`TokenIterator`, whatever prefill step and chunking
-    /// the caller asks for) prefills with the reference plan, so it decodes
-    /// the step-2048 oracle cases exactly.
+    /// the caller asks for) prefills with the fixed 2048-token plan and
+    /// decodes the oracle's tokens.
     func testTokenIteratorUsesReferencePrefillPlan() throws {
         try Device.withDefaultDevice(.cpu) {
             let dir = try fixture
@@ -123,9 +130,9 @@ final class DeepseekV4Tests: XCTestCase {
             let cases = oracle.cases.filter {
                 $0.prefillStep == DeepseekV4Model.prefillStepSize
             }
-            XCTAssertEqual(cases.count, 2)
+            XCTAssertEqual(cases.count, 1)
             for item in cases {
-                let model = try loadTiny(indexBlock: item.indexBlock, indexKeep: item.indexKeep)
+                let model = try loadTiny(indexBlock: 0, indexKeep: 0, float32: true)
                 for chunking in [PrefillParameters.Chunking.remainder, .balanced, .unchunked] {
                     let parameters = GenerateParameters(
                         maxTokens: oracle.decode, temperature: 0,
@@ -206,7 +213,7 @@ final class DeepseekV4Tests: XCTestCase {
             let prompts = lengths.enumerated().map { row, count in
                 (0 ..< count).map { ($0 * 7 + row * 11 + 2) % 128 }
             }
-            for indexBlock in [0, 4] {
+            for indexBlock in [0] {
                 let model = try loadTiny(indexBlock: indexBlock, indexKeep: 2)
                 let count = 16
                 let serial = try prompts.map {
@@ -235,7 +242,7 @@ final class DeepseekV4Tests: XCTestCase {
             let prompts = [31, 32, 33, 127, 128, 129, 131, 137].enumerated().map { row, count in
                 (0 ..< count).map { ($0 * 7 + row * 11 + 2) % 128 }
             }
-            for indexBlock in [0, 4] {
+            for indexBlock in [0] {
                 let model = try loadTiny(indexBlock: indexBlock, indexKeep: 2)
                 let serial = try prompts.map {
                     try greedy(model, prompt: $0, step: DeepseekV4Model.prefillStepSize, count: 4).0
@@ -260,7 +267,7 @@ final class DeepseekV4Tests: XCTestCase {
 
     func testContinuousBatchRowsJoinLeaveAndReorderWithoutChangingTokens() throws {
         try Device.withDefaultDevice(.cpu) {
-            let model = try loadTiny(indexBlock: 4, indexKeep: 2)
+            let model = try loadTiny(indexBlock: 0, indexKeep: 0)
             let prompts = [7, 31, 127, 130].enumerated().map { row, count in
                 (0 ..< count).map { ($0 * 3 + row * 17) % 128 }
             }
@@ -346,9 +353,225 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
+    /// The pooled entries of a token stream do not depend on how it is split
+    /// into calls: one call, uneven chunks, one token at a time, and a
+    /// `copy()` / `state` snapshot resumed mid-stream all pool the same
+    /// entries (`inference/model.py:309-310, 336-338, 353-360` carry the
+    /// previous ratio-4 window across calls).
+    func testCompressorPoolsAreChunkingInvariant() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = try loadTiny(indexBlock: 0, indexKeep: 0)
+            for layer in model.layers where layer.attn.ratio > 0 {
+                let ratio = layer.attn.ratio
+                var compressors = [try XCTUnwrap(layer.attn.compressor)]
+                if let indexer = layer.attn.indexer { compressors.append(indexer.compressor) }
+                let total = ratio == 4 ? 4 * 13 + 3 : 2 * 128 + 5
+                let x = sin(MLXArray.arange(total * 64, dtype: .float32) / 7).reshaped(1, total, 64)
+                    .asType(.bfloat16)
+                for compressor in compressors {
+                    func pool(_ chunks: [Int], snapshotAfter: Int? = nil) -> DeepseekV4PoolCache {
+                        var cache = DeepseekV4PoolCache(ratio: ratio)
+                        var offset = 0
+                        for (i, n) in chunks.enumerated() {
+                            _ = compressor(x[0..., offset ..< (offset + n)], cache: cache, offset: offset)
+                            eval(cache.innerState())
+                            offset += n
+                            if i == snapshotAfter {
+                                let restored = DeepseekV4PoolCache(ratio: ratio)
+                                restored.state = (cache.copy() as! DeepseekV4PoolCache).state
+                                restored.metaState = cache.metaState
+                                cache = restored
+                            }
+                        }
+                        XCTAssertEqual(offset, total)
+                        return cache
+                    }
+                    let whole = pool([total])
+                    let expected = try XCTUnwrap(whole.pooled)
+                    XCTAssertEqual(expected.dim(1), total / ratio)
+                    let uneven = ratio == 4 ? [3, 6, 1, 17, 2, 26] : [100, 1, 60, 100]
+                    for (label, cache) in [
+                        ("uneven", pool(uneven)),
+                        ("one at a time", pool(Array(repeating: 1, count: total))),
+                        ("snapshot", pool(uneven, snapshotAfter: 2)),
+                    ] {
+                        let actual = try XCTUnwrap(cache.pooled, label)
+                        XCTAssertEqual(actual.shape, expected.shape, label)
+                        let diff = abs(actual.asType(.float32) - expected.asType(.float32)).max()
+                            .item(Float.self)
+                        XCTAssertLessThanOrEqual(diff, 1e-5, "ratio=\(ratio) \(label)")
+                        XCTAssertEqual(cache.remainder, whole.remainder, label)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The default indexer selects exactly the brute-force top `index_topk`
+    /// of `sum_h relu(q_h . k) * scale * w_h / sqrt(H)` over every pooled
+    /// entry, serially and in a ragged batch, at pool sizes of 2048 and more
+    /// (where mlx-vlm's HISA filter used to replace it).
+    func testIndexerSelectsExactTopKOverLargePools() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let json = """
+                {"model_type": "deepseek_v4", "num_hidden_layers": 2, "hidden_size": 64,
+                 "q_lora_rank": 32, "qk_rope_head_dim": 16, "index_n_heads": 4,
+                 "index_head_dim": 32, "index_topk": 512, "compress_ratios": [4, 4]}
+                """
+            let config = try JSONDecoder().decode(DeepseekV4Configuration.self, from: Data(json.utf8))
+            try config.validateModelConfiguration()
+            XCTAssertEqual(config.indexBlock, 0)
+            MLXRandom.seed(2111)
+            let indexer = DeepseekV4Indexer(config, ratio: 4)
+            let rope = DeepseekV4RoPE(dims: 16, base: 160000, scaling: nil)
+            func bruteForce(x: MLXArray, qResidual: MLXArray, pool: MLXArray, offset: Int) -> Set<Int32> {
+                let q = rope(
+                    indexer.wqB(qResidual).reshaped(1, 1, 4, 32).transposed(0, 2, 1, 3), offset: offset)
+                    .asType(.float32)
+                let w = indexer.weightsProj(x).asType(.float32).reshaped(4, 1, 1) * pow(Float(4), -0.5)
+                let dots = maximum(matmul(q[0], pool[0].asType(.float32).T), 0)  // [H, 1, P]
+                let scores = (dots * indexer.scale * w).sum(axis: 0).reshaped(-1)
+                let k = min(512, pool.dim(1))
+                return Set(argSort(-scores)[..<k].asArray(Int32.self))
+            }
+            var pools = [MLXArray]()
+            var inputs = [(MLXArray, MLXArray, Int)]()
+            for count in [2048, 3001, 4096] {
+                let pool = MLXRandom.normal([1, count, 32]).asType(.bfloat16)
+                let x = MLXRandom.normal([1, 1, 64]).asType(.bfloat16)
+                let qResidual = MLXRandom.normal([1, 1, 32]).asType(.bfloat16)
+                let offset = 4 * count + 1
+                let cache = DeepseekV4PoolCache(ratio: 4)
+                _ = cache.accumulateWindows(
+                    kv: MLXArray.zeros([1, 2, 64], dtype: .bfloat16),
+                    gate: MLXArray.zeros([1, 2, 64], dtype: .bfloat16), offset: offset - 2)
+                _ = cache.appendPooled(pool)
+                let expected = bruteForce(x: x, qResidual: qResidual, pool: pool, offset: offset)
+                XCTAssertEqual(expected.count, 512)
+                let serial = try XCTUnwrap(
+                    indexer(x, qResidual: qResidual, rope: rope, cache: cache, offset: offset))
+                XCTAssertEqual(Set(serial.reshaped(-1).asArray(Int32.self)), expected, "serial P=\(count)")
+                pools.append(pool)
+                inputs.append((x, qResidual, offset))
+            }
+            let batched = indexer.decodeBatch(
+                concatenated(inputs.map { $0.0 }, axis: 0),
+                qResidual: concatenated(inputs.map { $0.1 }, axis: 0), rope: rope, pools: pools,
+                offsets: MLXArray(inputs.map { Int32($0.2) }))
+            for row in pools.indices {
+                let expected = bruteForce(
+                    x: inputs[row].0, qResidual: inputs[row].1, pool: pools[row], offset: inputs[row].2)
+                XCTAssertEqual(
+                    Set(batched[row].reshaped(-1).asArray(Int32.self)), expected, "batched row=\(row)")
+            }
+        }
+    }
+
+    /// A prompt chunk's exact selection is the same whether its float32
+    /// scores fit one workspace or are tiled over queries.
+    func testIndexerPrefillTilesKeepTheExactSelection() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let json = """
+                {"model_type": "deepseek_v4", "num_hidden_layers": 2, "hidden_size": 64,
+                 "q_lora_rank": 32, "qk_rope_head_dim": 16, "index_n_heads": 4,
+                 "index_head_dim": 32, "index_topk": 8, "compress_ratios": [4, 4]}
+                """
+            let config = try JSONDecoder().decode(DeepseekV4Configuration.self, from: Data(json.utf8))
+            MLXRandom.seed(2151)
+            let indexer = DeepseekV4Indexer(config, ratio: 4)
+            let rope = DeepseekV4RoPE(dims: 16, base: 160000, scaling: nil)
+            let (L, offset) = (40, 4 * 300)
+            let pool = MLXRandom.normal([1, 300, 32]).asType(.bfloat16)
+            let x = MLXRandom.normal([1, L, 64]).asType(.bfloat16)
+            let qResidual = MLXRandom.normal([1, L, 32]).asType(.bfloat16)
+            func run(workspace: Int) throws -> MLXArray {
+                indexer.scoreWorkspaceBytes = workspace
+                let cache = DeepseekV4PoolCache(ratio: 4)
+                _ = cache.accumulateWindows(
+                    kv: MLXArray.zeros([1, 2, 64], dtype: .bfloat16),
+                    gate: MLXArray.zeros([1, 2, 64], dtype: .bfloat16), offset: offset - 2)
+                _ = cache.appendPooled(pool)
+                return try XCTUnwrap(
+                    indexer(x, qResidual: qResidual, rope: rope, cache: cache, offset: offset))
+            }
+            let whole = try run(workspace: 512 << 20)
+            let tiled = try run(workspace: 4 * 4 * 310 * 4 * 7)  // 7 queries per tile
+            XCTAssertEqual(whole.shape, [1, L, 8])
+            for t in 0 ..< L {
+                XCTAssertEqual(
+                    Set(whole[0, t].asArray(Int32.self)), Set(tiled[0, t].asArray(Int32.self)),
+                    "query \(t)")
+            }
+        }
+    }
+
+    /// DeepSeek's kernel rounds the unnormalized weights against the running
+    /// max of each 64-key block, then rescales the float32 accumulator when a
+    /// later block raises the max. A query whose first block holds a value of
+    /// 128 at score 0 and whose second block holds -47 at score 1 keeps
+    /// 128 * exp(-1) - 47; rounding exp(-1) to bf16 (47/128) against the final
+    /// max would cancel it to 0.
+    func testAttentionRoundsWeightsPerRunningMaxBlock() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let json = """
+                {"model_type": "deepseek_v4", "num_hidden_layers": 1, "hidden_size": 64,
+                 "num_attention_heads": 2, "o_groups": 2, "head_dim": 64, "qk_rope_head_dim": 16,
+                 "q_lora_rank": 32, "o_lora_rank": 8, "sliding_window": 128, "compress_ratios": [0]}
+                """
+            let config = try JSONDecoder().decode(DeepseekV4Configuration.self, from: Data(json.utf8))
+            let attention = DeepseekV4Attention(config, layerIdx: 0)
+            // scale 1/8: q = 8 e0 gives scores k[0].
+            var keys = [[Float]](repeating: [Float](repeating: 0, count: 64), count: 128)
+            keys[0][1] = 128
+            keys[64][0] = 1
+            keys[64][1] = -47
+            let k = MLXArray(keys.flatMap { $0 }).reshaped(1, 1, 128, 64)
+            var query = [Float](repeating: 0, count: 64)
+            query[0] = 8
+            let q = broadcast(MLXArray(query).reshaped(1, 1, 1, 64), to: [1, 2, 1, 64])
+            let out = attention.referenceAttention(
+                q, keys: k, valid: MLXArray.ones([1, 1, 128], dtype: .bool))
+            // Block 0: max 0, weights 1, accumulator 128. Block 1 raises the max to 1:
+            // the accumulator rescales by e^-1 and adds -47; 128 + 1 weights and
+            // the sink (e^-1) form the normalizer.
+            let e = Float(Foundation.exp(-1.0))
+            let expected = (128 * e - 47) / (1 + 128 * e)
+            XCTAssertEqual(out[0, 0, 0, 1].item(Float.self), expected, accuracy: 1e-6)
+            XCTAssertGreaterThan(out[0, 0, 0, 1].item(Float.self), 1e-3)
+        }
+    }
+
+    /// The float32 linear (compressor projections, head) on the GPU: the
+    /// bfloat16-weight kernel equals a float32 matmul over the widened weight
+    /// up to summation order, and a row's result does not depend on how many
+    /// rows share the call.
+    func testFloat32LinearKernelMatchesWidenedWeight() throws {
+        guard Device.defaultDevice().deviceType == .gpu else { throw XCTSkip("GPU only") }
+        MLXRandom.seed(272)
+        for (K, N) in [(64, 129), (4096, 1000)] {
+            let weight = MLXRandom.normal([N, K]).asType(.bfloat16)
+            let layer = Linear(weight: weight)
+            let x = MLXRandom.normal([8, 1, K]).asType(.bfloat16)
+            let expected = matmul(x.asType(.float32), weight.asType(.float32).T)
+            let full = deepseekV4LinearF32(layer, x)
+            XCTAssertEqual(full.dtype, .float32)
+            XCTAssertEqual(full.shape, [8, 1, N])
+            let scale = abs(expected).max().item(Float.self)
+            XCTAssertLessThan(
+                abs(full - expected).max().item(Float.self) / scale, 1e-5, "K=\(K) N=\(N)")
+            for rows in 1 ... 7 {
+                let part = deepseekV4LinearF32(layer, x[..<rows])
+                XCTAssertEqual(
+                    part.asArray(Float.self), full[..<rows].asArray(Float.self), "rows=\(rows)")
+            }
+        }
+    }
+
     func testContinuousBatchUsesKeysOnlyWindowsAndIndependentPoolSnapshots() throws {
         try Device.withDefaultDevice(.cpu) {
-            let model = try loadTiny(indexBlock: 4, indexKeep: 2)
+            let model = try loadTiny(indexBlock: 0, indexKeep: 0)
+            XCTAssertTrue(model.batchesExactly)
+            XCTAssertFalse(try loadTiny(indexBlock: 4, indexKeep: 2).batchesExactly)
             let prompts = [1, 3, 31, 32, 33, 127, 128, 129].enumerated().map { row, count in
                 (0 ..< count).map { ($0 * 5 + row * 7) % 128 }
             }
@@ -431,9 +654,9 @@ final class DeepseekV4Tests: XCTestCase {
         XCTAssertEqual(config.compressRatios.filter { $0 == 4 }.count, 21)
         XCTAssertEqual(config.compressRatios.filter { $0 == 128 }.count, 20)
         XCTAssertEqual(config.compressRatios.last, 4)
-        // The reference enables HISA by default; the artifact sets neither key.
-        XCTAssertEqual(config.indexBlock, 64)
-        XCTAssertEqual(config.indexKeep, 16)
+        // The artifact sets neither HISA key: exact flat top-k, as DeepSeek's reference.
+        XCTAssertEqual(config.indexBlock, 0)
+        XCTAssertEqual(config.indexKeep, 0)
 
         var bad = config
         bad.compressRatios[5] = 2
@@ -455,6 +678,7 @@ final class DeepseekV4Tests: XCTestCase {
             "layers.0.hc_attn_fn": MLXArray.zeros([2]),
             "layers.0.hc_ffn_scale": MLXArray.zeros([3]),
             "layers.0.ffn.gate.tid2eid": MLXArray([Int64(1), 0]),
+            "layers.0.ffn.gate.weight": MLXArray.zeros([2, 64], dtype: .bfloat16),
             "layers.0.ffn.shared_experts.w3.weight": MLXArray.zeros([2]),
             "layers.1.attn.wkv.weight": MLXArray.zeros([2]),
             "mtp.0.block.attn.wkv.weight": MLXArray.zeros([2]),
@@ -467,13 +691,15 @@ final class DeepseekV4Tests: XCTestCase {
             [
                 "layers.0.ffn.switch_mlp.gate_proj.weight", "layers.0.ffn.switch_mlp.down_proj.scales",
                 "layers.0.attn.wo_a.weight", "layers.0.attn_hc.fn", "layers.0.ffn_hc.scale",
-                "layers.0.ffn.gate.tid2eid", "layers.0.ffn.shared_experts.w3.weight",
+                "layers.0.ffn.gate.tid2eid", "layers.0.ffn.gate.weight",
+                "layers.0.ffn.shared_experts.w3.weight",
                 "hc_head.fn", "embed.weight",
             ])
         XCTAssertEqual(out["layers.0.ffn.switch_mlp.gate_proj.weight"]!.shape, [2, 3, 5])
         XCTAssertEqual(out["layers.0.ffn.switch_mlp.gate_proj.weight"]![1].sum().item(Float.self), 15)
         XCTAssertEqual(out["layers.0.attn.wo_a.weight"]!.shape, [2, 4, 6])
         XCTAssertEqual(out["layers.0.ffn.gate.tid2eid"]!.dtype, .int32)
+        XCTAssertEqual(out["layers.0.ffn.gate.weight"]!.dtype, .float32)
     }
     /// The real artifact's tensor names, shapes and dtypes (from the
     /// safetensors headers) against the module tree after sanitize and the
