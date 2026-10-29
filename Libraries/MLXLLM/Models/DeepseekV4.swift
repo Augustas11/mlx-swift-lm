@@ -398,7 +398,7 @@ private func deepseekV4PackedLinear(_ layer: Linear, _ x: MLXArray) -> MLXArray 
     if Device.defaultDevice().deviceType == .cpu, x.dim(0) > 1 {
         return concatenated((0 ..< x.dim(0)).map { layer(x[$0 ..< ($0 + 1)]) }, axis: 0)
     }
-    return layer(x)
+    return deepseekV4Project(layer, x)
 }
 
 // MARK: - RoPE
@@ -846,9 +846,10 @@ final class DeepseekV4Indexer: Module {
             ], axis: 1)
         }, axis: 0)
         let q = rope(
-            wqB(qResidual).reshaped(B, 1, heads, headDim).transposed(0, 2, 1, 3), offsets: offsets)
+            deepseekV4Project(wqB, qResidual).reshaped(B, 1, heads, headDim).transposed(0, 2, 1, 3),
+            offsets: offsets)
             .asType(.float32)
-        let weights = weightsProj(x).asType(.float32) * pow(Float(heads), -0.5)
+        let weights = deepseekV4Project(weightsProj, x).asType(.float32) * pow(Float(heads), -0.5)
         let wq = expandedDimensions(weights.swappedAxes(-1, -2), axis: -1)
         let lengths = MLXArray(counts.map(Int32.init)).reshaped(B, 1, 1)
         var scores = maximum(
@@ -870,9 +871,9 @@ final class DeepseekV4Indexer: Module {
         let poolCount = pooled.dim(1)
         guard poolCount > 0 else { return nil }
 
-        var q = wqB(qResidual).reshaped(B, L, heads, headDim).transposed(0, 2, 1, 3)
+        var q = deepseekV4Project(wqB, qResidual).reshaped(B, L, heads, headDim).transposed(0, 2, 1, 3)
         q = rope(q, offset: offset)
-        let weights = weightsProj(x).asType(.float32) * pow(Float(heads), -0.5)
+        let weights = deepseekV4Project(weightsProj, x).asType(.float32) * pow(Float(heads), -0.5)
         return selectProjected(q, weights: weights, pooled: pooled, cache: cache, offset: offset)
     }
 
@@ -1089,11 +1090,11 @@ final class DeepseekV4Attention: Module {
         let (B, L) = (x.dim(0), x.dim(1))
         let offset = cache.local.offset
 
-        let qResidual = qNorm(wqA(x))
-        var q = wqB(qResidual).reshaped(B, L, heads, headDim)
+        let qResidual = qNorm(deepseekV4Project(wqA, x))
+        var q = deepseekV4Project(wqB, qResidual).reshaped(B, L, heads, headDim)
         q = MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: normEps)
         q = rope(q.transposed(0, 2, 1, 3), offset: offset)
-        var kv = kvNorm(wkv(x)).reshaped(B, 1, L, headDim)
+        var kv = kvNorm(deepseekV4Project(wkv, x)).reshaped(B, 1, L, headDim)
         kv = rope(kv, offset: offset)
 
         var out = attend(x, q: q, kv: kv, qResidual: qResidual, mask: mask, cache: cache, offset: offset)
@@ -1103,7 +1104,7 @@ final class DeepseekV4Attention: Module {
             .reshaped(B, groups, L, heads / groups * headDim)
         out = callMultiLinear(woA, out)  // [B, G, L, R]
         out = out.transposed(0, 2, 1, 3).reshaped(B, L, -1)
-        return woB(out)
+        return deepseekV4Project(woB, out)
     }
 
     /// One token per row. Projections and the attention arithmetic are
@@ -1114,13 +1115,13 @@ final class DeepseekV4Attention: Module {
         let B = x.dim(0)
         let offsets = caches.map { $0.local.offset }
         let offsetArray = MLXArray(offsets.map(Int32.init))
-        let qResidual = qNorm(wqA(x))
+        let qResidual = qNorm(deepseekV4Project(wqA, x))
         let q = rope(
             MLXFast.rmsNorm(
-                wqB(qResidual).reshaped(B, 1, heads, headDim),
+                deepseekV4Project(wqB, qResidual).reshaped(B, 1, heads, headDim),
                 weight: MLXArray.mlxNone, eps: normEps).transposed(0, 2, 1, 3),
             offsets: offsetArray)
-        let kv = rope(kvNorm(wkv(x)).reshaped(B, 1, 1, headDim), offsets: offsetArray)
+        let kv = rope(kvNorm(deepseekV4Project(wkv, x)).reshaped(B, 1, 1, headDim), offsets: offsetArray)
         let emptyValues = MLXArray.zeros([B, 1, 1, 0], dtype: kv.dtype)
         let windows = caches.enumerated().map { row, cache in
             Self.temporal(
@@ -1184,7 +1185,7 @@ final class DeepseekV4Attention: Module {
         out = out.reshaped(B, groups, heads / groups, 1, headDim).transposed(0, 1, 3, 2, 4)
             .reshaped(B, groups, 1, heads / groups * headDim)
         out = callMultiLinear(woA, out)
-        return woB(out.transposed(0, 2, 1, 3).reshaped(B, 1, -1))
+        return deepseekV4Project(woB, out.transposed(0, 2, 1, 3).reshaped(B, 1, -1))
     }
 
     /// Flattened row-major verification positions. All weight-bound work is
