@@ -546,9 +546,9 @@ final class GLM5NextLinearAttention: Module {
     /// the state after every kept prefix `k < L` saved for an in-place rewind
     /// (`MambaCache.saveSpeculativePrefixes`). The fused path projects all
     /// columns in one multi-qmv and runs every column in one KDA dispatch;
-    /// each prefix state is a lazy replay of that kernel over its first `k`
-    /// columns, evaluated only if a rewind restores it. A right-padded column
-    /// (prepared lengths) never advances a row's state.
+    /// width two emits its prefix state in that dispatch; wider prefixes are
+    /// lazy replays evaluated only if a rewind restores them. A right-padded
+    /// column (prepared lengths) never advances a row's state.
     private func verifyColumns(_ x: MLXArray, cache: MambaCache, checkpointAfter _: Int)
         -> MLXArray
     {
@@ -567,7 +567,7 @@ final class GLM5NextLinearAttention: Module {
                 ?? MLXArray.zeros([B, convKernelSize - 1, 3 * projectionDim], dtype: x.dtype)
             let stateBase =
                 cache[1] ?? MLXArray.zeros([B, numHeads, headDim, headDim], dtype: .float32)
-            func run(_ k: Int) -> (y: MLXArray, convState: MLXArray, state: MLXArray)? {
+            func run(_ k: Int) -> GLM5NextKDAVerifyResult? {
                 func cols(_ a: MLXArray) -> MLXArray { k == L ? a : a[0..., ..<k] }
                 return glm5NextKDAVerifyStep(
                     q: cols(parts[0]), k: cols(parts[1]), v: cols(parts[2]), fa: cols(parts[3]),
@@ -576,7 +576,8 @@ final class GLM5NextLinearAttention: Module {
                     dtBias: forgetGate.dtBias, normWeight: oNorm.weight, state: stateBase,
                     heads: numHeads, headDim: headDim, lowerBound: lowerBound,
                     normEps: oNorm.eps,
-                    valid: validCounts.map { k == L ? $0 : minimum($0, Int32(k)) })
+                    valid: validCounts.map { k == L ? $0 : minimum($0, Int32(k)) },
+                    capturePrefix: k == L)
             }
             if let step = run(L) {
                 cache[0] = step.convState
@@ -584,9 +585,13 @@ final class GLM5NextLinearAttention: Module {
                 cache.advance(L)
                 var prefixes = [Int: [MLXArray]]()
                 for k in 1 ..< L {
-                    // Same shapes and widths as the full step, so covered too.
-                    let replay = run(k)!
-                    prefixes[k] = [replay.convState, replay.state]
+                    if L == 2, let prefix = step.prefix {
+                        prefixes[k] = [prefix.convState, prefix.state]
+                    } else {
+                        // Same shapes and widths as the full step, so covered too.
+                        let replay = run(k)!
+                        prefixes[k] = [replay.convState, replay.state]
+                    }
                 }
                 cache.saveSpeculativePrefixes(prefixes, width: L)
                 return glm5NextProject(oProj, step.y)

@@ -1127,7 +1127,7 @@ final class GLM5NextTests: XCTestCase {
                 let (fa, ga, bRaw) = (rnd([B, T, dk], 4), rnd([B, T, dk], 5), rnd([B, T, heads], 6))
                 let convState = rnd([B, 3, 3 * qkv], 7)
                 let state = rnd([B, heads, dk, dk], 8, 0.1, .float32)
-                func verify(_ width: Int) -> (y: MLXArray, convState: MLXArray, state: MLXArray)? {
+                func verify(_ width: Int) -> GLM5NextKDAVerifyResult? {
                     func cols(_ a: MLXArray) -> MLXArray { a[0..., ..<width] }
                     return glm5NextKDAVerifyStep(
                         q: cols(q), k: cols(k), v: cols(v), fa: cols(fa), ga: cols(ga), fb: fb,
@@ -1165,6 +1165,70 @@ final class GLM5NextTests: XCTestCase {
                     }
                     assertBitwiseEqual(fused.convState[r ..< (r + 1)], conv, "\(bits)-bit T=\(T) row \(r) conv")
                     assertBitwiseEqual(fused.state[r ..< (r + 1)], st, "\(bits)-bit T=\(T) row \(r) state")
+                }
+            }
+        }
+    }
+
+    /// Width-two checkpoints equal the unchanged width-one replay, including
+    /// the existing zero-count clamp to one valid token.
+    func testKDAVerifyWidthTwoCheckpointMatchesReplayBitwise() throws {
+        let (batch, heads, dk) = (4, 2, 128)
+        let qkv = heads * dk
+        for dtype in [DType.bfloat16, .float16] {
+            for bits in [4, 5, 8] {
+                func rnd(_ shape: [Int], _ seed: UInt64, _ scale: Float = 1) -> MLXArray {
+                    withRandomState(MLXRandom.RandomState(seed: seed)) {
+                        (scale * MLXRandom.normal(shape)).asType(dtype)
+                    }
+                }
+                func affine(_ seed: UInt64) -> GLM5NextAffine {
+                    let value = randomAffine([qkv, dk], bits: bits, seed: seed)
+                    return GLM5NextAffine(
+                        weight: value.weight, scales: value.scales.asType(dtype),
+                        biases: value.biases.asType(dtype), bits: bits, groupSize: value.groupSize)
+                }
+                let (fb, gb) = (affine(701), affine(702))
+                let (q, k, v) = (
+                    rnd([batch, 2, qkv], 703), rnd([batch, 2, qkv], 704),
+                    rnd([batch, 2, qkv], 705))
+                let (fa, ga, beta) = (
+                    rnd([batch, 2, dk], 706), rnd([batch, 2, dk], 707),
+                    rnd([batch, 2, heads], 708))
+                let conv = rnd([batch, 3, 3 * qkv], 709)
+                let state = rnd([batch, heads, dk, dk], 710, 0.1).asType(.float32)
+                let convWeight = rnd([3 * qkv, 4, 1], 711, 0.3)
+                let aLog = rnd([heads], 712, 0.5).asType(.float32)
+                let dtBias = rnd([qkv], 713, 0.5).asType(.float32)
+                let norm = 1 + rnd([dk], 714, 0.1)
+                func run(_ width: Int, _ valid: [Int]?, capturePrefix: Bool = true)
+                    -> GLM5NextKDAVerifyResult?
+                {
+                    func cols(_ value: MLXArray) -> MLXArray { value[0..., ..<width] }
+                    return glm5NextKDAVerifyStep(
+                        q: cols(q), k: cols(k), v: cols(v), fa: cols(fa), ga: cols(ga),
+                        fb: fb, gb: gb, bRaw: cols(beta), convState: conv,
+                        convWeight: convWeight, aLog: aLog, dtBias: dtBias, normWeight: norm,
+                        state: state, heads: heads, headDim: dk, lowerBound: -5,
+                        normEps: 1e-5,
+                        valid: valid.map { MLXArray($0.map { Int32(min($0, width)) }) },
+                        capturePrefix: capturePrefix)
+                }
+                let validCases: [[Int]?] = [nil, [0, 1, 2, 2]]
+                for valid in validCases {
+                    let full = try XCTUnwrap(run(2, valid))
+                    let checkpoint = try XCTUnwrap(full.prefix)
+                    let replay = try XCTUnwrap(run(1, valid))
+                    let original = try XCTUnwrap(run(2, valid, capturePrefix: false))
+                    XCTAssertNil(replay.prefix)
+                    XCTAssertNil(original.prefix)
+                    let label = "\(dtype) \(bits)-bit valid=\(String(describing: valid))"
+                    assertBitwiseEqual(full.y, original.y, label + " final output")
+                    assertBitwiseEqual(full.convState, original.convState, label + " final conv")
+                    assertBitwiseEqual(full.state, original.state, label + " final state")
+                    assertBitwiseEqual(checkpoint.convState, replay.convState, label + " conv")
+                    assertBitwiseEqual(checkpoint.state, replay.state, label + " state")
+                    assertBitwiseEqual(full.y[0..., ..<1], replay.y, label + " first output")
                 }
             }
         }
