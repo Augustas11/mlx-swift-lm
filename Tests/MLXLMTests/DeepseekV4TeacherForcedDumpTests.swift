@@ -25,6 +25,636 @@ import XCTest
 /// config this is not the selection the forward used); per
 /// compressed layer the final pooled entries; and the float32 logits.
 final class DeepseekV4TeacherForcedDumpTests: XCTestCase {
+    /// Head-only diagnostic: named extracted tensors, never a full model load.
+    func testFinalHeadSameInputDiagnostic() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let configPath = env["DSV4_HEAD_CONFIG"], let weightPath = env["DSV4_HEAD_WEIGHTS"],
+            let referencePath = env["DSV4_HEAD_REFERENCE"], let pythonPath = env["DSV4_HEAD_PYTHON_STAGES"],
+            let outputPath = env["DSV4_HEAD_OUT"]
+        else { throw XCTSkip("Head same-input diagnostic environment is not set") }
+        try Device.withDefaultDevice(.gpu) {
+            let output = URL(fileURLWithPath: outputPath, isDirectory: true)
+            guard !FileManager.default.fileExists(atPath: output.path) else {
+                XCTFail("Head diagnostic output exists; refusing overwrite")
+                return
+            }
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
+            let config = try JSONDecoder().decode(DeepseekV4Configuration.self,
+                from: Data(contentsOf: URL(fileURLWithPath: configPath)))
+            let weights = try MLX.loadArrays(url: URL(fileURLWithPath: weightPath))
+            XCTAssertEqual(Set(weights.keys), Set([
+                "head.weight", "norm.weight", "hc_head_fn", "hc_head_base", "hc_head_scale"]))
+            let reference = try MLX.loadArrays(url: URL(fileURLWithPath: referencePath))
+            let python = try MLX.loadArrays(url: URL(fileURLWithPath: pythonPath))
+            let hidden = try XCTUnwrap(reference["h.42"]).asType(.bfloat16).reshaped(1, 158, 4, 4096)
+            let frozenLogits = try XCTUnwrap(reference["logits"])
+            XCTAssertEqual(config.hiddenSize, 4096)
+            XCTAssertEqual(config.hcMult, 4)
+            XCTAssertEqual(frozenLogits.shape, [158, 129280])
+            let hc = DeepseekV4HyperHead(config)
+            try hc.update(parameters: ModuleParameters.unflattened([
+                "fn": try XCTUnwrap(weights["hc_head_fn"]),
+                "base": try XCTUnwrap(weights["hc_head_base"]),
+                "scale": try XCTUnwrap(weights["hc_head_scale"])]), verify: [.all])
+            let norm = DeepseekV4RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+            norm.update(parameters: ModuleParameters.unflattened([
+                "weight": try XCTUnwrap(weights["norm.weight"])]))
+            let head = Linear(config.hiddenSize, config.vocabularySize, bias: false)
+            head.update(parameters: ModuleParameters.unflattened([
+                "weight": try XCTUnwrap(weights["head.weight"])]))
+            hc.train(false)
+            norm.train(false)
+            head.train(false)
+            var saved = [String: MLXArray]()
+            var metrics = [String: Any]()
+            func compare(_ name: String, _ actual: MLXArray, _ expected: MLXArray) {
+                let a = actual.asType(.float32)
+                let b = expected.asType(.float32)
+                eval(a, b)
+                let count = (a .!= b).asType(.int32).sum().item(Int.self)
+                let maximum = abs(a - b).max().item(Float.self)
+                metrics[name] = ["shape": a.shape, "difference_count": count, "max_abs": maximum]
+                print("HEAD \(name) count=\(count) maxabs=\(maximum)")
+            }
+            func topFive(_ name: String, _ actual: MLXArray, _ expected: MLXArray) {
+                let a = argSort(-actual, axis: -1)[0..., ..<5]
+                let b = argSort(-expected, axis: -1)[0..., ..<5]
+                let matches = (sorted(a, axis: -1) .== sorted(b, axis: -1))
+                    .asType(.int32).sum(axis: -1) .== Int32(5)
+                eval(a, b, matches)
+                metrics[name] = ["compared": actual.dim(0),
+                    "matching": matches.asType(.int32).sum().item(Int.self),
+                    "actual_ids": a.asArray(Int.self), "reference_ids": b.asArray(Int.self)]
+            }
+            let collapsed = hc(hidden)
+            let normalized = norm(collapsed)
+            let logits158 = deepseekV4LinearF32(head, normalized)[0]
+            saved["swift.collapsed_bf16"] = collapsed[0]
+            saved["swift.final_norm_bf16"] = normalized[0]
+            saved["swift.head_f32.M158"] = logits158
+            for (name, actual, key) in [
+                ("collapse.vs_python_old", collapsed[0], "all158.old.collapsed_bf16"),
+                ("norm.vs_python_old", normalized[0], "all158.old.final_norm_bf16"),
+                ("logits158.vs_python_old", logits158, "all158.old.head_f32"),
+                ("collapse.vs_python_reference", collapsed[0], "all158.reference.collapsed_bf16"),
+                ("norm.vs_python_reference", normalized[0], "all158.reference.final_norm_bf16")
+            ] {
+                compare(name, actual, try XCTUnwrap(python[key]))
+            }
+            compare("logits158.vs_frozen", logits158, frozenLogits)
+            topFive("top5.M158.vs_frozen", logits158, frozenLogits)
+
+            // Hold the actual normalized row fixed; only projection geometry changes.
+            let last = normalized[0..., 157..<158]
+            let custom1 = deepseekV4LinearF32(head, last)[0]
+            let generic1 = matmul(last.asType(.float32), head.weight.asType(.float32).T)[0]
+            var rowIndices = (0..<8192).map { Int32($0 % 158) }
+            rowIndices[8191] = 157
+            let indices = MLXArray(rowIndices)
+            let denseInput = take(normalized[0], indices, axis: 0).reshaped(1, 8192, 4096)
+            XCTAssertTrue(denseInput[0, 8191].asType(.float32).asArray(Float.self)
+                == last[0, 0].asType(.float32).asArray(Float.self))
+            let dense8192 = deepseekV4LinearF32(head, denseInput)
+            eval(dense8192) // Materialize M8192 before selecting the only saved row.
+            let denseLast = dense8192[0, 8191..<8192]
+            saved["swift.head_f32.customM1"] = custom1
+            saved["swift.head_f32.genericM1"] = generic1
+            saved["swift.head_f32.denseM8192.last"] = denseLast
+            for (name, actual) in [("customM1", custom1), ("genericM1", generic1), ("denseM8192.last", denseLast)] {
+                compare(name + ".vs_frozen", actual, frozenLogits[157..<158])
+                compare(name + ".vs_python_old_M158", actual, try XCTUnwrap(python["all158.old.head_f32"])[157..<158])
+                topFive("top5." + name + ".vs_frozen", actual, frozenLogits[157..<158])
+            }
+            compare("customM1.vs_genericM1", custom1, generic1)
+            compare("denseM8192.vs_genericM1", denseLast, generic1)
+            eval(Array(saved.values))
+            try save(arrays: saved, url: output.appendingPathComponent("swift-head-stages.safetensors"))
+            let data = try JSONSerialization.data(withJSONObject: metrics, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: output.appendingPathComponent("metrics.json"), options: [.withoutOverwriting])
+        }
+    }
+
+    /// Frozen small-query attention input, shared by prefill-tail and decode diagnostics.
+    func testLayer3TailSameInputDiagnostic() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let inputPath = env["DSV4_TAIL_INPUT"], let configPath = env["DSV4_HEAD_CONFIG"],
+            let outputPath = env["DSV4_TAIL_OUT"]
+        else { throw XCTSkip("Layer3 tail diagnostic environment is not set") }
+        try Device.withDefaultDevice(.gpu) {
+            let output = URL(fileURLWithPath: outputPath, isDirectory: true)
+            guard !FileManager.default.fileExists(atPath: output.path) else {
+                XCTFail("Tail output exists; refusing overwrite")
+                return
+            }
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
+            let config = try JSONDecoder().decode(DeepseekV4Configuration.self,
+                from: Data(contentsOf: URL(fileURLWithPath: configPath)))
+            let values = try MLX.loadArrays(url: URL(fileURLWithPath: inputPath))
+            let q = try XCTUnwrap(values["q"])
+            let keys = try XCTUnwrap(values["keys"])
+            let valid = try XCTUnwrap(values["valid"])
+            let expected = try XCTUnwrap(values["reference_attention_tail"])
+            let sink = try XCTUnwrap(values["sink"])
+            XCTAssertEqual(q.shape, [1, config.attentionHeads, q.dim(2), config.headDim])
+            XCTAssertTrue((1...8).contains(q.dim(2)))
+            XCTAssertEqual(keys.shape, [1, q.dim(2), keys.dim(2), config.headDim])
+            XCTAssertEqual(valid.shape, [1, q.dim(2), keys.dim(2)])
+            let attention = DeepseekV4Attention(config, layerIdx: 3)
+            attention.update(parameters: ModuleParameters.unflattened(["attn_sink": sink]))
+            let fused = try XCTUnwrap(deepseekV4SparseAttention(
+                q, keys: keys, valid: valid, sink: sink, scale: attention.scale))
+            let graph = attention.graphAttention(q, keys: keys, valid: valid)
+            let fusedBF16 = fused.asType(q.dtype)
+            let graphBF16 = graph.asType(q.dtype)
+            if env["DSV4_REQUIRE_EXACT_ATTENTION"] == "1" {
+                eval(fusedBF16, expected)
+                XCTAssertTrue(fusedBF16.asType(.float32).asArray(Float.self)
+                    == expected.asType(.float32).asArray(Float.self), "Canonical attention BF16 differs from frozen reference")
+                let expectedF32 = try XCTUnwrap(values["reference_attention_f32"])
+                eval(fused, expectedF32)
+                XCTAssertTrue(fused.asArray(Float.self) == expectedF32.asArray(Float.self),
+                    "Canonical attention F32 differs from frozen reference")
+            }
+            var metrics = [String: Any]()
+            var comparisons = [
+                ("fused_vs_graph_f32", fused, graph),
+                ("fused_vs_graph_bf16", fusedBF16, graphBF16),
+                ("fused_vs_reference_bf16", fusedBF16, expected),
+                ("graph_vs_reference_bf16", graphBF16, expected)
+            ]
+            if let expectedF32 = values["reference_attention_f32"] {
+                comparisons.append(("fused_vs_reference_f32", fused, expectedF32))
+                comparisons.append(("graph_vs_reference_f32", graph, expectedF32))
+            }
+            var diagnostics = [String: MLXArray]()
+            var precise: MLXArray?
+            if env["DSV4_SPARSE_PRECISE_EXP"] == "1", let kernelPath = env["DSV4_SPARSE_KERNEL_SOURCE"] {
+                let sourceFile = try String(contentsOfFile: kernelPath, encoding: .utf8)
+                let source = try XCTUnwrap(sourceFile.components(separatedBy: "source: \"\"\"").dropFirst().first)
+                    .components(separatedBy: "\"\"\"")[0]
+                    .replacingOccurrences(of: "exp(", with: "metal::precise::exp(")
+                let kernel = MLXFast.metalKernel(name: "dsv4_diagnostic_precise_sparse_attention",
+                    inputNames: ["q", "keys", "valid", "sink", "scale"], outputNames: ["out"], source: source)
+                let (B, H, L, D, K) = (q.dim(0), q.dim(1), q.dim(2), q.dim(3), keys.dim(2))
+                let result = kernel([q, keys, valid, sink.asType(.float32), MLXArray(attention.scale)],
+                    template: [("H", H), ("L", L), ("D", D), ("K", K)],
+                    grid: (H * L * 256, B, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [q.shape], outputDTypes: [.float32])[0]
+                precise = result
+                comparisons.append(("precise_vs_reference_bf16", result.asType(q.dtype), expected))
+                comparisons.append(("precise_vs_fused_f32", result, fused))
+                if let reference = values["reference_attention_f32"] {
+                    comparisons.append(("precise_vs_reference_f32", result, reference))
+                }
+            }
+            if env["DSV4_SPARSE_INSTRUMENT"] == "1", let kernelPath = env["DSV4_SPARSE_KERNEL_SOURCE"] {
+                let file = try String(contentsOfFile: kernelPath, encoding: .utf8)
+                let original = try XCTUnwrap(file.components(separatedBy: "source: \"\"\"" ).dropFirst().first)
+                    .components(separatedBy: "\"\"\"" )[0]
+                let (B, H, L, D, K) = (q.dim(0), q.dim(1), q.dim(2), q.dim(3), keys.dim(2))
+                let blocks = (K + 63) / 64
+                let scoreShape = [B, H, L, K]
+                let stateShape = [B, H, L, blocks]
+                var instrumented = original.replacingOccurrences(
+                    of: "if (lane == 0) { scores[j] = present ? dot : -INFINITY; }",
+                    with: """
+                        if (lane == 0) {
+                            scores[j] = present ? dot : -INFINITY;
+                            if (k < K) { debug_scores[((size_t(b) * H + h) * L + l) * K + k] = scores[j]; }
+                        }
+                        """)
+                instrumented = instrumented.replacingOccurrences(
+                    of: "state[0] = peak;",
+                    with: """
+                        const size_t debug_row = ((size_t(b) * H + h) * L + l);
+                        debug_running[debug_row * ((K + 63) / 64) + start / 64] = peak;
+                        debug_norm[debug_row * ((K + 63) / 64) + start / 64] = norm;
+                        for (uint z = 0; z < 64 && start + z < K; ++z) {
+                            debug_weights[debug_row * K + start + z] = weights[z];
+                        }
+                        state[0] = peak;
+                        """)
+                XCTAssertNotEqual(instrumented, original)
+                let instrument = MLXFast.metalKernel(name: "dsv4_diagnostic_instrument_sparse",
+                    inputNames: ["q", "keys", "valid", "sink", "scale"],
+                    outputNames: ["out", "debug_scores", "debug_weights", "debug_running", "debug_norm"],
+                    source: instrumented)
+                let outputs = instrument([q, keys, valid, sink.asType(.float32), MLXArray(attention.scale)],
+                    template: [("H", H), ("L", L), ("D", D), ("K", K)],
+                    grid: (H * L * 256, B, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [q.shape, scoreShape, scoreShape, stateShape, stateShape],
+                    outputDTypes: Array(repeating: .float32, count: 5))
+                eval(outputs)
+                XCTAssertTrue(outputs[0].asArray(Float.self) == fused.asArray(Float.self),
+                    "Instrumentation perturbed fused output; stage conclusions are invalid")
+                comparisons.append(("instrumented_vs_fused_f32", outputs[0], fused))
+                let expectedScores = try XCTUnwrap(values["scores"])
+                let expectedWeights = try XCTUnwrap(values["weights"]).asType(.bfloat16).asType(.float32)
+                    .reshaped(scoreShape)
+                comparisons.append(("scores_vs_reference_f32", outputs[1], expectedScores))
+                comparisons.append(("weights_vs_reference_bf16", outputs[2], expectedWeights))
+                comparisons.append(("running_vs_reference_f32", outputs[3], try XCTUnwrap(values["running"])))
+                diagnostics["instrumented_f32"] = outputs[0]
+                diagnostics["scores"] = outputs[1]
+                diagnostics["weights"] = outputs[2]
+                diagnostics["running"] = outputs[3]
+                diagnostics["online_norm"] = outputs[4]
+                let overrideSource = original.replacingOccurrences(of: "dot *= scale;",
+                    with: "dot = k < K ? reference_scores[((size_t(b) * H + h) * L + l) * K + k] : -INFINITY;")
+                let overrideKernel = MLXFast.metalKernel(name: "dsv4_diagnostic_reference_scores_sparse",
+                    inputNames: ["q", "keys", "valid", "sink", "scale", "reference_scores"],
+                    outputNames: ["out"], source: overrideSource)
+                let override = overrideKernel([q, keys, valid, sink.asType(.float32), MLXArray(attention.scale), expectedScores],
+                    template: [("H", H), ("L", L), ("D", D), ("K", K)],
+                    grid: (H * L * 256, B, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [q.shape], outputDTypes: [.float32])[0]
+                comparisons.append(("reference_scores_vs_reference_bf16", override.asType(q.dtype), expected))
+                comparisons.append(("reference_scores_vs_reference_f32", override,
+                                    try XCTUnwrap(values["reference_attention_f32"])))
+                diagnostics["reference_scores_output_f32"] = override
+            }
+            for (name, a, b) in comparisons {
+                eval(a, b)
+                let count = (a .!= b).asType(.int32).sum().item(Int.self)
+                let maximum = MLX.where(a .== b, MLXArray(Float(0)),
+                    abs(a.asType(.float32) - b.asType(.float32))).max().item(Float.self)
+                metrics[name] = ["shape": a.shape, "difference_count": count, "max_abs": maximum]
+                print("TAIL \(name) count=\(count) maxabs=\(maximum)")
+            }
+            var saved = ["fused_f32": fused, "graph_f32": graph,
+                         "fused_bf16": fusedBF16, "graph_bf16": graphBF16,
+                         "reference_bf16": expected]
+            saved["precise_f32"] = precise
+            saved.merge(diagnostics) { _, new in new }
+            try save(arrays: saved, url: output.appendingPathComponent("tail-stages.safetensors"))
+            try JSONSerialization.data(withJSONObject: metrics, options: [.prettyPrinted, .sortedKeys])
+                .write(to: output.appendingPathComponent("metrics.json"), options: [.withoutOverwriting])
+        }
+    }
+
+    /// Real prefill followed by three scalar decode calls, with persistent caches.
+    func testActualDecodeLayerDiagnostic() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let artifact = env["DSV4_ARTIFACT_DIR"], let oraclePath = env["DSV4_DECODE_ORACLE"],
+            let outputPath = env["DSV4_DECODE_OUT"]
+        else { throw XCTSkip("Actual decode diagnostic environment is not set") }
+        try Device.withDefaultDevice(.gpu) {
+            let output = URL(fileURLWithPath: outputPath, isDirectory: true)
+            guard !FileManager.default.fileExists(atPath: output.path) else {
+                XCTFail("Decode diagnostic output exists; refusing overwrite")
+                return
+            }
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
+            struct Oracle: Decodable { let prompt: [Int]; let greedy: [Int] }
+            let oracle = try JSONDecoder().decode(Oracle.self,
+                from: Data(contentsOf: URL(fileURLWithPath: oraclePath)))
+            XCTAssertEqual(oracle.prompt.count, 1024)
+            let steps = try XCTUnwrap(Int(env["DSV4_DECODE_STEPS"] ?? "4"))
+            guard (1...16).contains(steps), oracle.greedy.count >= steps - 1 else {
+                XCTFail("Decode diagnostic requires 1...16 assessed steps and sufficient oracle tokens")
+                return
+            }
+            let dir = URL(fileURLWithPath: artifact)
+            let data = try Data(contentsOf: dir.appendingPathComponent("config.json"))
+            let config = try JSONDecoder().decode(DeepseekV4Configuration.self, from: data)
+            let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
+            let model = DeepseekV4Model(config)
+            try loadWeights(modelDirectory: dir, model: model, perLayerQuantization: base.perLayerQuantization)
+            model.train(false)
+            let caches = try model.newCache(parameters: nil)
+            var metadata = [[String: Any]]()
+            for step in 0..<steps {
+                let tokens = step == 0 ? oracle.prompt : [oracle.greedy[step - 1]]
+                let ids = MLXArray(tokens.map(Int32.init)).reshaped(1, tokens.count)
+                let positions = step == 0
+                    ? Array(Set(Array(stride(from: 0, to: 1024, by: 64)) + Array(896..<1024))).sorted()
+                    : [0]
+                let at = MLXArray(positions.map(Int32.init))
+                let layerCaches = zip(caches, model.layers).map {
+                    DeepseekV4LayerCache($0, ratio: $1.attn.ratio)
+                }
+                var mask: MLXArray?
+                if tokens.count > 1,
+                    case .array(let array) = layerCaches[0].local.makeMask(
+                        n: tokens.count, windowSize: config.slidingWindow, returnArray: true) {
+                    mask = array
+                }
+                var h = repeated(expandedDimensions(model.embed(ids), axis: 2), count: config.hcMult, axis: 2)
+                var captured = [String: MLXArray]()
+                func keep(_ name: String, _ tensor: MLXArray) {
+                    captured[name] = take(tensor[0], at, axis: 0).asType(.float32)
+                }
+                for (index, item) in zip(model.layers, layerCaches).enumerated() {
+                    let (layer, cache) = item
+                    let residual = h
+                    let (attnInput, post, comb) = layer.attnHC.normalizedBranchInput(h, norm: layer.attnNorm)
+                    var reconstructed: MLXArray?
+                    var leaf = [String: MLXArray]()
+                    if step == 1, index == 2, env["DSV4_ACTUAL_QK_OUT"] != nil {
+                        let attention = layer.attn
+                        let copy = DeepseekV4LayerCache(caches[index].copy(), ratio: attention.ratio)
+                        let offset = copy.local.offset
+                        let qA = deepseekV4Project(attention.wqA, attnInput)
+                        let qr = attention.qNorm(qA)
+                        let qB = deepseekV4Project(attention.wqB, qr)
+                            .reshaped(1, 1, attention.heads, attention.headDim)
+                        let qNormalized = deepseekV4QueryHeadNorm(qB, eps: attention.normEps)
+                        let q = attention.rope(qNormalized.transposed(0, 2, 1, 3), offset: offset)
+                        let kvProjection = deepseekV4Project(attention.wkv, attnInput)
+                        let kvNormalized = attention.kvNorm(kvProjection).reshaped(1, 1, 1, attention.headDim)
+                        let kv = attention.rope(kvNormalized, offset: offset)
+                        let updated = copy.local.update(keys: kv,
+                            values: MLXArray.zeros([1, 1, 1, 0], dtype: kv.dtype)).0
+                        let local = DeepseekV4Attention.temporal(updated, cache: copy.local)
+                        let (window, windowValid) = attention.windowList(local[0, 0],
+                            first: offset + 1 - local.dim(2), positions: [offset])
+                        let pool = try XCTUnwrap(attention.compressor)(attnInput,
+                            cache: try XCTUnwrap(copy.pool), offset: offset)
+                        let selected = try XCTUnwrap(try XCTUnwrap(attention.indexer)(attnInput,
+                            qResidual: qr, rope: attention.rope,
+                            cache: try XCTUnwrap(copy.indexPool), offset: offset))
+                        let selectedKeys = take(pool[0], maximum(selected[0], Int32(0)).flattened(), axis: 0)
+                            .reshaped(1, selected.dim(2), attention.headDim)
+                        let keys = expandedDimensions(concatenated([window, selectedKeys], axis: 1), axis: 0)
+                        let selectedValid = selected[0] .< Int32((offset + 1) / attention.ratio)
+                        let valid = expandedDimensions(concatenated([windowValid, selectedValid], axis: 1), axis: 0)
+                        let raw = attention.referenceAttention(q, keys: keys, valid: valid).asType(q.dtype)
+                        let inverse = attention.rope(raw, offset: offset, inverse: true)
+                        let grouped = inverse.reshaped(1, attention.groups, attention.heads / attention.groups,
+                            1, attention.headDim).transposed(0, 1, 3, 2, 4)
+                            .reshaped(1, attention.groups, 1, attention.heads / attention.groups * attention.headDim)
+                        let woA = deepseekV4MultiLinear(attention.woA, grouped)
+                        reconstructed = deepseekV4Project(attention.woB, woA.transposed(0, 2, 1, 3).reshaped(1, 1, -1))
+                        leaf = ["attn_input": attnInput, "q_a": qA, "q_residual": qr, "q_b": qB,
+                                "q_normalized": qNormalized, "q": q, "kv_projection": kvProjection,
+                                "kv_normalized": kvNormalized, "kv": kv, "window": window,
+                                "selected_indices": selected, "keys": keys, "valid": valid,
+                                "raw_attention": raw, "inverse": inverse, "wo_a": woA,
+                                "reconstructed_branch": reconstructed!, "pool": pool,
+                                "wo_b_input": woA.transposed(0, 2, 1, 3).reshaped(1, 1, -1)]
+                    }
+                    let branch = layer.attn(attnInput, mask: mask, cache: cache)
+                    if let reconstructed {
+                        eval(branch, reconstructed)
+                        XCTAssertTrue(branch.asType(.float32).asArray(Float.self)
+                            == reconstructed.asType(.float32).asArray(Float.self),
+                            "Reconstructed layer2 attention differs from actual serving call")
+                        leaf["actual_branch"] = branch
+                        let frozen = try MLX.loadArrays(url: URL(fileURLWithPath: try XCTUnwrap(env["DSV4_ACTUAL_QK_REFERENCE"])))
+                        var leafMetrics = [String: Any]()
+                        for name in ["q", "keys", "valid"] {
+                            let actual = try XCTUnwrap(leaf[name]).asType(.float32)
+                            let expected = try XCTUnwrap(frozen[name]).asType(.float32)
+                            eval(actual, expected)
+                            leafMetrics[name] = ["actual_shape": actual.shape, "reference_shape": expected.shape,
+                                "difference_count": (actual .!= expected).asType(.int32).sum().item(Int.self),
+                                "max_abs": abs(actual - expected).max().item(Float.self)]
+                        }
+                        let leafPath = URL(fileURLWithPath: try XCTUnwrap(env["DSV4_ACTUAL_QK_OUT"]), isDirectory: true)
+                        try FileManager.default.createDirectory(at: leafPath, withIntermediateDirectories: false)
+                        let widened = leaf.mapValues { $0.asType(.float32) }
+                        eval(Array(widened.values))
+                        try save(arrays: widened, url: leafPath.appendingPathComponent("actual-qk.safetensors"))
+                        try JSONSerialization.data(withJSONObject: leafMetrics, options: [.prettyPrinted, .sortedKeys])
+                            .write(to: leafPath.appendingPathComponent("metrics.json"), options: [.withoutOverwriting])
+                    }
+                    h = deepseekV4HCExpand(branch, residual, post, comb)
+                    keep("attn_in.\(index)", attnInput)
+                    keep("attn_post.\(index)", post)
+                    keep("attn_comb.\(index)", comb)
+                    keep("attn_out.\(index)", branch)
+                    keep("after_attn.\(index)", h)
+                    let (ffnInput, ffnPost, ffnComb) = layer.ffnHC.normalizedBranchInput(h, norm: layer.ffnNorm)
+                    let experts = layer.ffn.gate(ffnInput, inputIDs: ids).0
+                    let ffnBranch = layer.ffn(ffnInput, inputIDs: ids)
+                    h = deepseekV4HCExpand(ffnBranch, h, ffnPost, ffnComb)
+                    keep("ffn_in.\(index)", ffnInput)
+                    keep("ffn_post.\(index)", ffnPost)
+                    keep("ffn_comb.\(index)", ffnComb)
+                    keep("ffn_out.\(index)", ffnBranch)
+                    keep("h.\(index)", h)
+                    captured["experts.\(index)"] = sorted(take(experts[0], at, axis: 0).asType(.int32), axis: -1)
+                    if let pool = cache.pool?.pooled { captured["pool.\(index)"] = pool[0].asType(.float32) }
+                    if let pool = cache.indexPool?.pooled { captured["index_pool.\(index)"] = pool[0].asType(.float32) }
+                }
+                let collapsed = model.hcHead(h)
+                let normalized = model.norm(collapsed)
+                let allLogits = deepseekV4LinearF32(model.head, normalized)
+                eval(allLogits) // Preserve actual M1024/M1 head dispatch before row selection.
+                captured["logits"] = allLogits[0, -1, 0...]
+                captured["head_collapsed"] = collapsed[0, -1, 0...].asType(.float32)
+                captured["head_normalized"] = normalized[0, -1, 0...].asType(.float32)
+                captured["positions"] = MLXArray(positions.map { Int32(step == 0 ? $0 : 1024 + step - 1) })
+                eval(Array(captured.values) + caches.flatMap { $0.innerState() })
+                try save(arrays: captured, url: output.appendingPathComponent("step-\(step).safetensors"))
+                metadata.append(["assessed_step": step, "fed_tokens": tokens,
+                                 "cache_meta_state": caches.map { $0.metaState }])
+                print("DECODE TRACE step=\(step) done")
+            }
+            try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted, .sortedKeys])
+                .write(to: output.appendingPathComponent("metadata.json"), options: [.withoutOverwriting])
+        }
+    }
+
+    func testHyperConnectionSameInputDiagnostic() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let inputPath = env["DSV4_HC_INPUT"], let configPath = env["DSV4_HC_CONFIG"],
+            let outputPath = env["DSV4_HC_OUT"]
+        else { throw XCTSkip("HC same-input diagnostic environment is not set") }
+        try Device.withDefaultDevice(.gpu) {
+            let data = try MLX.loadArrays(url: URL(fileURLWithPath: inputPath))
+            let config = try JSONDecoder().decode(DeepseekV4Configuration.self,
+                from: Data(contentsOf: URL(fileURLWithPath: configPath)))
+            let h = try XCTUnwrap(data["h"])
+            let branch = try XCTUnwrap(data["branch"])
+            XCTAssertEqual(h.shape, [1, 1, 4, 4096])
+            let hc = GLM5NextHyperConnection(hcMult: config.hcMult,
+                sinkhornIterations: config.hcSinkhornIters, hcEps: config.hcEps,
+                normEps: config.rmsNormEps, hiddenSize: config.hiddenSize,
+                normWeightInFloat32: true, normalizeMixAfterProjection: true)
+            try hc.update(parameters: ModuleParameters.unflattened([
+                "fn": try XCTUnwrap(data["fn"]), "base": try XCTUnwrap(data["base"]),
+                "scale": try XCTUnwrap(data["scale"])]), verify: [.all])
+            let norm = DeepseekV4RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+            norm.update(parameters: ModuleParameters.unflattened([
+                "weight": try XCTUnwrap(data["norm_weight"])]))
+            hc.train(false)
+            norm.train(false)
+            let fusedMix = try XCTUnwrap(glm5NextHCMix(h, fn: hc.fn, eps: hc.normEps,
+                normalizeMixAfterProjection: true))
+            let flat = h.asType(.float32).reshaped(1, 1, -1)
+            let inverse = rsqrt(square(flat).mean(axis: -1, keepDims: true) + hc.normEps)
+            let projection = matmul(flat, hc.fn.T)
+            let mix = projection * inverse
+            let (productionNormalized, productionPost, productionComb) = hc.normalizedBranchInput(h, norm: norm)
+            let (collapsed, graphPost, graphComb) = hc(h)
+            let graphNormalized = norm(collapsed)
+            let graphExpanded = deepseekV4HCExpand(branch, h, graphPost, graphComb)
+            let productionExpanded = deepseekV4HCExpand(branch, h, productionPost, productionComb)
+            let (replayPre, replayPost, replayComb) = replaySinkhorn(mix, connection: hc, precise: true)
+            var saved = [String: MLXArray]()
+            var metrics = [String: Any]()
+            for (name, a, key) in [
+                ("graph_inverse", inverse, "inverse"), ("graph_projection", projection, "projection"),
+                ("graph_mix", mix, "mix"), ("fused_mix", fusedMix, "mix"),
+                ("graph_collapsed", collapsed, "collapsed"),
+                ("graph_normalized", graphNormalized, "normalized"),
+                ("graph_post", graphPost, "post"), ("graph_comb", graphComb, "comb"),
+                ("graph_expanded", graphExpanded, "expanded"),
+                ("production_normalized", productionNormalized, "normalized"),
+                ("production_post", productionPost, "post"), ("production_comb", productionComb, "comb"),
+                ("production_expanded", productionExpanded, "expanded"),
+                ("uncompiled_pre", replayPre, "pre"), ("uncompiled_post", replayPost, "post"),
+                ("uncompiled_comb", replayComb, "comb")
+            ] {
+                let a = a.asType(.float32), b = try XCTUnwrap(data[key]).asType(.float32)
+                eval(a, b)
+                let delta = a - b
+                metrics[name] = ["count": (a .!= b).asType(.int32).sum().item(Int.self),
+                    "max_abs": abs(delta).max().item(Float.self),
+                    "rel_l2": (sqrt(square(delta).sum()) / sqrt(square(b).sum())).item(Float.self)]
+                saved[name] = a
+                if name.hasPrefix("production_") {
+                    XCTAssertTrue(a.asArray(Float.self) == b.asArray(Float.self),
+                        "Canonical production HC differs from frozen reference: \(name)")
+                }
+            }
+            // Compare each ordinary decode row with the identical batched/packed input.
+            hc.fusedDecode = false
+            let varied = concatenated([h, -h, h * Float(2), h * Float(0.5),
+                h * Float(0.25), -h * Float(0.5), h * Float(0.125), -h * Float(2)], axis: 0)
+            for (geometry, inputs) in [("rows", varied), ("positions", varied.transposed(1, 0, 2, 3))] {
+                let axis = geometry == "rows" ? 0 : 1
+                let widths = geometry == "rows" ? [1, 2, 4, 8] : Array(1...8)
+                for width in widths {
+                    let batch = axis == 0 ? inputs[..<width] : inputs[0..., ..<width]
+                    let (normalized, post, comb) = hc.normalizedBranchInput(batch, norm: norm)
+                    let expanded = deepseekV4HCExpand(
+                        broadcast(branch, to: Array(batch.shape.prefix(2)) + [config.hiddenSize]),
+                        batch, post, comb)
+                    var singles = [[MLXArray]](repeating: [], count: 4)
+                    for index in 0..<width {
+                        let row = axis == 0 ? batch[index..<index+1] : batch[0..., index..<index+1]
+                        let (n, p, c) = hc.normalizedBranchInput(row, norm: norm)
+                        let e = deepseekV4HCExpand(branch, row, p, c)
+                        for (part, tensor) in [n, p, c, e].enumerated() { singles[part].append(tensor) }
+                    }
+                    for (part, tensor) in [normalized, post, comb, expanded].enumerated() {
+                        let scalar = concatenated(singles[part], axis: axis).asType(.float32)
+                        let actual = tensor.asType(.float32)
+                        eval(actual, scalar)
+                        let names = ["normalized", "post", "comb", "expanded"]
+                        XCTAssertTrue(actual.asArray(Float.self) == scalar.asArray(Float.self),
+                            "Canonical HC row/position differs: \(geometry) \(width) \(names[part])")
+                        metrics["production_\(geometry)_\(width)_\(names[part])"] = [
+                            "count": (actual .!= scalar).asType(.int32).sum().item(Int.self),
+                            "max_abs": abs(actual - scalar).max().item(Float.self)]
+                    }
+                }
+            }
+            let output = URL(fileURLWithPath: outputPath, isDirectory: true)
+            guard !FileManager.default.fileExists(atPath: output.path) else {
+                XCTFail("HC diagnostic output exists; refusing overwrite")
+                return
+            }
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
+            try save(arrays: saved, url: output.appendingPathComponent("hc-stages.safetensors"))
+            try JSONSerialization.data(withJSONObject: metrics, options: [.prettyPrinted, .sortedKeys])
+                .write(to: output.appendingPathComponent("metrics.json"), options: [.withoutOverwriting])
+        }
+    }
+
+    func testGroupedOutputProjectionSameInputDiagnostic() throws {
+        let env = ProcessInfo.processInfo.environment
+        guard let stagePath = env["DSV4_PROJECTION_STAGES"], let weightPath = env["DSV4_PROJECTION_WEIGHTS"],
+            let actualPath = env["DSV4_PROJECTION_ACTUAL"], let outputPath = env["DSV4_PROJECTION_OUT"]
+        else { throw XCTSkip("Grouped projection diagnostic environment is not set") }
+        try Device.withDefaultDevice(.gpu) {
+            let stages = try MLX.loadArrays(url: URL(fileURLWithPath: stagePath))
+            let weights = try MLX.loadArrays(url: URL(fileURLWithPath: weightPath))
+            let actual = try MLX.loadArrays(url: URL(fileURLWithPath: actualPath))
+            let x = try XCTUnwrap(stages["input_grouped"])
+            let dense = try XCTUnwrap(stages["dense_weight"])
+            let weight = try XCTUnwrap(weights["layers.2.attn.wo_a.weight"]).reshaped(8, 1024, -1)
+            let scales = try XCTUnwrap(weights["layers.2.attn.wo_a.scales"]).reshaped(8, 1024, -1)
+            XCTAssertEqual(x.shape, [1, 8, 1, 4096])
+            XCTAssertEqual(x.dtype, .bfloat16)
+            let quantized = QuantizedMultiLinear(weight: weight, scales: scales, biases: nil,
+                groupSize: 32, bits: 8, mode: .mxfp8)
+            let qBF16 = quantized(x)
+            let qF32 = quantized(x.asType(.float32))
+            let dBF16 = matmul(x, dense.swappedAxes(-1, -2))
+            let dF32 = matmul(x.asType(.float32), dense.asType(.float32).swappedAxes(-1, -2))
+            let swiftDense = dequantized(weight, scales: scales, biases: nil, groupSize: 32, bits: 8, mode: .mxfp8)
+                .asType(.bfloat16)
+            eval(swiftDense, dense)
+            XCTAssertTrue(swiftDense.asType(.float32).asArray(Float.self)
+                == dense.asType(.float32).asArray(Float.self), "Swift dequantized weight differs from reference")
+            // Both CB rows and packed target positions occupy the outer dimension.
+            let varied = concatenated([x, -x, x * Float(2), x * Float(0.5),
+                x * Float(0.25), -x * Float(0.5), x * Float(0.125), -x * Float(2)], axis: 0)
+            let full = deepseekV4MultiLinear(quantized, varied)
+            var rowChecks = 0
+            for rows in [1, 2, 4, 8] {
+                let prefix = deepseekV4MultiLinear(quantized, varied[..<rows])
+                eval(prefix, full)
+                XCTAssertTrue(prefix.asType(.float32).asArray(Float.self)
+                    == full[..<rows].asType(.float32).asArray(Float.self), "Dense grouped prefix rows=\(rows)")
+                rowChecks += 1
+            }
+            for row in 0..<8 {
+                let scalar = deepseekV4MultiLinear(quantized, varied[row..<row+1])
+                eval(scalar, full)
+                XCTAssertTrue(scalar.asType(.float32).asArray(Float.self)
+                    == full[row..<row+1].asType(.float32).asArray(Float.self), "Dense grouped row/packed position=\(row)")
+                rowChecks += 1
+            }
+            MLXRandom.seed(2151)
+            let fixture = QuantizedMultiLinear(weight: MLXRandom.normal([8, 1024, 4096]).asType(.bfloat16),
+                groupSize: 32, bits: 8, mode: .mxfp8)
+            let fixtureX = MLXRandom.normal([1, 8, 1, 4096]).asType(.bfloat16)
+            let oldFixture = fixture(fixtureX)
+            let fixtureWeight = dequantized(fixture.weight, scales: fixture.scales, biases: nil,
+                groupSize: 32, bits: 8, mode: .mxfp8).asType(.bfloat16)
+            let denseFixture = matmul(fixtureX, fixtureWeight.swappedAxes(-1, -2))
+            eval(oldFixture, denseFixture)
+            var metrics: [String: Any] = ["row_and_packed_exact_checks": rowChecks,
+                "swift_dequantized_vs_reference_count": 0,
+                "synthetic_seed": 2151,
+                "synthetic_old_quantized_vs_dense_bf16_count":
+                    (oldFixture .!= denseFixture).asType(.int32).sum().item(Int.self)]
+            for (name, a, b) in [
+                ("production_helper_vs_reference_bf16", deepseekV4MultiLinear(quantized, x),
+                 try XCTUnwrap(stages["reference_wo_a"])),
+                ("quantized_vs_actual_bf16", qBF16, try XCTUnwrap(actual["wo_a"])),
+                ("dense_vs_reference_bf16", dBF16, try XCTUnwrap(stages["reference_wo_a"])),
+                ("dense_vs_reference_f32", dF32, try XCTUnwrap(stages["reference_wo_a_f32"])),
+                ("quantized_vs_dense_bf16", qBF16, dBF16),
+                ("quantized_vs_dense_f32", qF32, dF32)
+            ] {
+                let a = a.asType(.float32), b = b.asType(.float32)
+                eval(a, b)
+                let delta = a - b
+                metrics[name] = ["count": (a .!= b).asType(.int32).sum().item(Int.self),
+                    "max_abs": abs(delta).max().item(Float.self),
+                    "rel_l2": (sqrt((delta * delta).sum()) / sqrt((b * b).sum())).item(Float.self)]
+            }
+            XCTAssertTrue(qBF16.asType(.float32).asArray(Float.self)
+                == actual["wo_a"]!.asArray(Float.self), "Projection probe differs from actual branch")
+            XCTAssertTrue(dBF16.asType(.float32).asArray(Float.self)
+                == stages["reference_wo_a"]!.asArray(Float.self), "Dense projection differs from frozen reference")
+            XCTAssertTrue(deepseekV4MultiLinear(quantized, x).asType(.float32).asArray(Float.self)
+                == stages["reference_wo_a"]!.asArray(Float.self), "Production projection differs from frozen reference")
+            let output = URL(fileURLWithPath: outputPath, isDirectory: true)
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
+            try save(arrays: ["quantized_bf16": qBF16, "quantized_f32": qF32,
+                              "dense_bf16": dBF16, "dense_f32": dF32],
+                     url: output.appendingPathComponent("projection-stages.safetensors"))
+            try JSONSerialization.data(withJSONObject: metrics, options: [.prettyPrinted, .sortedKeys])
+                .write(to: output.appendingPathComponent("metrics.json"), options: [.withoutOverwriting])
+        }
+    }
+
     func testLayer2IndexerDiagnosticDump() throws {
         let env = ProcessInfo.processInfo.environment
         guard let artifact = env["DSV4_ARTIFACT_DIR"], let input = env["DSV4_INDEXER_INPUT"],

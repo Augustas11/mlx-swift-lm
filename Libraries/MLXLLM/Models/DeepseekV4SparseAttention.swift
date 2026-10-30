@@ -2,91 +2,42 @@
 
 import MLX
 
-/// One independent threadgroup per query/head. In particular, changing the
-/// batch size never changes a dot product's reduction or its key order.
-/// MLXFast's default ensureRowContiguous packs views before this flat indexing;
-/// it preserves each input's dtype (in particular, bf16 keys stay bf16).
-private let deepseekV4SparseAttentionKernel = MLXFast.metalKernel(
-    name: "deepseek_v4_sparse_attention",
-    inputNames: ["q", "keys", "valid", "sink", "scale"], outputNames: ["out"],
-    source: """
-        const uint tid = thread_position_in_threadgroup.x;
-        const uint lane = thread_index_in_simdgroup;
-        const uint sg = simdgroup_index_in_threadgroup;
-        const uint h = threadgroup_position_in_grid.x % H;
-        const uint l = threadgroup_position_in_grid.x / H;
-        const uint b = threadgroup_position_in_grid.y;
-        const size_t qi = ((size_t(b) * H + h) * L + l) * D;
-        const size_t ki = (size_t(b) * L + l) * K;
-        threadgroup float scores[64];
-        threadgroup float weights[64];
-        threadgroup float state[3]; // running max, accumulator rescale, denominator
-        float acc[(D + 255) / 256];
-        for (uint j = 0; j < (D + 255) / 256; ++j) { acc[j] = 0.0f; }
-        if (tid == 0) { state[0] = -INFINITY; state[2] = 0.0f; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+/// Canonical float32 attention graph, with bf16-rounded block weights.
+func deepseekV4GraphAttention(
+    _ q: MLXArray, keys: MLXArray, valid: MLXArray, sink: MLXArray, scale: Float
+) -> MLXArray {
+    let (B, H, L) = (q.dim(0), q.dim(1), q.dim(2))
+    let K = keys.dim(2)
+    let block = 64
+    let blocks = (K + block - 1) / block
+    let keys32 = keys.asType(.float32)
+    var scores = matmul(
+        q.transposed(0, 2, 1, 3).asType(.float32), keys32.swappedAxes(-1, -2)) * scale
+    scores = MLX.where(expandedDimensions(valid, axis: 2), scores, MLXArray(-Float.infinity))
+    if blocks * block > K {
+        scores = concatenated(
+            [scores, MLXArray.full([B, L, H, blocks * block - K], values: MLXArray(-Float.infinity))],
+            axis: -1)
+    }
+    let blocked = scores.reshaped(B, L, H, blocks, block)
+    let running = cummax(blocked.max(axis: -1), axis: -1)
+    let peak = running[.ellipsis, (blocks - 1)...]
+    // Empty leading blocks contribute zero, including an entirely empty list.
+    // Finite score maxima retain the reference graph's exact arithmetic.
+    let safeRunning = MLX.where(running .== MLXArray(-Float.infinity), MLXArray(Float(0)), running)
+    let safePeak = MLX.where(peak .== MLXArray(-Float.infinity), MLXArray(Float(0)), peak)
+    let weights = exp(blocked - expandedDimensions(safeRunning, axis: -1))
+    let rescale = exp(running - safePeak)
+    let normalizer = (weights.sum(axis: -1) * rescale).sum(axis: -1, keepDims: true)
+        + exp(sink.asType(.float32).reshaped(1, 1, H, 1) - safePeak)
+    let valueWeights = (weights.asType(.bfloat16).asType(.float32)
+        * expandedDimensions(rescale, axis: -1))
+        .reshaped(B, L, H, blocks * block)[.ellipsis, ..<K]
+    return (matmul(valueWeights, keys32) / normalizer).transposed(0, 2, 1, 3)
+}
 
-        for (uint start = 0; start < K; start += 64) {
-            for (uint j = sg; j < 64; j += 8) {
-                const uint k = start + j;
-                float dot = 0.0f;
-                const bool present = k < K && valid[ki + k];
-                if (present) {
-                    for (uint d = lane; d < D; d += 32) {
-                        const float query = float(q[qi + d]);
-                        dot += query * float(keys[(ki + k) * D + d]);
-                    }
-                }
-                dot = simd_sum(dot);
-                // The reference scales the completed float32 score reduction.
-                // MLX lowers the rank-zero scale input to a scalar value.
-                dot *= scale;
-                if (lane == 0) { scores[j] = present ? dot : -INFINITY; }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid == 0) {
-                float peak = state[0];
-                for (uint j = 0; j < 64; ++j) { peak = max(peak, scores[j]); }
-                // An empty first block must not evaluate exp(-inf - -inf).
-                const float rescale = state[0] == -INFINITY ? 0.0f : exp(state[0] - peak);
-                float norm = state[2] * rescale;
-                for (uint j = 0; j < 64; ++j) {
-                    const float w = scores[j] == -INFINITY ? 0.0f : exp(scores[j] - peak);
-                    norm += w;
-                    // Round-to-nearest-even bf16, without materializing widened keys.
-                    const uint bits = as_type<uint>(w);
-                    weights[j] = as_type<float>((bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u);
-                }
-                state[0] = peak;
-                state[1] = rescale;
-                state[2] = norm;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint j = 0; j < (D + 255) / 256; ++j) {
-                const uint d = tid + j * 256;
-                if (d < D) {
-                    float value = acc[j] * state[1];
-                    for (uint k = 0; k < 64 && start + k < K; ++k) {
-                        value += weights[k] * float(keys[(ki + start + k) * D + d]);
-                    }
-                    acc[j] = value;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        // Sink participates only in the denominator, never in the bf16 rounding.
-        const float peak = max(state[0], float(sink[h]));
-        const float rescale = state[0] == -INFINITY ? 0.0f : exp(state[0] - peak);
-        const float norm = state[2] * rescale + exp(float(sink[h]) - peak);
-        for (uint j = 0; j < (D + 255) / 256; ++j) {
-            const uint d = tid + j * 256;
-            if (d < D) { out[qi + d] = (acc[j] * rescale) / norm; }
-        }
-        """
-)
-
-/// Decode and bounded packed verification use the same arithmetic for every
-/// row. Large prefill and unsupported inputs retain the graph implementation.
+/// Keep each decode query's GEMM geometry identical to ordinary single-row decode.
+/// Large prefill and unsupported inputs retain their existing fallback.
 func deepseekV4SparseAttention(
     _ q: MLXArray, keys: MLXArray, valid: MLXArray, sink: MLXArray, scale: Float
 ) -> MLXArray? {
@@ -101,9 +52,18 @@ func deepseekV4SparseAttention(
         (32 ... 1024).contains(D), D % 32 == 0, (1 ... 65536).contains(K),
         keys.shape == [B, L, K, D], valid.shape == [B, L, K], sink.size == H
     else { return nil }
-    return deepseekV4SparseAttentionKernel(
-        [q, keys, valid, sink.asType(.float32), MLXArray(scale)],
-        template: [("H", H), ("L", L), ("D", D), ("K", K)],
-        grid: (H * L * 256, B, 1), threadGroup: (256, 1, 1),
-        outputShapes: [q.shape], outputDTypes: [.float32])[0]
+
+    var rows = [MLXArray]()
+    for row in 0 ..< B {
+        var queries = [MLXArray]()
+        for position in 0 ..< L {
+            queries.append(deepseekV4GraphAttention(
+                contiguous(q[row ..< (row + 1), 0..., position ..< (position + 1), 0...]),
+                keys: contiguous(keys[row ..< (row + 1), position ..< (position + 1), 0..., 0...]),
+                valid: contiguous(valid[row ..< (row + 1), position ..< (position + 1), 0...]),
+                sink: sink, scale: scale))
+        }
+        rows.append(queries.count == 1 ? queries[0] : concatenated(queries, axis: 2))
+    }
+    return rows.count == 1 ? rows[0] : concatenated(rows, axis: 0)
 }
