@@ -1403,7 +1403,7 @@ final class DeepseekV4Attention: Module {
     /// projected once; only window/pool/indexer state advances positionwise,
     /// as in mlx-vlm's `DECODE_BLOCK_SIZE` verification path.
     func verifyPacked(
-        _ x: MLXArray, caches: [KVCache], rowLengths: [Int]
+        _ x: MLXArray, caches: [KVCache], rowLengths: [Int], capturePrefixes: Bool = true
     ) -> (output: MLXArray, prefixes: [[KVCache]]) {
         let M = x.dim(0)
         let layerCaches = caches.map { DeepseekV4LayerCache($0, ratio: ratio) }
@@ -1449,7 +1449,7 @@ final class DeepseekV4Attention: Module {
                         (kv: $0.kv[range], gate: $0.gate[range], q: $0.q[range], weights: $0.weights[range])
                     })
                 attended.append(part)
-                prefixes[row].append(caches[row].copy())
+                if capturePrefixes { prefixes[row].append(caches[row].copy()) }
                 packed += 1
             }
         }
@@ -1661,7 +1661,7 @@ final class DeepseekV4HyperHead: Module {
     }
 
     func decodeBatch(_ x: MLXArray) -> MLXArray {
-        guard Device.defaultDevice().deviceType == .cpu, x.dim(0) > 1 else { return self(x) }
+        guard x.dim(0) > 1 else { return self(x) }
         return concatenated((0 ..< x.dim(0)).map { self(x[$0 ..< ($0 + 1)]) }, axis: 0)
     }
 }
@@ -1703,20 +1703,22 @@ final class DeepseekV4Block: Module {
     }
 
     func decodeBatch(
-        _ h: MLXArray, caches: [DeepseekV4LayerCache], inputIDs: MLXArray
+        _ h: MLXArray, caches: [KVCache], inputIDs: MLXArray
     ) -> MLXArray {
-        let (attnInput, attnPost, attnComb) = decodeBranchInput(attnHC, h, norm: attnNorm)
-        let h = deepseekV4HCExpand(
-            attn.decodeBatch(attnInput, caches: caches), h, attnPost, attnComb)
-        let (ffnInput, ffnPost, ffnComb) = decodeBranchInput(ffnHC, h, norm: ffnNorm)
-        return deepseekV4HCExpand(ffn(ffnInput, inputIDs: inputIDs), h, ffnPost, ffnComb)
+        // Share projections and experts, but advance each row's own pools and
+        // attention key list with the same arithmetic as one-position verify.
+        verifyPacked(
+            h, caches: caches, rowLengths: Array(repeating: 1, count: caches.count),
+            inputIDs: inputIDs, capturePrefixes: false).output
     }
 
     func verifyPacked(
-        _ h: MLXArray, caches: [KVCache], rowLengths: [Int], inputIDs: MLXArray
+        _ h: MLXArray, caches: [KVCache], rowLengths: [Int], inputIDs: MLXArray,
+        capturePrefixes: Bool = true
     ) -> (output: MLXArray, prefixes: [[KVCache]]) {
         let (attnInput, attnPost, attnComb) = packedBranchInput(attnHC, h, norm: attnNorm)
-        let attention = attn.verifyPacked(attnInput, caches: caches, rowLengths: rowLengths)
+        let attention = attn.verifyPacked(
+            attnInput, caches: caches, rowLengths: rowLengths, capturePrefixes: capturePrefixes)
         let h = deepseekV4HCExpand(attention.output, h, attnPost, attnComb)
         let (ffnInput, ffnPost, ffnComb) = packedBranchInput(ffnHC, h, norm: ffnNorm)
         let projected: MLXArray
@@ -1730,8 +1732,7 @@ final class DeepseekV4Block: Module {
         return (deepseekV4HCExpand(projected, h, ffnPost, ffnComb), attention.prefixes)
     }
 
-    /// Dense float32 HC falls back to a graph whose GEMM depends on row
-    /// count. Keep its serial primitive without changing ordinary CB arithmetic.
+    /// Keep dense float32 HC reductions independent of the number of rows.
     private func packedBranchInput(
         _ hc: GLM5NextHyperConnection, _ h: MLXArray, norm: RMSNorm
     ) -> (MLXArray, MLXArray, MLXArray) {
@@ -1910,14 +1911,13 @@ public final class DeepseekV4Model: Module, LLMModel {
         var h = repeated(
             expandedDimensions(embed(inputs), axis: 2), count: configuration.hcMult, axis: 2)
         for (i, layer) in layers.enumerated() {
-            let caches = rowCaches.map { DeepseekV4LayerCache($0[i], ratio: layer.attn.ratio) }
-            h = layer.decodeBatch(h, caches: caches, inputIDs: inputs)
+            h = layer.decodeBatch(h, caches: rowCaches.map { $0[i] }, inputIDs: inputs)
             if emitMTPState, configuration.dsparkTargetLayerIDs.contains(i) {
                 captured[i] = h.mean(axis: 2)
             }
         }
         return output(
-            logits: logits(norm(hcHead.decodeBatch(h))), captured: captured,
+            logits: deepseekV4PackedLinearF32(head, norm(hcHead.decodeBatch(h))), captured: captured,
             emitMTPState: emitMTPState)
     }
 
