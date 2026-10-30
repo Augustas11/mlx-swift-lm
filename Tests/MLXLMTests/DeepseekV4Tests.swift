@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import MLX
 import MLXLMCommon
@@ -11,10 +12,141 @@ import XCTest
 /// its `make_fixture.py`) is a 4-layer model with every V4 path: a
 /// hash-routed layer, local, ratio-4 (indexer) and ratio-128 attention, an
 /// 8-token window, and the artifact's MXFP4/MXFP8 per-layer quantization.
-/// Everything runs on the CPU. The oracle (`make_oracle.py`) prefills the
+/// Fixture parity runs on the CPU. The oracle (`make_oracle.py`) prefills the
 /// whole prompt in one call with float32 activations, so the parity test
 /// loads the fixture with its bf16 tensors widened to float32 as well.
 final class DeepseekV4Tests: XCTestCase {
+    func testGPURouterScoresMatchFrozenReferenceBits() throws {
+        guard Device.defaultDevice().deviceType == .gpu,
+            GPU.deviceInfo().architecture == "applegpu_g15d"
+        else { throw XCTSkip("Frozen M3 Ultra router arithmetic fixture") }
+        // Actual layer-0 router logits and scores from the immutable QAT-off
+        // MLX 0.32.4 oracle. Native-log/logAddExp variants fail these values.
+        let logits: [UInt32] = [
+            3225218394, 3222189349, 3211923427, 3222413284, 3230276969, 3217268808,
+            3217943974, 3223332806, 3221304816, 3217019275, 3210747181, 3224934482,
+            3217346718, 3220346189, 3210065375, 3209252010, 3217649196, 3223024702,
+            3219915628, 3217681364, 3220021372, 3231168264, 3219503136, 3208394419,
+        ]
+        let expected: [UInt32] = [
+            1046941800, 1050911680, 1058187427, 1050642621, 1038867744, 1055054120,
+            1054518922, 1049600937, 1052036038, 1055255987, 1058477594, 1047449381,
+            1054991542, 1052742984, 1058648462, 1058854834, 1054750618, 1049938888,
+            1053046782, 1054725187, 1052971591, 1035922857, 1053343714, 1059075373,
+        ]
+        let result = deepseekV4RouterSoftplusScores(MLXArray(logits.map { Float(bitPattern: $0) }))
+        XCTAssertEqual(result.asArray(Float.self).map(\.bitPattern), expected)
+    }
+
+
+    func testHyperConnectionExpansionRoundsProductsBeforeReducingStreams() {
+        for device in [Device.cpu, Device.gpu] {
+            Device.withDefaultDevice(device) {
+                let residual = MLXArray([Float(0.75), -0.75, 0, 0])
+                    .reshaped(1, 1, 4, 1).asType(.bfloat16)
+                var coefficients = [Float](repeating: 0, count: 16)
+                coefficients[0] = 1 + Float(1.1920928955078125e-7)
+                coefficients[4] = 1
+                let comb = MLXArray(coefficients).reshaped(1, 1, 4, 4)
+                let output = deepseekV4HCExpand(
+                    MLXArray.zeros([1, 1, 1], dtype: .bfloat16), residual,
+                    MLXArray.zeros([1, 1, 4], dtype: .float32), comb)
+                // roundF32(0.75 * (1 + 2^-23)) - 0.75 = 2^-23.
+                // An exact/FMA dot product instead gives 3 * 2^-25.
+                XCTAssertEqual(output.dtype, .bfloat16)
+                XCTAssertEqual(
+                    output.asType(.float32).asArray(Float.self),
+                    [1.1920928955078125e-7, 0, 0, 0])
+            }
+        }
+    }
+
+    func testQueryHeadNormRoundsInverseBeforeMultiplication() {
+        for device in [Device.cpu, Device.gpu] {
+            Device.withDefaultDevice(device) {
+                let input = MLXArray([Float(1), 2, 3, 6]).reshaped(1, 1, 1, 4)
+                    .asType(.bfloat16)
+                let actual = deepseekV4QueryHeadNorm(input, eps: 1e-6)
+                XCTAssertEqual(actual.dtype, .bfloat16)
+                // Inverse RMS rounds from 0.28284270 to bf16 0.283203125.
+                XCTAssertEqual(
+                    actual.asType(.float32).asArray(Float.self),
+                    [0.283203125, 0.56640625, 0.8515625, 1.703125])
+                if device.deviceType == .gpu {
+                    XCTAssertEqual(
+                        MLXFast.rmsNorm(input, weight: MLXArray.mlxNone, eps: 1e-6)
+                            .asType(.float32).asArray(Float.self),
+                        [0.283203125, 0.56640625, 0.84765625, 1.6953125])
+                }
+            }
+        }
+    }
+
+    /// The third component differs by one bf16 step if the normalized
+    /// activation is rounded before multiplying the learned weight.
+    func testLearnedRMSNormRoundsAfterWeight() {
+        for device in [Device.cpu, Device.gpu] {
+            Device.withDefaultDevice(device) {
+                let input = MLXArray([Float(1), 2, 3, 4]).reshaped(1, 1, 4).asType(.bfloat16)
+                let weight = MLXArray(Array(repeating: Float(1.0234375), count: 4))
+                    .asType(.bfloat16)
+                let norm = DeepseekV4RMSNorm(dimensions: 4, eps: 0)
+                norm.update(parameters: ModuleParameters.unflattened(["weight": weight]))
+                XCTAssertEqual(norm.parameters().flattened().map { $0.0 }, ["weight"])
+                XCTAssertEqual(norm(input).dtype, .bfloat16)
+                XCTAssertEqual(
+                    norm(input).asType(.float32).asArray(Float.self),
+                    [0.373046875, 0.74609375, 1.125, 1.4921875])
+            }
+        }
+    }
+
+    func testHyperConnectionPreservesDeepseekRMSNormInPrefillAndFusedDecode() throws {
+        try Device.withDefaultDevice(.gpu) {
+            let width = 1024
+            let weight = MLXArray(Array(repeating: Float(1.0234375), count: width))
+                .asType(.bfloat16)
+            let norm = DeepseekV4RMSNorm(dimensions: width, eps: 0)
+            norm.update(parameters: ModuleParameters.unflattened(["weight": weight]))
+            norm.train(false)
+            let connection = GLM5NextHyperConnection(
+                hcMult: 4, sinkhornIterations: 1, hcEps: 0, normEps: 0,
+                hiddenSize: width, normWeightInFloat32: true, normalizeMixAfterProjection: true)
+            connection.train(false)
+            let reference: [Float] = [0.373046875, 0.74609375, 1.125, 1.4921875]
+            // Zero mixing weights give each of the four streams weight 0.5,
+            // so the collapsed activation is exactly twice [1, 2, 3, 4].
+            for length in [1, 9] {
+                let input = MLXArray((0 ..< (length * 4 * width)).map { Float($0 % 4 + 1) })
+                    .reshaped(1, length, 4, width).asType(.bfloat16)
+                let expected = (0 ..< (length * width)).map { reference[$0 % 4] }
+                for fusedDecode in [false, true] {
+                    connection.fusedDecode = fusedDecode
+                    let (actual, _, _) = connection.normalizedBranchInput(input, norm: norm)
+                    XCTAssertEqual(actual.asType(.float32).asArray(Float.self), expected)
+                }
+                if length == 1 {
+                    let mixes = try XCTUnwrap(
+                        glm5NextHCMix(input, fn: connection.fn, eps: connection.normEps))
+                    let fused = try XCTUnwrap(
+                        glm5NextHCNorm(
+                            input, mixes: mixes, scale: connection.scale, base: connection.base,
+                            normWeight: weight, sinkhornIterations: 1, hcEps: 0, normEps: 0,
+                            normWeightInFloat32: true))
+                    XCTAssertEqual(fused.0.asType(.float32).asArray(Float.self), expected)
+                    // Omitting the option retains the GLM kernel's original arithmetic.
+                    let glm = try XCTUnwrap(
+                        glm5NextHCNorm(
+                            input, mixes: mixes, scale: connection.scale, base: connection.base,
+                            normWeight: weight, sinkhornIterations: 1, hcEps: 0, normEps: 0))
+                    let glmReference: [Float] = [0.373046875, 0.74609375, 1.1171875, 1.4921875]
+                    XCTAssertEqual(
+                        glm.0.asType(.float32).asArray(Float.self),
+                        (0 ..< width).map { glmReference[$0 % 4] })
+                }
+            }
+        }
+    }
 
     private struct Oracle: Decodable {
         struct Case: Decodable {
@@ -64,6 +196,37 @@ final class DeepseekV4Tests: XCTestCase {
         }
         model.train(false)
         return model
+    }
+
+    func testQuantizedMoEPrefillPreservesIndependentTokenOutputs() throws {
+        try Device.withDefaultDevice(.gpu) {
+            let model = try loadTiny(indexBlock: 0, indexKeep: 0)
+            let width = model.layers[0].ffn.gate.weight.dim(1)
+            let values: [Float] = (0 ..< (18 * width)).map { index in
+                let centered = (index * 17) % 41 - 20
+                return Float(centered) / Float(32)
+            }
+            let input = MLXArray(values).reshaped(2, 9, width).asType(.bfloat16)
+            let ids = MLXArray((0 ..< 18).map { Int32($0 % model.vocabularySize) }).reshaped(2, 9)
+            // Exercise both hash and score routing with repeated experts across batch rows.
+            for layer in model.layers.prefix(2) {
+                let projection = try XCTUnwrap(layer.ffn.switchMLP.gateProjection as? QuantizedSwitchLinear)
+                XCTAssertEqual(projection.mode, .mxfp4)
+                let prefill = layer.ffn(input, inputIDs: ids)
+                let flatInput = input.reshaped(18, width)
+                let flatIDs = ids.flattened()
+                let independent = concatenated((0 ..< 18).map { row in
+                    layer.ffn(flatInput[row ..< (row + 1)], inputIDs: flatIDs[row ..< (row + 1)])
+                }, axis: 0).reshaped(input.shape)
+                XCTAssertEqual(prefill.dtype, .bfloat16)
+                XCTAssertEqual(prefill.shape, input.shape)
+                let error = (prefill.asType(.float32) - independent.asType(.float32)).asArray(Float.self)
+                let expected = independent.asType(.float32).asArray(Float.self)
+                let squaredError = error.reduce(Float(0)) { $0 + $1 * $1 }
+                let squaredNorm = expected.reduce(Float(0)) { $0 + $1 * $1 }
+                XCTAssertLessThan(sqrt(squaredError / max(squaredNorm, 1e-20)), 0.01)
+            }
+        }
     }
 
     /// mlx-vlm `generate_step`: prompt chunks of `min(step, remaining - 1)`
@@ -120,7 +283,7 @@ final class DeepseekV4Tests: XCTestCase {
     }
 
     /// The serving path (`TokenIterator`, whatever prefill step and chunking
-    /// the caller asks for) prefills with the fixed 2048-token plan and
+    /// the caller asks for) keeps the final reference chunk intact and
     /// decodes the oracle's tokens.
     func testTokenIteratorUsesReferencePrefillPlan() throws {
         try Device.withDefaultDevice(.cpu) {
@@ -128,7 +291,7 @@ final class DeepseekV4Tests: XCTestCase {
             let oracle = try JSONDecoder().decode(
                 Oracle.self, from: Data(contentsOf: dir.appendingPathComponent("oracle.json")))
             let cases = oracle.cases.filter {
-                $0.prefillStep == DeepseekV4Model.prefillStepSize
+                $0.prefillStep == 2048
             }
             XCTAssertEqual(cases.count, 1)
             for item in cases {
@@ -143,6 +306,31 @@ final class DeepseekV4Tests: XCTestCase {
                     var tokens = [Int]()
                     while let token = iterator.next() { tokens.append(token) }
                     XCTAssertEqual(tokens, item.greedy, "\(item.indexer) \(chunking)")
+                }
+            }
+        }
+    }
+
+    func testPrepareReturnsFullContextLogitsAndCache() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = try loadTiny(indexBlock: 0, indexKeep: 0, float32: true)
+            let tokens = MLXArray((0 ..< 96).map { Int32($0 % model.vocabularySize) })
+            let referenceCache = try model.newCache(parameters: nil)
+            let preparedCache = try model.newCache(parameters: nil)
+            let expected = model(tokens.reshaped(1, 96), cache: referenceCache)
+            let result = try model.prepare(
+                LMInput(tokens: tokens), cache: preparedCache, state: nil,
+                prefill: PrefillParameters(stepSize: 16))
+            guard case .logits(let output) = result else {
+                return XCTFail("The final complete reference chunk must return logits")
+            }
+            XCTAssertEqual(output.logits.shape, [1, 96, model.vocabularySize])
+            XCTAssertEqual(output.logits.asArray(Float.self), expected.asArray(Float.self))
+            for (actual, expected) in zip(preparedCache, referenceCache) {
+                XCTAssertEqual(actual.offset, expected.offset)
+                for (a, b) in zip(actual.state, expected.state) {
+                    XCTAssertEqual(a.asType(.float32).asArray(Float.self),
+                        b.asType(.float32).asArray(Float.self))
                 }
             }
         }
@@ -190,21 +378,32 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
-    private func prefetchedRow(_ model: DeepseekV4Model, prompt: [Int]) throws -> [KVCache] {
+    private func servingGreedy(_ model: DeepseekV4Model, prompt: [Int], count: Int) throws -> [Int] {
+        var iterator = try TokenIterator(
+            input: LMInput(tokens: MLXArray(prompt.map(Int32.init))), model: model,
+            parameters: GenerateParameters(maxTokens: count, temperature: 0))
+        var tokens = [Int]()
+        while let token = iterator.next() { tokens.append(token) }
+        XCTAssertEqual(tokens.count, count)
+        return tokens
+    }
+
+    private func prefetchedRow(
+        _ model: DeepseekV4Model, prompt: [Int]
+    ) throws -> (cache: [KVCache], firstToken: Int32) {
         let cache = try model.newCache(parameters: nil)
         let input = LMInput(tokens: MLXArray(prompt.map(Int32.init)))
         let result = try model.prepare(
             input, cache: cache, state: nil, prefill: PrefillParameters(stepSize: 16))
-        guard case .tokens(let last) = result else {
-            XCTFail("DeepSeek V4 prepare must leave the last token for decode")
-            return cache
-        }
-        XCTAssertEqual(last.tokens.asArray(Int32.self), [Int32(prompt.last!)])
+        let output: LMOutput?
+        if case .logits(let logits) = result { output = logits } else { output = nil }
+        let prepared = try XCTUnwrap(output, "DeepSeek V4 prepare must return full-prompt logits")
+        let firstToken = argMax(prepared.logits[0, -1], axis: -1).item(Int32.self)
         for (layer, item) in zip(model.layers, cache) {
             XCTAssertEqual(
-                DeepseekV4LayerCache(item, ratio: layer.attn.ratio).local.offset, prompt.count - 1)
+                DeepseekV4LayerCache(item, ratio: layer.attn.ratio).local.offset, prompt.count)
         }
-        return cache
+        return (cache, firstToken)
     }
 
     func testContinuousBatchGreedyParityAtOneTwoFourEightRows() throws {
@@ -217,13 +416,15 @@ final class DeepseekV4Tests: XCTestCase {
                 let model = try loadTiny(indexBlock: indexBlock, indexKeep: 2)
                 let count = 16
                 let serial = try prompts.map {
-                    try greedy(model, prompt: $0, step: DeepseekV4Model.prefillStepSize, count: count).0
+                    try servingGreedy(model, prompt: $0, count: count)
                 }
                 for rows in [1, 2, 4, 8] {
-                    let caches = try prompts.prefix(rows).map { try prefetchedRow(model, prompt: $0) }
-                    var inputs = prompts.prefix(rows).map { Int32($0.last!) }
-                    var tokens = Array(repeating: [Int](), count: rows)
-                    for _ in 0 ..< count {
+                    let prepared = try prompts.prefix(rows).map { try prefetchedRow(model, prompt: $0) }
+                    let caches = prepared.map { $0.cache }
+                    var inputs = prepared.map { $0.firstToken }
+                    var tokens = inputs.map { [Int($0)] }
+                    XCTAssertEqual(inputs.map(Int.init), serial.prefix(rows).map { $0[0] }, "first rows=\(rows)")
+                    for _ in 1 ..< count {
                         let logits = model.decodeBatch(
                             MLXArray(inputs).reshaped(rows, 1), rowCaches: caches)
                         let next = argMax(logits, axis: -1).asArray(Int32.self)
@@ -245,12 +446,14 @@ final class DeepseekV4Tests: XCTestCase {
             for indexBlock in [0] {
                 let model = try loadTiny(indexBlock: indexBlock, indexKeep: 2)
                 let serial = try prompts.map {
-                    try greedy(model, prompt: $0, step: DeepseekV4Model.prefillStepSize, count: 4).0
+                    try servingGreedy(model, prompt: $0, count: 4)
                 }
                 for rows in [1, 2, 4, 8] {
-                    let caches = try prompts.prefix(rows).map { try prefetchedRow(model, prompt: $0) }
-                    var inputs = prompts.prefix(rows).map { Int32($0.last!) }
-                    for step in 0 ..< 4 {
+                    let prepared = try prompts.prefix(rows).map { try prefetchedRow(model, prompt: $0) }
+                    let caches = prepared.map { $0.cache }
+                    var inputs = prepared.map { $0.firstToken }
+                    XCTAssertEqual(inputs.map(Int.init), serial.prefix(rows).map { $0[0] }, "first long rows=\(rows)")
+                    for step in 1 ..< 4 {
                         let next = argMax(
                             model.decodeBatch(MLXArray(inputs).reshaped(rows, 1), rowCaches: caches),
                             axis: -1).asArray(Int32.self)
@@ -272,15 +475,19 @@ final class DeepseekV4Tests: XCTestCase {
                 (0 ..< count).map { ($0 * 3 + row * 17) % 128 }
             }
             let serial = try prompts.map {
-                try greedy(model, prompt: $0, step: DeepseekV4Model.prefillStepSize, count: 16).0
+                try servingGreedy(model, prompt: $0, count: 16)
             }
             var caches = [Int: [KVCache]]()
-            var inputs = prompts.map { Int32($0.last!) }
+            var inputs = Array(repeating: Int32(0), count: prompts.count)
             var positions = Array(repeating: 0, count: prompts.count)
             let schedule = [[0, 1], [1, 0], [1, 0, 2], [2, 1], [3, 2], [0, 3, 2], [2], [3, 0]]
             for active in schedule {
                 for row in active where caches[row] == nil {
-                    caches[row] = try prefetchedRow(model, prompt: prompts[row])
+                    let prepared = try prefetchedRow(model, prompt: prompts[row])
+                    caches[row] = prepared.cache
+                    inputs[row] = prepared.firstToken
+                    XCTAssertEqual(Int(prepared.firstToken), serial[row][0], "first row=\(row)")
+                    positions[row] = 1
                 }
                 let next = argMax(
                     model.decodeBatch(
@@ -295,7 +502,7 @@ final class DeepseekV4Tests: XCTestCase {
                     for (layer, item) in zip(model.layers, caches[row]!) {
                         XCTAssertEqual(
                             DeepseekV4LayerCache(item, ratio: layer.attn.ratio).local.offset,
-                            prompts[row].count - 1 + positions[row])
+                            prompts[row].count + positions[row] - 1)
                     }
                 }
             }
@@ -313,6 +520,107 @@ final class DeepseekV4Tests: XCTestCase {
                     rope(x[row ..< (row + 1)], offset: offset, inverse: inverse)
                 }, axis: 0)
                 XCTAssertEqual(batched.asArray(Float.self), serial.asArray(Float.self))
+            }
+        }
+    }
+
+    func testRoPEFloat32PhasesAtPositions257Through320() {
+        Device.withDefaultDevice(.gpu) {
+            let frequencies = MLXArray((0 ..< 32).map {
+                Float(1) / Foundation.pow(Float(10000), Float(2 * $0) / 64)
+            })
+            let positions = MLXArray((257 ... 320).map(Int32.init)).asType(.float32)
+            let angles = positions[0..., .newAxis] * frequencies[.newAxis, 0...]
+            let (cosine, sine) = deepseekV4RoPEPhases(angles)
+            XCTAssertEqual(cosine.dtype, .float32)
+            XCTAssertEqual(sine.dtype, .float32)
+            // NumPy float32 arange/outer/cos/sin; little-endian row-major phases.
+            let values = cosine.asArray(Float.self) + sine.asArray(Float.self)
+            let digest = values.withUnsafeBytes { SHA256.hash(data: Data($0)) }
+            XCTAssertEqual(digest.map { String(format: "%02x", $0) }.joined(),
+                "1e9c0f920fc12705248915b2a65cf99ea1b7f19564674e161775d87e744c13f3")
+
+            // Layer-0 position 320/head 34/pair 3 cancels near a bf16 boundary.
+            let rope = DeepseekV4RoPE(dims: 64, base: 10000, scaling: nil)
+            var input = [Float](repeating: 0, count: 68)
+            input[0] = 9
+            input[10] = 0.51953125
+            input[11] = 0.076171875
+            let result = rope(MLXArray(input).reshaped(1, 1, 1, 68).asType(.bfloat16), offset: 320)
+                .asType(.float32)
+            XCTAssertEqual(result[0, 0, 0, 0].item(Float.self), 9)
+            XCTAssertEqual(result[0, 0, 0, 11].item(Float.self), 9.715557098388672e-6)
+        }
+    }
+
+    func testRoPEMatchesCanonicalFloat32Positions() {
+        // NumPy float32 reference: plain base 10000, positions 192/2049,
+        // pairs 0/1/19/31 of the final 64 channels, input pair [0.75, 1.25].
+        let forward: [[Float]] = [
+            [-0.25749433, -1.4348159, 1.2815117, 0.6947863,
+                -0.38775349, 1.4052215, 0.71775317, 1.2687908],
+            [-0.2051065, 1.4432364, -0.35503149, -1.4138433,
+                -1.413795, -0.35522372, 0.38486242, 1.4060159],
+        ]
+        let inverse: [[Float]] = [
+            [-1.1448402, -0.90240836, 0.009982467, 1.4577038,
+                1.4223735, 0.3191452, 0.7817552, 1.2303897],
+            [1.3699646, 0.49819374, -1.080435, -0.9786011,
+                0.35188252, -1.4146302, 1.0594906, 1.0012391],
+        ]
+        let channels = [0, 1, 2, 3, 38, 39, 62, 63]
+        let offsets = [192, 2049]
+        for device in [Device.cpu, Device.gpu] {
+            Device.withDefaultDevice(device) {
+                let rope = DeepseekV4RoPE(dims: 64, base: 10000, scaling: nil)
+                let values = (0 ..< (2 * 68)).map { index -> Float in
+                    let channel = index % 68
+                    return channel < 4 ? 9 : (channel % 2 == 0 ? 0.75 : 1.25)
+                }
+                let x = MLXArray(values).reshaped(2, 1, 1, 68)
+                for (isInverse, expected) in [(false, forward), (true, inverse)] {
+                    let result = rope(
+                        x, offsets: MLXArray(offsets.map(Int32.init)), inverse: isInverse)
+                    for row in 0 ..< 2 {
+                        XCTAssertEqual(
+                            result[row, 0, 0, ..<4].asArray(Float.self), [9, 9, 9, 9])
+                        for (column, channel) in channels.enumerated() {
+                            XCTAssertEqual(
+                                result[row, 0, 0, channel + 4].item(Float.self),
+                                expected[row][column], accuracy: 2e-6)
+                        }
+                        XCTAssertEqual(
+                            result[row ..< (row + 1)].asArray(Float.self),
+                            rope(x[row ..< (row + 1)], offset: offsets[row], inverse: isInverse)
+                                .asArray(Float.self))
+                    }
+                }
+            }
+        }
+    }
+
+    func testRoPECompressorScaleKeepsRoundedOffsetsAndSequencePositions() {
+        for device in [Device.cpu, Device.gpu] {
+            Device.withDefaultDevice(device) {
+                let rope = DeepseekV4RoPE(dims: 16, base: 160000, scaling: nil, freqScale: 4)
+                let x = MLXArray((0 ..< 32).map { Float($0 % 2 == 0 ? 0.75 : 1.25) })
+                    .reshaped(1, 2, 16).asType(.bfloat16)
+                // Offset 769 rounds down to pool position 192: physical positions 768/772.
+                let forward = rope(x, offset: 769).asType(.float32)
+                let inverse = rope(x, offsets: MLXArray([Int32(769)]), inverse: true)
+                    .asType(.float32)
+                XCTAssertEqual(
+                    forward[0, 0, ..<4].asArray(Float.self),
+                    [-1.1484375, 0.89453125, -1.4609375, 0.03955078125])
+                XCTAssertEqual(
+                    forward[0, 1, ..<4].asArray(Float.self),
+                    [1.4296875, 0.287109375, -0.94140625, -1.109375])
+                XCTAssertEqual(
+                    inverse[0, 0, ..<4].asArray(Float.self),
+                    [1.328125, -0.59765625, 0.72265625, -1.265625])
+                XCTAssertEqual(
+                    inverse[0, 1, ..<4].asArray(Float.self),
+                    [-0.41796875, 1.3984375, -0.53515625, -1.3515625])
             }
         }
     }
@@ -423,14 +731,23 @@ final class DeepseekV4Tests: XCTestCase {
             XCTAssertEqual(config.indexBlock, 0)
             MLXRandom.seed(2111)
             let indexer = DeepseekV4Indexer(config, ratio: 4)
+            // The artifact stores this LinearF32 weight in bf16. Keeping the
+            // random initializer's float32 weight would hide the premature
+            // bf16 projection that this regression must detect.
+            indexer.weightsProj.update(parameters: ModuleParameters.unflattened([
+                "weight": indexer.weightsProj.weight.asType(.bfloat16),
+            ]))
             let rope = DeepseekV4RoPE(dims: 16, base: 160000, scaling: nil)
             func bruteForce(x: MLXArray, qResidual: MLXArray, pool: MLXArray, offset: Int) -> Set<Int32> {
                 let q = rope(
                     indexer.wqB(qResidual).reshaped(1, 1, 4, 32).transposed(0, 2, 1, 3), offset: offset)
                     .asType(.float32)
-                let w = indexer.weightsProj(x).asType(.float32).reshaped(4, 1, 1) * pow(Float(4), -0.5)
+                // Independent reference LinearF32: widening after a bf16
+                // projection has already lost the routing coefficients.
+                let raw = matmul(x.asType(.float32), indexer.weightsProj.weight.asType(.float32).T)
+                let w = raw.reshaped(4, 1, 1) * (indexer.scale * pow(Float(4), -0.5))
                 let dots = maximum(matmul(q[0], pool[0].asType(.float32).T), 0)  // [H, 1, P]
-                let scores = (dots * indexer.scale * w).sum(axis: 0).reshaped(-1)
+                let scores = (dots * w).sum(axis: 0).reshaped(-1)
                 let k = min(512, pool.dim(1))
                 return Set(argSort(-scores)[..<k].asArray(Int32.self))
             }
@@ -576,11 +893,13 @@ final class DeepseekV4Tests: XCTestCase {
                 (0 ..< count).map { ($0 * 5 + row * 7) % 128 }
             }
             let serial = try prompts.map {
-                try greedy(model, prompt: $0, step: DeepseekV4Model.prefillStepSize, count: 4).0
+                try servingGreedy(model, prompt: $0, count: 4)
             }
-            let caches = try prompts.map { try prefetchedRow(model, prompt: $0) }
-            var inputs = prompts.map { Int32($0.last!) }
-            for step in 0 ..< 4 {
+            let prepared = try prompts.map { try prefetchedRow(model, prompt: $0) }
+            let caches = prepared.map { $0.cache }
+            var inputs = prepared.map { $0.firstToken }
+            XCTAssertEqual(inputs.map(Int.init), serial.map { $0[0] })
+            for step in 1 ..< 4 {
                 let next = argMax(
                     model.decodeBatch(MLXArray(inputs).reshaped(8, 1), rowCaches: caches), axis: -1)
                     .asArray(Int32.self)

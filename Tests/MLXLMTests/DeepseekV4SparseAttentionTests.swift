@@ -21,6 +21,33 @@ final class DeepseekV4SparseAttentionTests: XCTestCase {
         guard Device.defaultDevice().deviceType == .gpu else { throw XCTSkip("GPU only") }
     }
 
+    /// Exact cancellation precedes the non-power-of-two softmax scale.
+    /// Scaling each query component first changes the score and bf16 weights.
+    func testSoftmaxScaleFollowsScoreReduction() throws {
+        try requireGPU()
+        let dim = 512
+        let attn = try attention(dim: dim, heads: 1)
+        var query = [Float](repeating: 0, count: dim)
+        query[0] = 3
+        query[1] = 7
+        var keyValues = [Float](repeating: 0, count: 2 * dim)
+        keyValues[0] = 229376
+        keyValues[1] = -98304
+        let q = MLXArray(query).reshaped(1, 1, 1, dim).asType(.bfloat16)
+        let keys = MLXArray(keyValues).reshaped(1, 1, 2, dim).asType(.bfloat16)
+        let valid = MLXArray.ones([1, 1, 2], dtype: .bool)
+        let fused = try XCTUnwrap(
+            deepseekV4SparseAttention(
+                q, keys: keys, valid: valid, sink: attn.attnSink, scale: attn.scale))
+        let graph = attn.graphAttention(q, keys: keys, valid: valid)
+        // Both key scores and the sink are zero, so each has probability 1/3.
+        for output in [graph, fused] {
+            XCTAssertEqual(output.dtype, .float32)
+            XCTAssertEqual(output[0, 0, 0, 0].item(Float.self), 229376 / 3, accuracy: 0.05)
+            XCTAssertEqual(output[0, 0, 0, 1].item(Float.self), -98304 / 3, accuracy: 0.05)
+        }
+    }
+
     /// Tiny and production head dimensions; tails, holes, multiple blocks,
     /// bf16 inputs and a nonzero, per-head sink all use the graph oracle.
     func testFusedMatchesGraph() throws {
