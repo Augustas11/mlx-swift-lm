@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXNN
+import MLXLMCommon
 import XCTest
 
 @testable import MLXLLM
@@ -197,6 +198,67 @@ final class DeepseekV4SparseAttentionTests: XCTestCase {
                 attn.referenceAttention(q, keys: keys, valid: valid).asArray(Float.self),
                 attn.graphAttention(q, keys: keys, valid: valid).asArray(Float.self))
         }
+    }
+
+    func testCanonicalHyperConnectionKeepsOrdinaryTokenArithmetic() throws {
+        try requireGPU()
+        MLXRandom.seed(2151)
+        let hc = GLM5NextHyperConnection(
+            hcMult: 4, sinkhornIterations: 20, hcEps: 1e-6, normEps: 1e-6,
+            hiddenSize: 32, normWeightInFloat32: true, normalizeMixAfterProjection: true)
+        hc.update(parameters: ModuleParameters.unflattened([
+            "fn": MLXRandom.normal([24, 128]) * 0.05,
+            "base": MLXRandom.normal([24]),
+        ]))
+        hc.train(false)
+        let norm = DeepseekV4RMSNorm(dimensions: 32, eps: 1e-6)
+        let x = MLXRandom.normal([8, 8, 4, 32]).asType(.bfloat16)
+        let actual = hc.normalizedBranchInput(x, norm: norm)
+        for row in 0 ..< 8 {
+            for position in 0 ..< 8 {
+                let (collapsed, post, comb) = hc(
+                    x[row ..< (row + 1), position ..< (position + 1), 0..., 0...])
+                XCTAssertEqual(
+                    actual.0[row, position].asArray(Float.self), norm(collapsed)[0, 0].asArray(Float.self))
+                XCTAssertEqual(actual.1[row, position].asArray(Float.self), post[0, 0].asArray(Float.self))
+                XCTAssertEqual(actual.2[row, position].asArray(Float.self), comb[0, 0].asArray(Float.self))
+            }
+        }
+        XCTAssertFalse(hc.deferredDecodeSupported(dtype: .bfloat16, norm: norm))
+    }
+
+    /// Frozen seed reproduces a bf16 rounding boundary in the old quantized woA.
+    func testMXFP8GroupProjectionUsesReferenceWeightRounding() throws {
+        try requireGPU()
+        MLXRandom.seed(2151)
+        let projection = QuantizedMultiLinear(
+            weight: MLXRandom.normal([8, 1024, 4096]).asType(.bfloat16),
+            groupSize: 32, bits: 8, mode: .mxfp8)
+        let x = MLXRandom.normal([1, 8, 1, 4096]).asType(.bfloat16)
+        let weight = dequantized(
+            projection.weight, scales: projection.scales, biases: nil,
+            groupSize: 32, bits: 8, mode: .mxfp8).asType(.bfloat16)
+        let expected = matmul(x, weight.swappedAxes(-1, -2))
+        let actual = deepseekV4MultiLinear(projection, x)
+        XCTAssertEqual(actual.asArray(Float.self), expected.asArray(Float.self))
+    }
+
+    /// A bounded key workspace may leave a <=8-query tail in a long prefill.
+    /// That tail must retain the same graph arithmetic as every earlier tile.
+    func testPrefillTailKeepsGraphArithmetic() throws {
+        try requireGPU()
+        MLXRandom.seed(2151)
+        let attn = try attention(dim: 64, heads: 2)
+        let x = MLXRandom.normal([1, 11, 64])
+        func freshCache() -> DeepseekV4LayerCache {
+            DeepseekV4LayerCache(RotatingKVCache(maxSize: 128), ratio: 0)
+        }
+        let full = attn(x, mask: nil, cache: freshCache())
+        eval(full)
+        // Nine queries use the graph; the final two previously selected decode.
+        attn.keyWorkspaceBytes = 9 * 128 * 64 * 4
+        let tiled = attn(x, mask: nil, cache: freshCache())
+        XCTAssertEqual(tiled.asArray(Float.self), full.asArray(Float.self))
     }
 
     func testLargePrefillUsesGraphFallback() throws {

@@ -150,9 +150,33 @@ final class GLM5NextHyperConnection: Module {
         return (collapsed, post, comb)
     }
 
+    private var usesCanonicalDeepseekHC: Bool {
+        normWeightInFloat32 && normalizeMixAfterProjection
+    }
+
     /// `norm(collapsed)`, `post` and `comb` for a branch: the reference
     /// model's decode kernels for one sequence, the op path otherwise.
     func normalizedBranchInput(_ x: MLXArray, norm: RMSNorm) -> (MLXArray, MLXArray, MLXArray) {
+        if usesCanonicalDeepseekHC, (1 ... 8).contains(x.dim(1)) {
+            // Each decode/verification token keeps ordinary M1 graph arithmetic.
+            // Batched GEMM and fused coefficients can cross bf16 rounding ties.
+            var normalizedRows = [MLXArray]()
+            var postRows = [MLXArray]()
+            var combRows = [MLXArray]()
+            for row in 0 ..< x.dim(0) {
+                let tokens = (0 ..< x.dim(1)).map { position in
+                    let (collapsed, post, comb) = self(
+                        x[row ..< (row + 1), position ..< (position + 1), 0..., 0...])
+                    return (norm(collapsed), post, comb)
+                }
+                normalizedRows.append(concatenated(tokens.map { $0.0 }, axis: 1))
+                postRows.append(concatenated(tokens.map { $0.1 }, axis: 1))
+                combRows.append(concatenated(tokens.map { $0.2 }, axis: 1))
+            }
+            return (
+                concatenated(normalizedRows, axis: 0), concatenated(postRows, axis: 0),
+                concatenated(combRows, axis: 0))
+        }
         if fusedDecode, !training, x.dim(1) <= 8, hcMult == 4,
             let mixes = glm5NextHCMix(
                 x, fn: fn, eps: normEps, normalizeMixAfterProjection: normalizeMixAfterProjection),
@@ -168,7 +192,7 @@ final class GLM5NextHyperConnection: Module {
     }
 
     func deferredDecodeSupported(dtype: DType, norm: RMSNorm) -> Bool {
-        fusedDecode && !training && hcMult == 4
+        !usesCanonicalDeepseekHC && fusedDecode && !training && hcMult == 4
             && glm5NextHCDeferredSupported(
                 dtype: dtype, width: fn.dim(1) / hcMult, fn: fn, scale: scale, base: base,
                 normWeight: norm.weight)

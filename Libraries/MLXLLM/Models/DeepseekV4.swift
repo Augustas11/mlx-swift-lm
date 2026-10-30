@@ -323,24 +323,25 @@ func deepseekV4HCExpand(
     return (expanded + products.sum(axis: 2)).asType(x.dtype)
 }
 
-/// The kernel's unnormalized attention weights as the value product reads
-/// them: `exp(s - max)` rounded to bf16 (`acc_s_cast`, `inference/kernel.py:
-/// 305, 340-343`), the normalizer and accumulation staying float32. The
-/// kernel takes its running max over 64-key blocks in its key order; this
-/// takes the row max over all keys (the kernel's final max).
-private func deepseekV4KernelWeights(_ weights: MLXArray) -> MLXArray {
-    weights.asType(.bfloat16).asType(.float32)
-}
-
 private func deepseekV4MaskScores(_ scores: MLXArray, _ mask: MLXArray?) -> MLXArray {
     guard let mask else { return scores }
     return MLX.where(mask, scores, MLXArray(deepseekV4FinfoMin(scores.dtype)).asType(scores.dtype))
 }
 
-private func callMultiLinear(_ module: Module, _ x: MLXArray) -> MLXArray {
+/// The reference rounds MXFP8 group weights to bf16 before its dense product.
+/// Quantized GEMV has a different accumulation order that can cross a bf16 tie.
+func deepseekV4MultiLinear(_ module: Module, _ x: MLXArray) -> MLXArray {
     switch module {
-    case let quantized as QuantizedMultiLinear: quantized(x)
-    case let dense as MultiLinear: dense(x)
+    case let quantized as QuantizedMultiLinear:
+        if quantized.mode == .mxfp8 {
+            let weight = dequantized(
+                quantized.weight, scales: quantized.scales, biases: quantized.biases,
+                groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode
+            ).asType(.bfloat16)
+            return matmul(x, weight.asType(x.dtype).swappedAxes(-1, -2))
+        }
+        return quantized(x)
+    case let dense as MultiLinear: return dense(x)
     default: fatalError("Expected MultiLinear or QuantizedMultiLinear, got \(type(of: module))")
     }
 }
@@ -1312,7 +1313,7 @@ final class DeepseekV4Attention: Module {
 
         out = out.reshaped(B, groups, heads / groups, L, headDim).transposed(0, 1, 3, 2, 4)
             .reshaped(B, groups, L, heads / groups * headDim)
-        out = callMultiLinear(woA, out)  // [B, G, L, R]
+        out = deepseekV4MultiLinear(woA, out)  // [B, G, L, R]
         out = out.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         return deepseekV4Project(woB, out)
     }
@@ -1394,7 +1395,7 @@ final class DeepseekV4Attention: Module {
         var out = rope(attended, offsets: offsetArray, inverse: true)
         out = out.reshaped(B, groups, heads / groups, 1, headDim).transposed(0, 1, 3, 2, 4)
             .reshaped(B, groups, 1, heads / groups * headDim)
-        out = callMultiLinear(woA, out)
+        out = deepseekV4MultiLinear(woA, out)
         return deepseekV4Project(woB, out.transposed(0, 2, 1, 3).reshaped(B, 1, -1))
     }
 
@@ -1457,9 +1458,9 @@ final class DeepseekV4Attention: Module {
             .reshaped(M, groups, 1, heads / groups * headDim)
         let denseFloat32Output = out.dtype == .float32 && woA is MultiLinear
         if M > 1, Device.defaultDevice().deviceType == .cpu || denseFloat32Output {
-            out = concatenated((0 ..< M).map { callMultiLinear(woA, out[$0 ..< ($0 + 1)]) }, axis: 0)
+            out = concatenated((0 ..< M).map { deepseekV4MultiLinear(woA, out[$0 ..< ($0 + 1)]) }, axis: 0)
         } else {
-            out = callMultiLinear(woA, out)
+            out = deepseekV4MultiLinear(woA, out)
         }
         return (
             deepseekV4PackedLinear(woB, out.transposed(0, 2, 1, 3).reshaped(M, 1, -1)),
@@ -1597,7 +1598,7 @@ final class DeepseekV4Attention: Module {
             }
             let part = referenceAttention(
                 q[0..., 0..., start ..< end], keys: stacked(keys, axis: 0),
-                valid: stacked(valid, axis: 0)
+                valid: stacked(valid, axis: 0), allowDecode: L <= 8
             ).asType(q.dtype)
             if tile < L { eval(part) }
             parts.append(part)
@@ -1611,40 +1612,22 @@ final class DeepseekV4Attention: Module {
     /// running max, `exp(s - running max)` rounded to bf16 for the value
     /// product, and the float32 accumulator and normalizer rescaled when the
     /// max rises; the float32 sink joins the normalizer at the end.
-    func referenceAttention(_ q: MLXArray, keys: MLXArray, valid: MLXArray) -> MLXArray {
-        if let fused = deepseekV4SparseAttention(
+    func referenceAttention(
+        _ q: MLXArray, keys: MLXArray, valid: MLXArray, allowDecode: Bool = true
+    ) -> MLXArray {
+        // A small tail of a long prefill retains the full-query graph selected
+        // for the original call; its tile length does not make it decode.
+        if allowDecode, let decoded = deepseekV4SparseAttention(
             q, keys: keys, valid: valid, sink: attnSink, scale: scale)
         {
-            return fused
+            return decoded
         }
         return graphAttention(q, keys: keys, valid: valid)
     }
 
     /// Float32 graph oracle and fallback for prefill, CPU and unsupported shapes.
     func graphAttention(_ q: MLXArray, keys: MLXArray, valid: MLXArray) -> MLXArray {
-        let (B, H, L) = (q.dim(0), q.dim(1), q.dim(2))
-        let K = keys.dim(2)
-        let block = 64
-        let blocks = (K + block - 1) / block
-        let keys32 = keys.asType(.float32)
-        var scores = matmul(
-            q.transposed(0, 2, 1, 3).asType(.float32), keys32.swappedAxes(-1, -2)) * scale  // [B, L, H, K]
-        scores = MLX.where(expandedDimensions(valid, axis: 2), scores, MLXArray(-Float.infinity))
-        if blocks * block > K {
-            scores = concatenated(
-                [scores, MLXArray.full([B, L, H, blocks * block - K], values: MLXArray(-Float.infinity))],
-                axis: -1)
-        }
-        let blocked = scores.reshaped(B, L, H, blocks, block)
-        let running = cummax(blocked.max(axis: -1), axis: -1)  // [B, L, H, blocks]
-        let peak = running[.ellipsis, (blocks - 1)...]  // [B, L, H, 1]
-        let weights = exp(blocked - expandedDimensions(running, axis: -1))
-        let rescale = exp(running - peak)
-        let normalizer = (weights.sum(axis: -1) * rescale).sum(axis: -1, keepDims: true)
-            + exp(attnSink.asType(.float32).reshaped(1, 1, H, 1) - peak)
-        let valueWeights = (deepseekV4KernelWeights(weights) * expandedDimensions(rescale, axis: -1))
-            .reshaped(B, L, H, blocks * block)[.ellipsis, ..<K]
-        return (matmul(valueWeights, keys32) / normalizer).transposed(0, 2, 1, 3)
+        deepseekV4GraphAttention(q, keys: keys, valid: valid, sink: attnSink, scale: scale)
     }
 }
 
