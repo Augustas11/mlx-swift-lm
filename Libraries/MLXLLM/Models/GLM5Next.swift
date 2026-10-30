@@ -65,6 +65,10 @@ final class GLM5NextHyperConnection: Module {
     let normEps: Float
     let hcEps: Float
     let sinkhornIterations: Int
+    /// DeepSeek weights the float32 normalized activation before its final cast.
+    let normWeightInFloat32: Bool
+    /// DeepSeek applies inverse RMS after the float32 mixing projection.
+    let normalizeMixAfterProjection: Bool
 
     /// Decode (up to 8 tokens per row, any number of rows) runs the mix GEMV
     /// and the Sinkhorn + collapse + branch RMSNorm as two kernels, as the
@@ -84,11 +88,17 @@ final class GLM5NextHyperConnection: Module {
     }
 
     /// Also DeepSeek-V4's `attn_hc`/`ffn_hc`, which share the math.
-    init(hcMult hc: Int, sinkhornIterations iterations: Int, hcEps eps: Float, normEps: Float, hiddenSize: Int) {
+    init(
+        hcMult hc: Int, sinkhornIterations iterations: Int, hcEps eps: Float, normEps: Float,
+        hiddenSize: Int, normWeightInFloat32: Bool = false,
+        normalizeMixAfterProjection: Bool = false
+    ) {
         self.hcMult = hc
         self.normEps = normEps
         self.hcEps = eps
         self.sinkhornIterations = iterations
+        self.normWeightInFloat32 = normWeightInFloat32
+        self.normalizeMixAfterProjection = normalizeMixAfterProjection
 
         let mix = (2 + hc) * hc
         _fn.wrappedValue = MLXArray.zeros([mix, hc * hiddenSize], dtype: .float32)
@@ -122,8 +132,19 @@ final class GLM5NextHyperConnection: Module {
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
         let (B, L, H, D) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3))
         let y = x.asType(.float32)
-        let z = MLXFast.rmsNorm(y.reshaped(B, L, H * D), weight: MLXArray.mlxNone, eps: normEps)
-        let mixes = matmul(z, fn.T)
+        let flat = y.reshaped(B, L, H * D)
+        let mixes: MLXArray
+        // Preserve the CPU float32 oracle's established projection geometry.
+        // GPU and bf16 DeepSeek inputs use the canonical post-projection scale.
+        if normalizeMixAfterProjection,
+            !(Device.defaultDevice().deviceType == .cpu && x.dtype == .float32)
+        {
+            let inverse = rsqrt(square(flat).mean(axis: -1, keepDims: true) + normEps)
+            mixes = matmul(flat, fn.T) * inverse
+        } else {
+            let z = MLXFast.rmsNorm(flat, weight: MLXArray.mlxNone, eps: normEps)
+            mixes = matmul(z, fn.T)
+        }
         let (pre, post, comb) = sinkhorn(mixes, scale, base)
         let collapsed = (expandedDimensions(pre, axis: -1) * y).sum(axis: 2).asType(x.dtype)
         return (collapsed, post, comb)
@@ -133,10 +154,12 @@ final class GLM5NextHyperConnection: Module {
     /// model's decode kernels for one sequence, the op path otherwise.
     func normalizedBranchInput(_ x: MLXArray, norm: RMSNorm) -> (MLXArray, MLXArray, MLXArray) {
         if fusedDecode, !training, x.dim(1) <= 8, hcMult == 4,
-            let mixes = glm5NextHCMix(x, fn: fn, eps: normEps),
+            let mixes = glm5NextHCMix(
+                x, fn: fn, eps: normEps, normalizeMixAfterProjection: normalizeMixAfterProjection),
             let fused = glm5NextHCNorm(
                 x, mixes: mixes, scale: scale, base: base, normWeight: norm.weight,
-                sinkhornIterations: sinkhornIterations, hcEps: hcEps, normEps: norm.eps)
+                sinkhornIterations: sinkhornIterations, hcEps: hcEps, normEps: norm.eps,
+                normWeightInFloat32: normWeightInFloat32)
         {
             return fused
         }

@@ -55,19 +55,20 @@ final class DeepseekV4DSparkStage: Module {
         config.numHashLayers = 0
         _attn.wrappedValue = DeepseekV4Attention(config, layerIdx: 0)
         _ffn.wrappedValue = DeepseekV4MoE(config, layerIdx: 0)
-        _attnNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        _ffnNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        _attnNorm.wrappedValue = DeepseekV4RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        _ffnNorm.wrappedValue = DeepseekV4RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
         func hc() -> GLM5NextHyperConnection {
             GLM5NextHyperConnection(
                 hcMult: config.hcMult, sinkhornIterations: config.hcSinkhornIters,
-                hcEps: config.hcEps, normEps: config.rmsNormEps, hiddenSize: config.hiddenSize)
+                hcEps: config.hcEps, normEps: config.rmsNormEps, hiddenSize: config.hiddenSize,
+                normWeightInFloat32: true, normalizeMixAfterProjection: true)
         }
         _attnHC.wrappedValue = hc()
         _ffnHC.wrappedValue = hc()
         if stageID == 0 {
             _mainProj.wrappedValue = Linear(
                 config.hiddenSize * config.dsparkTargetLayerIDs.count, config.hiddenSize, bias: false)
-            _mainNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+            _mainNorm.wrappedValue = DeepseekV4RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
         }
         if stageID == stageCount - 1 {
             _markovHead.wrappedValue = DeepseekV4DSparkMarkovHead(
@@ -75,7 +76,7 @@ final class DeepseekV4DSparkStage: Module {
             _confidenceHead.wrappedValue = DeepseekV4DSparkConfidenceHead(
                 hiddenSize: config.hiddenSize, rank: config.dsparkMarkovRank)
             _hcHead.wrappedValue = DeepseekV4HyperHead(config)
-            _norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
+            _norm.wrappedValue = DeepseekV4RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
         }
         super.init()
     }
@@ -102,7 +103,7 @@ final class DeepseekV4DSparkStage: Module {
         let (batch, width) = (x.dim(0), x.dim(1))
         var q = attn.wqB(attn.qNorm(attn.wqA(x)))
             .reshaped(batch, width, attn.heads, attn.headDim)
-        q = MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: attn.normEps).transposed(0, 2, 1, 3)
+        q = deepseekV4QueryHeadNorm(q, eps: attn.normEps).transposed(0, 2, 1, 3)
         let offsets = MLXArray(caches.map { Int32($0.offset) })
         q = attn.rope(q, offsets: offsets)
         var blockKV = attn.kvNorm(attn.wkv(x)).reshaped(batch, 1, width, attn.headDim)
@@ -148,9 +149,9 @@ final class DeepseekV4DSparkStage: Module {
 
     func decodeBatch(_ h: MLXArray, caches: [RotatingKVCache], inputIDs: MLXArray) -> MLXArray {
         let (x, post, comb) = attnHC.normalizedBranchInput(h, norm: attnNorm)
-        let h = glm5NextHCExpand(crossAttention(x, caches: caches), h, post, comb)
+        let h = deepseekV4HCExpand(crossAttention(x, caches: caches), h, post, comb)
         let (ffnInput, ffnPost, ffnComb) = ffnHC.normalizedBranchInput(h, norm: ffnNorm)
-        return glm5NextHCExpand(ffn(ffnInput, inputIDs: inputIDs), h, ffnPost, ffnComb)
+        return deepseekV4HCExpand(ffn(ffnInput, inputIDs: inputIDs), h, ffnPost, ffnComb)
     }
 
 }

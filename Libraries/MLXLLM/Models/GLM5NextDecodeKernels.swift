@@ -783,7 +783,11 @@ private let glm5NextHCMixSource = """
         float v_coeff[4];
         float inter[4];
         for (int tn = 0; tn < 4; tn++) {
-          v_coeff[tn] = static_cast<float>(xr[bn + tn]) * inv;
+          if (NORMALIZE_AFTER_PROJECTION) {
+            v_coeff[tn] = static_cast<float>(xr[bn + tn]);
+          } else {
+            v_coeff[tn] = static_cast<float>(xr[bn + tn]) * inv;
+          }
         }
         for (int tn = 0; tn < 4; tn++) {
           inter[tn] = mrow[bn + tn];
@@ -805,7 +809,7 @@ private let glm5NextHCMixSource = """
         for (int s = 1; s < 8; s++) {
           total += partial[s];
         }
-        mixes[size_t(tok) * MIX + row] = total;
+        mixes[size_t(tok) * MIX + row] = NORMALIZE_AFTER_PROJECTION ? total * inv : total;
       }
     """
 
@@ -924,13 +928,18 @@ private let glm5NextHCNormSource = """
     if (tid < D4) {
       float inv = local_inv_mean[0];
       const device T4* weights = (const device T4*)norm_weight;
-      T4 scaled = T4(float4(rounded) * inv);
       T4 weight = weights[tid];
-      ((device T4*)normalized)[row * D4 + tid] = T4(
-          weight.x * scaled.x,
-          weight.y * scaled.y,
-          weight.z * scaled.z,
-          weight.w * scaled.w);
+      if (NORM_WEIGHT_F32) {
+        ((device T4*)normalized)[row * D4 + tid] =
+            T4(float4(weight) * (float4(rounded) * inv));
+      } else {
+        T4 scaled = T4(float4(rounded) * inv);
+        ((device T4*)normalized)[row * D4 + tid] = T4(
+            weight.x * scaled.x,
+            weight.y * scaled.y,
+            weight.z * scaled.z,
+            weight.w * scaled.w);
+      }
     }
     """
 
@@ -953,7 +962,9 @@ private final class GLM5NextHCKernels: Sendable {
 
 /// `matmul(rmsNorm(x.flatten(-2), eps), fn.T)` for `x: [B, L, HC, D]`:
 /// `[B, L, MIX]` float32, or `nil` outside the replicated configuration.
-func glm5NextHCMix(_ x: MLXArray, fn: MLXArray, eps: Float) -> MLXArray? {
+func glm5NextHCMix(
+    _ x: MLXArray, fn: MLXArray, eps: Float, normalizeMixAfterProjection: Bool = false
+) -> MLXArray? {
     guard x.ndim == 4, fn.ndim == 2, fn.dtype == .float32,
         [.bfloat16, .float16, .float32].contains(x.dtype)
     else { return nil }
@@ -963,7 +974,10 @@ func glm5NextHCMix(_ x: MLXArray, fn: MLXArray, eps: Float) -> MLXArray? {
     guard fn.dim(1) == K, K % 4096 == 0, mix < 4096, K >= 16 * mix else { return nil }
     return GLM5NextHCKernels.shared.mix(
         [x, fn, MLXArray([eps])],
-        template: [("T", x.dtype), ("HCD", K), ("MIX", mix)],
+        template: [
+            ("T", x.dtype), ("HCD", K), ("MIX", mix),
+            ("NORMALIZE_AFTER_PROJECTION", normalizeMixAfterProjection),
+        ],
         grid: (256 * mix, B * L, 1),
         threadGroup: (256, 1, 1),
         outputShapes: [[B, L, mix]],
@@ -975,7 +989,7 @@ func glm5NextHCMix(_ x: MLXArray, fn: MLXArray, eps: Float) -> MLXArray? {
 /// `nil` outside the kernel's configuration.
 func glm5NextHCNorm(
     _ x: MLXArray, mixes: MLXArray, scale: MLXArray, base: MLXArray, normWeight: MLXArray,
-    sinkhornIterations: Int, hcEps: Float, normEps: Float
+    sinkhornIterations: Int, hcEps: Float, normEps: Float, normWeightInFloat32: Bool = false
 ) -> (MLXArray, MLXArray, MLXArray)? {
     guard x.ndim == 4, [.bfloat16, .float16].contains(x.dtype), x.dim(2) == 4,
         x.dim(3) % 4 == 0, x.dim(3) <= 4096, normWeight.dtype == x.dtype,
@@ -991,6 +1005,7 @@ func glm5NextHCNorm(
             ("T", x.dtype), ("HC", hc), ("D", D), ("ITERS", sinkhornIterations),
             ("HC_EPS_INT", Int((Double(hcEps) / 1e-9).rounded())),
             ("NORM_EPS_INT", Int((Double(normEps) / 1e-9).rounded())),
+            ("NORM_WEIGHT_F32", normWeightInFloat32),
         ],
         grid: (B * L * threads, 1, 1),
         threadGroup: (threads, 1, 1),
