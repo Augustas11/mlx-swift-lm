@@ -1957,6 +1957,12 @@ public final class DeepseekV4Model: Module, LLMModel {
         precondition((1 ... 8).contains(M), "DeepSeek V4 packed verify supports 1...8 positions")
         precondition(rowCaches.count == inputs.count)
         precondition(rowCaches.allSatisfy { $0.count == layers.count })
+        // CPU graph reductions can round differently with packed leading
+        // dimensions. Preserve the ordinary one-position graph there; the
+        // qualified GPU verifier below remains packed.
+        if Device.defaultDevice().deviceType == .cpu {
+            return verifyCPUBatchOutput(inputs, rowCaches: rowCaches, emitMTPState: emitMTPState)
+        }
         let working = rowCaches.map { $0.map { $0.copy() } }
         let tokens = MLXArray(inputs.flatMap { $0 }.map(Int32.init)).reshaped(M, 1)
         var h = repeated(
@@ -1993,6 +1999,37 @@ public final class DeepseekV4Model: Module, LLMModel {
             logits: deepseekV4PackedLinearF32(head, norm(collapsed)).reshaped(1, M, vocabularySize),
             captured: captured, emitMTPState: emitMTPState)
         return (result, prefixes, offsets)
+    }
+
+    private func verifyCPUBatchOutput(
+        _ inputs: [[Int]], rowCaches: [[KVCache]], emitMTPState: Bool
+    ) -> (output: LMOutput, cachePrefixes: [[[KVCache]]], rowOffsets: [Int]) {
+        var logits = [MLXArray]()
+        var hidden = [MLXArray]()
+        var prefixes = [[[KVCache]]]()
+        var offsets = [Int]()
+        for row in inputs.indices {
+            offsets.append(logits.count)
+            let working = rowCaches[row].map { $0.copy() }
+            var rowPrefixes = [[KVCache]]()
+            for token in inputs[row] {
+                let result = forward(
+                    MLXArray([Int32(token)]).reshaped(1, 1), cache: working,
+                    emitMTPState: emitMTPState)
+                logits.append(result.logits)
+                if let captured = result.state?[mtpLastHiddenStatesKey] {
+                    hidden.append(captured)
+                }
+                rowPrefixes.append(working.map { $0.copy() })
+            }
+            prefixes.append(rowPrefixes)
+        }
+        var state: LMOutput.State?
+        if !hidden.isEmpty {
+            state = LMOutput.State()
+            state?[mtpLastHiddenStatesKey] = concatenated(hidden, axis: 1)
+        }
+        return (LMOutput(logits: concatenated(logits, axis: 1), state: state), prefixes, offsets)
     }
 
     /// Float32 logits (`ParallelHead`, `inference/model.py:728-735`:
