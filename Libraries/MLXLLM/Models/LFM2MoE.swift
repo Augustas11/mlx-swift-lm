@@ -12,6 +12,12 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// Preserve mlx-lm's per-row prefill reduction order without changing the
+// batch-invariant single-token decode route or other model families.
+private func lfm2MoEReferenceLinear(_ input: Int, _ output: Int, bias: Bool) -> Linear {
+    Linear(input, output, bias: bias, referencePrefill: true)
+}
+
 public struct LFM2MoEConfiguration: Codable, Sendable {
     public let modelType: String
     public let vocabularySize: Int
@@ -127,10 +133,10 @@ class LFM2MoEAttention: Module {
         self.scale = pow(Float(headDim), -0.5)
 
         let dim = args.hiddenSize
-        _qProj.wrappedValue = Linear(dim, args.attentionHeads * headDim, bias: false)
-        _kProj.wrappedValue = Linear(dim, args.kvHeads * headDim, bias: false)
-        _vProj.wrappedValue = Linear(dim, args.kvHeads * headDim, bias: false)
-        _outProj.wrappedValue = Linear(args.attentionHeads * headDim, dim, bias: false)
+        _qProj.wrappedValue = lfm2MoEReferenceLinear(dim, args.attentionHeads * headDim, bias: false)
+        _kProj.wrappedValue = lfm2MoEReferenceLinear(dim, args.kvHeads * headDim, bias: false)
+        _vProj.wrappedValue = lfm2MoEReferenceLinear(dim, args.kvHeads * headDim, bias: false)
+        _outProj.wrappedValue = lfm2MoEReferenceLinear(args.attentionHeads * headDim, dim, bias: false)
 
         _qLayerNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.normEps)
         _kLayerNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: args.normEps)
@@ -201,8 +207,8 @@ class LFM2MoEShortConv: Module {
             bias: bias
         )
 
-        _inProj.wrappedValue = Linear(args.hiddenSize, 3 * args.hiddenSize, bias: bias)
-        _outProj.wrappedValue = Linear(args.hiddenSize, args.hiddenSize, bias: bias)
+        _inProj.wrappedValue = lfm2MoEReferenceLinear(args.hiddenSize, 3 * args.hiddenSize, bias: bias)
+        _outProj.wrappedValue = lfm2MoEReferenceLinear(args.hiddenSize, args.hiddenSize, bias: bias)
     }
 
     func callAsFunction(
@@ -250,9 +256,9 @@ class LFM2MoEMLP: Module, UnaryLayer {
         let hidden = args.hiddenSize
         let inter = intermediateSize ?? args.intermediateSize
 
-        _gateProj.wrappedValue = Linear(hidden, inter, bias: false)
-        _upProj.wrappedValue = Linear(hidden, inter, bias: false)
-        _downProj.wrappedValue = Linear(inter, hidden, bias: false)
+        _gateProj.wrappedValue = lfm2MoEReferenceLinear(hidden, inter, bias: false)
+        _upProj.wrappedValue = lfm2MoEReferenceLinear(hidden, inter, bias: false)
+        _downProj.wrappedValue = lfm2MoEReferenceLinear(inter, hidden, bias: false)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
@@ -278,7 +284,7 @@ class Lfm2MoeSparseMoeBlock: Module, UnaryLayer {
         self.normTopKProb = args.normTopkProb
         self.useExpertBias = args.useExpertBias
 
-        _gate.wrappedValue = Linear(args.hiddenSize, numExperts, bias: false)
+        _gate.wrappedValue = lfm2MoEReferenceLinear(args.hiddenSize, numExperts, bias: false)
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: args.hiddenSize,
             hiddenDims: args.moeIntermediateSize,
