@@ -204,6 +204,21 @@ public protocol KVCacheAttentionProtocol: KVCache {
     ) -> MLXArray
 }
 
+/// A ``KVCacheAttentionProtocol`` cache that also attends with per-head
+/// attention sinks (GPT-OSS). A batched cache whose rows sit at different key
+/// offsets attends each row over its own keys; the model must not call SDPA
+/// itself over the padded batch.
+public protocol KVCacheSinkAttentionProtocol: KVCacheAttentionProtocol {
+    func updateAndAttend(
+        queries: MLXArray,
+        keys: MLXArray,
+        values: MLXArray,
+        scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        sinks: MLXArray
+    ) -> MLXArray
+}
+
 /// Base cache implementation providing default behaviors
 open class BaseKVCache: KVCache {
     public var offset: Int = 0
