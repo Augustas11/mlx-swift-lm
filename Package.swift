@@ -66,7 +66,7 @@ let package = Package(
         // continuously batched row matches its serial result exactly, and
         // which erases a freed compiled function from every thread's cache,
         // and which keeps every internal op on the caller's stream.
-        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "d8045e6f22f5b5a32a146578820192a7969c7de6"),
+        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "c774cb0934c7503bc3fe1c3d1afbe44c728e8891"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
