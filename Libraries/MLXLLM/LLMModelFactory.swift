@@ -746,6 +746,8 @@ public final class LLMModelFactory: GenericModelFactory {
             perLayerQuantization: baseConfig.perLayerQuantization,
             weightFileSelection: configuration.weightFileSelection)
 
+        (model as? DeepseekV4Model)?.prepareInferenceWeights()
+
         let tokenizer = try await tokenizerTask
 
         let messageGenerator: any MessageGenerator
