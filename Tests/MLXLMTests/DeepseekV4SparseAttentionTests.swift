@@ -241,6 +241,14 @@ final class DeepseekV4SparseAttentionTests: XCTestCase {
         let expected = matmul(x, weight.swappedAxes(-1, -2))
         let actual = deepseekV4MultiLinear(projection, x)
         XCTAssertEqual(actual.asArray(Float.self), expected.asArray(Float.self))
+        let cached = DeepseekV4CachedMultiLinear(projection)
+        for dtype in [DType.bfloat16, .float32] {
+            for rows in [1, 4] {
+                let input = broadcast(x.asType(dtype), to: [rows, 8, 1, 4096])
+                XCTAssertEqual(deepseekV4MultiLinear(cached, input).asArray(Float.self),
+                    deepseekV4MultiLinear(projection, input).asArray(Float.self))
+            }
+        }
     }
 
     /// A bounded key workspace may leave a <=8-query tail in a long prefill.

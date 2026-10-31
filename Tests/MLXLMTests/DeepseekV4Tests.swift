@@ -311,7 +311,27 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
-    func testPrepareReturnsFullContextLogitsAndCache() throws {
+    func testInferenceWeightPreparationPreservesLoadedModel() throws {
+        try Device.withDefaultDevice(.gpu) {
+            let model = try loadTiny(indexBlock: 0, indexKeep: 0)
+            let attentions = model.layers.map { $0.attn }
+            let count = attentions.filter {
+                ($0.woA as? QuantizedMultiLinear)?.mode == .mxfp8
+            }.count
+            XCTAssertGreaterThan(count, 0)
+            let tokens = MLXArray([Int32(1), 2, 3, 4, 5]).reshaped(1, 5)
+            let expected = model(tokens, cache: try model.newCache(parameters: nil)).asArray(Float.self)
+            model.prepareInferenceWeights()
+            XCTAssertEqual(attentions.filter { $0.woA is DeepseekV4CachedMultiLinear }.count, count)
+            XCTAssertEqual(model(tokens, cache: try model.newCache(parameters: nil)).asArray(Float.self), expected)
+            // The load hook is idempotent and retains registered child modules.
+            model.prepareInferenceWeights()
+            XCTAssertEqual(attentions.filter { $0.woA is DeepseekV4CachedMultiLinear }.count, count)
+            XCTAssertEqual(model(tokens, cache: try model.newCache(parameters: nil)).asArray(Float.self), expected)
+        }
+    }
+
+    func testPrepareReturnsLastLogitsAndFullContextCache() throws {
         try Device.withDefaultDevice(.cpu) {
             let model = try loadTiny(indexBlock: 0, indexKeep: 0, float32: true)
             let tokens = MLXArray((0 ..< 96).map { Int32($0 % model.vocabularySize) })
@@ -324,8 +344,8 @@ final class DeepseekV4Tests: XCTestCase {
             guard case .logits(let output) = result else {
                 return XCTFail("The final complete reference chunk must return logits")
             }
-            XCTAssertEqual(output.logits.shape, [1, 96, model.vocabularySize])
-            XCTAssertEqual(output.logits.asArray(Float.self), expected.asArray(Float.self))
+            XCTAssertEqual(output.logits.shape, [1, 1, model.vocabularySize])
+            XCTAssertEqual(output.logits.asArray(Float.self), expected[0..., (-1)..., 0...].asArray(Float.self))
             for (actual, expected) in zip(preparedCache, referenceCache) {
                 XCTAssertEqual(actual.offset, expected.offset)
                 for (a, b) in zip(actual.state, expected.state) {
