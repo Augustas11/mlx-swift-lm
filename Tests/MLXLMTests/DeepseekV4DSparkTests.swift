@@ -33,6 +33,24 @@ final class DeepseekV4DSparkTests: XCTestCase {
         }
     }
 
+    func testInferenceWeightCachePreservesDSparkQuantizedArithmetic() throws {
+        let target = DeepseekV4Model(try configuration())
+        for attention in target.layers.map({ $0.attn }) + target.mtp.map({ $0.attn }) {
+            let dense = try XCTUnwrap(attention.woA as? MultiLinear)
+            let quantized = QuantizedMultiLinear(
+                weight: dense.weight.asType(.bfloat16), groupSize: 32, bits: 8, mode: .mxfp8)
+            attention.update(modules: ModuleChildren.unflattened([("wo_a", quantized)]))
+        }
+        let draftProjections = target.mtp.map { $0.attn.woA }
+        XCTAssertEqual(draftProjections.count, 3)
+        target.prepareInferenceWeights()
+        XCTAssertTrue(target.layers.allSatisfy { $0.attn.woA is DeepseekV4CachedMultiLinear })
+        for (stage, original) in zip(target.mtp, draftProjections) {
+            XCTAssertTrue(stage.attn.woA === original)
+            XCTAssertTrue(stage.attn.woA is QuantizedMultiLinear)
+        }
+    }
+
     func testPoolRetainsEveryExactPrefixAcrossBothCompressionBoundaries() throws {
         try Device.withDefaultDevice(.cpu) {
             let config = try configuration()

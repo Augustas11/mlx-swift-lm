@@ -330,8 +330,29 @@ private func deepseekV4MaskScores(_ scores: MLXArray, _ mask: MLXArray?) -> MLXA
 
 /// The reference rounds MXFP8 group weights to bf16 before its dense product.
 /// Quantized GEMV has a different accumulation order that can cross a bf16 tie.
+/// Inference-only bf16 materialization of the reference MXFP8 group weight.
+/// A distinct module preserves the original packed float32 dispatch predicates.
+final class DeepseekV4CachedMultiLinear: Module {
+    @ParameterInfo(key: "weight") var weight: MLXArray
+
+    init(_ projection: QuantizedMultiLinear) {
+        _weight.wrappedValue = dequantized(
+            projection.weight, scales: projection.scales, biases: projection.biases,
+            groupSize: projection.groupSize, bits: projection.bits, mode: projection.mode
+        ).asType(.bfloat16)
+        super.init()
+        eval(weight)
+        freeze()
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        matmul(x, weight.asType(x.dtype).swappedAxes(-1, -2))
+    }
+}
+
 func deepseekV4MultiLinear(_ module: Module, _ x: MLXArray) -> MLXArray {
     switch module {
+    case let cached as DeepseekV4CachedMultiLinear: return cached(x)
     case let quantized as QuantizedMultiLinear:
         if quantized.mode == .mxfp8 {
             let weight = dequantized(
@@ -1822,6 +1843,21 @@ public final class DeepseekV4Model: Module, LLMModel {
         super.init()
     }
 
+    /// Run once after checkpoint update. Keep target attention's exact bf16
+    /// dequantization resident. DSpark uses quantized MM directly and retains
+    /// its original projection module and arithmetic.
+    func prepareInferenceWeights() {
+        for attention in layers.map({ $0.attn }) {
+            if let projection = attention.woA as? QuantizedMultiLinear,
+                projection.mode == .mxfp8 {
+                attention.update(modules: ModuleChildren.unflattened([
+                    ("wo_a", DeepseekV4CachedMultiLinear(projection))
+                ]))
+            }
+        }
+        Memory.clearCache()
+    }
+
     /// Logits `[B, L, vocab]` for token ids `[B, L]`. Without a cache the
     /// call runs on fresh caches (the reference's no-cache pool path skips
     /// the pool's causal mask, so it is not reproduced).
@@ -1830,7 +1866,7 @@ public final class DeepseekV4Model: Module, LLMModel {
     }
 
     private func forward(
-        _ inputs: MLXArray, cache: [KVCache]?, emitMTPState: Bool
+        _ inputs: MLXArray, cache: [KVCache]?, emitMTPState: Bool, lastLogitsOnly: Bool = false
     ) -> LMOutput {
         let caches = try! cache ?? newCache(parameters: nil)
         let layerCaches = zip(caches, layers).map {
@@ -1857,13 +1893,28 @@ public final class DeepseekV4Model: Module, LLMModel {
                 captured[index] = h.mean(axis: 2)
             }
         }
-        return output(logits: logits(norm(hcHead(h))), captured: captured, emitMTPState: emitMTPState)
+        // CPU GEMM and GEMV have different reduction orders. Preserve its
+        // reference logits; the serving memory reduction targets GPU prefill.
+        let trimHead = lastLogitsOnly && Device.defaultDevice().deviceType == .gpu
+        let headInput = trimHead ? h[0..., (-1)..., 0..., 0...] : h
+        let projected = logits(norm(hcHead(headInput)))
+        let selected = lastLogitsOnly && !trimHead ? projected[0..., (-1)..., 0...] : projected
+        return output(logits: selected, captured: captured, emitMTPState: emitMTPState)
     }
 
     public func callAsFunction(
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
         forward(input.tokens, cache: cache, emitMTPState: state?[mtpEmitFlagKey] ?? false)
+    }
+
+    /// Serving prefill needs only the final vocabulary row. Target taps retain
+    /// every prompt position for DSpark; teacher-forced calls retain full logits.
+    public func prefillLastOutput(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        forward(input.tokens, cache: cache, emitMTPState: state?[mtpEmitFlagKey] ?? false,
+                lastLogitsOnly: true)
     }
 
     private func output(
@@ -2039,16 +2090,17 @@ public final class DeepseekV4Model: Module, LLMModel {
             try Task.checkCancellation()
             let end = processed + Self.prefillStepSize
             autoreleasepool {
-                _ = self(y[.newAxis, processed ..< end], cache: cache, state: state)
+                _ = prefillLastOutput(y[.newAxis, processed ..< end], cache: cache, state: state)
                 eval(cache)
             }
             processed = end
             prefill.progress?(processed, total)
         }
         try Task.checkCancellation()
-        let result = self(y[.newAxis, processed...], cache: cache, state: state)
+        let result = prefillLastOutput(y[.newAxis, processed...], cache: cache, state: state)
         eval(result.logits)
         eval(cache)
+        Memory.clearCache()
         prefill.progress?(total, total)
         return .logits(result)
     }
