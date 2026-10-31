@@ -276,6 +276,15 @@ class AttentionBlock: Module {
         q = applyRotaryPosition(rope, to: q, offset: offset)
         k = applyRotaryPosition(rope, to: k, offset: offset)
 
+        if let sinkCache = cache as? KVCacheSinkAttentionProtocol {
+            let vHat = sinkCache.updateAndAttend(
+                queries: q, keys: k, values: v,
+                scale: smScale,
+                mask: mask,
+                sinks: sinks)
+            return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
+        }
+
         if let cache {
             (k, v) = cache.update(keys: k, values: v)
         }
