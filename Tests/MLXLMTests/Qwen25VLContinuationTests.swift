@@ -187,6 +187,42 @@ final class Qwen25VLContinuationTests: XCTestCase {
         XCTAssertTrue(allClose(tokenDecode, textDecode, atol: 1e-5).item(Bool.self))
     }
 
+    /// macprovider #2201 audit: after an image prefill, text positions continue at
+    /// `offset + rope delta`. A token-only step must match the state-carrying step
+    /// instead of silently using cache-offset positions.
+    func testQwen2VLTokenOnlyStepAfterImagePrefillMatchesStatePath() throws {
+        let model = try makeTinyQwen2VL()
+        let tokens = concatenated(
+            [continuation.textTokens(5), continuation.imageRun(), continuation.textTokens(6, seed: 3)],
+            axis: 1)
+        let image = continuation.image()
+        let next = MLXArray([Int32(42), Int32(43)]).reshaped(1, 2)
+
+        func imagePrefill() throws -> ([any KVCache], LMOutput.State?) {
+            let cache = try model.newCache(parameters: nil)
+            let (_, state) = try continuation.lastLogits(
+                model.prepare(
+                    LMInput(text: .init(tokens: tokens), image: image),
+                    cache: cache, state: nil, prefill: PrefillParameters()))
+            return (cache, state)
+        }
+
+        let (stateCache, state) = try imagePrefill()
+        let viaState = model(LMInput.Text(tokens: next), cache: stateCache, state: state).logits
+
+        let (tokenCache, _) = try imagePrefill()
+        let viaTokens = model(next, cache: tokenCache)
+
+        let (offsetCache, _) = try imagePrefill()
+        let offsetOnly = model(LMInput.Text(tokens: next), cache: offsetCache, state: nil).logits
+
+        eval(viaState, viaTokens, offsetOnly)
+        XCTAssertGreaterThan(
+            continuation.maxAbsDiff(viaState, offsetOnly), 1e-3,
+            "fixture must make the rope delta matter")
+        XCTAssertLessThan(continuation.maxAbsDiff(viaState, viaTokens), 1e-4)
+    }
+
     func testQwen2VLWindowedImagePrefillMatchesSingleShot() throws {
         try continuation.assertWindowedImagePrefill(makeTinyQwen2VL())
     }

@@ -962,12 +962,42 @@ public struct Qwen2VLProcessor: UserInputProcessor {
 /// Qwen2VL VLM
 ///
 /// This is typically created by ``VLMModelFactory``.
+/// The M-RoPE delta of each cache that holds vision tokens, keyed weakly by the
+/// cache's first layer object (macprovider #2201 audit). After an image prefill,
+/// text positions continue at `offset + delta`, not at the cache offset, so the
+/// token-only forward must apply the delta that the prefill produced. Entries
+/// die with their cache. A copy of a cache is a new object and carries no entry:
+/// callers that copy a vision cache must thread the prepare state instead.
+private final class Qwen2VLRopeDeltaRegistry: @unchecked Sendable {
+    private struct Entry {
+        weak var cache: AnyObject?
+        let delta: MLXArray
+    }
+    private let lock = NSLock()
+    private var entries: [Entry] = []
+
+    func record(_ delta: MLXArray?, for cache: [any KVCache]) {
+        guard let first = cache.first.map({ $0 as AnyObject }) else { return }
+        let nonzero = delta.map { any($0 .!= 0).item(Bool.self) } ?? false
+        lock.lock(); defer { lock.unlock() }
+        entries.removeAll { $0.cache == nil || $0.cache === first }
+        if nonzero, let delta { entries.append(Entry(cache: first, delta: delta)) }
+    }
+
+    func delta(for cache: [any KVCache]?) -> MLXArray? {
+        guard let first = cache?.first.map({ $0 as AnyObject }) else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return entries.first { $0.cache === first }?.delta
+    }
+}
+
 public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
 
     @ModuleInfo(key: "vision_tower") private var visionModel: Vision.VisionModel
     @ModuleInfo(key: "language_model") private var languageModel: Language.LanguageModel
 
     public let config: Qwen2VLConfiguration
+    private let ropeDeltaRegistry = Qwen2VLRopeDeltaRegistry()
 
     public var vocabularySize: Int { config.baseConfiguration.vocabularySize }
     public var kvHeads: [Int] { languageModel.kvHeads }
@@ -1057,6 +1087,8 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
         let result = languageModel(
             embeds == nil ? inputIds2D : nil, cache: cache, state: state, inputEmbedding: embeds)
 
+        ropeDeltaRegistry.record(result.state?[ropeDeltasKey], for: cache)
+
         let total = inputIds2D.dim(-1)
         prefill.progress?(total, total)
         return .logits(result)
@@ -1114,6 +1146,7 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
 
         var resumeState = LMOutput.State()
         resumeState[ropeDeltasKey] = ropeDeltas - MLXArray(Int32(cacheOffset))
+        ropeDeltaRegistry.record(resumeState[ropeDeltasKey], for: cache)
 
         return .logits(LMOutput(logits: lastLogits, state: resumeState))
     }
@@ -1125,13 +1158,19 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
         languageModel(input.tokens, cache: cache, state: state)
     }
 
-    /// Token-only forward for text with no image or video in the cache. With no
-    /// vision tokens the three M-RoPE sections share one position, so the
-    /// language model's sequential RoPE at the cache offset is exact. Without
-    /// this the `LanguageModel` default traps, and any caller that drives the
-    /// model with token ids (prefill chunks, decode, cache probes) crashes.
+    /// Token-only forward. Without it the `LanguageModel` default traps, and any
+    /// caller that drives the model with token ids crashes. With no vision tokens
+    /// in the cache the three M-RoPE sections share one position, so sequential
+    /// RoPE at the cache offset is exact. After a vision prefill through
+    /// `prepare`, the delta it produced is applied, so positions match the
+    /// state-carrying path (`offset + rope delta`, as mlx-vlm's `rope_deltas`).
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
-        languageModel(inputs, cache: cache, state: nil).logits
+        var state: LMOutput.State?
+        if let delta = ropeDeltaRegistry.delta(for: cache) {
+            state = LMOutput.State()
+            state?[ropeDeltasKey] = delta
+        }
+        return languageModel(inputs, cache: cache, state: state).logits
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
