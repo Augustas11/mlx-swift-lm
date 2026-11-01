@@ -164,6 +164,29 @@ final class Qwen25VLContinuationTests: XCTestCase {
         try continuation.assertWindowedTextPrefill(makeTinyQwen2VL())
     }
 
+    /// macprovider #2201: a token-only forward (text prompt, no image) trapped in
+    /// the `LanguageModel` default. It must run and match the text-input forward
+    /// for a prefill and the decode step after it.
+    func testQwen2VLTokenOnlyForwardMatchesTextInputForward() throws {
+        let model = try makeTinyQwen2VL()
+        let prompt = MLXArray((1 ... 9).map(Int32.init)).reshaped(1, 9)
+        let next = MLXArray([Int32(42)]).reshaped(1, 1)
+
+        let tokenCache = try model.newCache(parameters: nil)
+        let tokenPrefill = model(prompt, cache: tokenCache)
+        let tokenDecode = model(next, cache: tokenCache)
+
+        let textCache = try model.newCache(parameters: nil)
+        let textPrefill = model(LMInput.Text(tokens: prompt), cache: textCache, state: nil).logits
+        let textDecode = model(LMInput.Text(tokens: next), cache: textCache, state: nil).logits
+
+        eval(tokenPrefill, tokenDecode, textPrefill, textDecode)
+        XCTAssertEqual(tokenPrefill.shape, [1, 9, 512])
+        XCTAssertEqual(tokenCache.first?.offset, 10)
+        XCTAssertTrue(allClose(tokenPrefill, textPrefill, atol: 1e-5).item(Bool.self))
+        XCTAssertTrue(allClose(tokenDecode, textDecode, atol: 1e-5).item(Bool.self))
+    }
+
     func testQwen2VLWindowedImagePrefillMatchesSingleShot() throws {
         try continuation.assertWindowedImagePrefill(makeTinyQwen2VL())
     }

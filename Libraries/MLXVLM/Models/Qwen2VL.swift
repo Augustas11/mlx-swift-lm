@@ -1125,6 +1125,15 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
         languageModel(input.tokens, cache: cache, state: state)
     }
 
+    /// Token-only forward for text with no image or video in the cache. With no
+    /// vision tokens the three M-RoPE sections share one position, so the
+    /// language model's sequential RoPE at the cache offset is exact. Without
+    /// this the `LanguageModel` default traps, and any caller that drives the
+    /// model with token ids (prefill chunks, decode, cache probes) crashes.
+    public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
+        languageModel(inputs, cache: cache, state: nil).logits
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         let weights = filterLMHeadWeights(
             from: weights,
