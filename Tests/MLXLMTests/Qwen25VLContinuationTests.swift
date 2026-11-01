@@ -187,9 +187,10 @@ final class Qwen25VLContinuationTests: XCTestCase {
         XCTAssertTrue(allClose(tokenDecode, textDecode, atol: 1e-5).item(Bool.self))
     }
 
-    /// macprovider #2201 audit: after an image prefill, text positions continue at
-    /// `offset + rope delta`. A token-only step must match the state-carrying step
-    /// instead of silently using cache-offset positions.
+    /// macprovider #2201 audit (code and architecture MEDIUMs): after an image
+    /// prefill, text positions continue at `offset + rope delta`. A token-only
+    /// step must match the state-carrying step, and refuse when the cache's
+    /// position state is unknown, instead of silently using cache-offset positions.
     func testQwen2VLTokenOnlyStepAfterImagePrefillMatchesStatePath() throws {
         let model = try makeTinyQwen2VL()
         let tokens = concatenated(
@@ -221,6 +222,14 @@ final class Qwen25VLContinuationTests: XCTestCase {
             continuation.maxAbsDiff(viaState, offsetOnly), 1e-3,
             "fixture must make the rope delta matter")
         XCTAssertLessThan(continuation.maxAbsDiff(viaState, viaTokens), 1e-4)
+
+        // A cache this model did not prepare (a copy of a vision cache) has an
+        // unknown M-RoPE delta: the token-only path refuses instead of guessing.
+        let (visionCache, _) = try imagePrefill()
+        let copied = visionCache.map { $0.copy() }
+        XCTAssertThrowsError(try model.tokenOnlyPositionState(cache: copied))
+        // A fresh cache is plain text and stays allowed.
+        XCTAssertNil(try model.tokenOnlyPositionState(cache: try model.newCache(parameters: nil)))
     }
 
     func testQwen2VLWindowedImagePrefillMatchesSingleShot() throws {

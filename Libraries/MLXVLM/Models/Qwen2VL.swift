@@ -962,32 +962,45 @@ public struct Qwen2VLProcessor: UserInputProcessor {
 /// Qwen2VL VLM
 ///
 /// This is typically created by ``VLMModelFactory``.
-/// The M-RoPE delta of each cache that holds vision tokens, keyed weakly by the
-/// cache's first layer object (macprovider #2201 audit). After an image prefill,
-/// text positions continue at `offset + delta`, not at the cache offset, so the
-/// token-only forward must apply the delta that the prefill produced. Entries
-/// die with their cache. A copy of a cache is a new object and carries no entry:
-/// callers that copy a vision cache must thread the prepare state instead.
+/// Which M-RoPE position state each cache needs for a token-only forward
+/// (macprovider #2201 audit). After an image prefill, text positions continue at
+/// `offset + rope delta`, not at the cache offset. `prepare` records the delta it
+/// returns for its cache (no delta: plain text), keyed weakly by the cache's
+/// first layer object, so entries die with their cache. A cache this model never
+/// saw (for example a caller's copy) is unknown: it is plain text only while
+/// this model has never prefilled vision.
 private final class Qwen2VLRopeDeltaRegistry: @unchecked Sendable {
+    enum Lookup {
+        case known(MLXArray?)
+        case unknown
+    }
+
     private struct Entry {
         weak var cache: AnyObject?
-        let delta: MLXArray
+        let delta: MLXArray?
     }
     private let lock = NSLock()
     private var entries: [Entry] = []
+    private var sawVision = false
 
-    func record(_ delta: MLXArray?, for cache: [any KVCache]) {
-        guard let first = cache.first.map({ $0 as AnyObject }) else { return }
+    private static func key(_ cache: [any KVCache]?) -> AnyObject? {
+        cache?.first.map { $0 as AnyObject }
+    }
+
+    func record(_ delta: MLXArray?, for cache: [any KVCache]?) {
+        guard let first = Self.key(cache) else { return }
         let nonzero = delta.map { any($0 .!= 0).item(Bool.self) } ?? false
         lock.lock(); defer { lock.unlock() }
         entries.removeAll { $0.cache == nil || $0.cache === first }
-        if nonzero, let delta { entries.append(Entry(cache: first, delta: delta)) }
+        entries.append(Entry(cache: first, delta: nonzero ? delta : nil))
+        if nonzero { sawVision = true }
     }
 
-    func delta(for cache: [any KVCache]?) -> MLXArray? {
-        guard let first = cache?.first.map({ $0 as AnyObject }) else { return nil }
+    func lookup(_ cache: [any KVCache]?) -> Lookup {
+        guard let first = Self.key(cache) else { return .known(nil) }
         lock.lock(); defer { lock.unlock() }
-        return entries.first { $0.cache === first }?.delta
+        if let entry = entries.first(where: { $0.cache === first }) { return .known(entry.delta) }
+        return sawVision ? .unknown : .known(nil)
     }
 }
 
@@ -1158,19 +1171,49 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
         languageModel(input.tokens, cache: cache, state: state)
     }
 
-    /// Token-only forward. Without it the `LanguageModel` default traps, and any
-    /// caller that drives the model with token ids crashes. With no vision tokens
-    /// in the cache the three M-RoPE sections share one position, so sequential
-    /// RoPE at the cache offset is exact. After a vision prefill through
-    /// `prepare`, the delta it produced is applied, so positions match the
-    /// state-carrying path (`offset + rope delta`, as mlx-vlm's `rope_deltas`).
+    /// Token-only forward (the `LanguageModel` default traps). Positions follow
+    /// the same state as the `LMInput.Text` path, which callers holding a
+    /// prepare state should use: with no vision in the cache, sequential RoPE at
+    /// the cache offset is exact; after a vision prefill through `prepare`, the
+    /// recorded M-RoPE delta is applied (mlx-vlm `rope_deltas`). A non-empty
+    /// cache this model did not prepare, once it has prefilled vision, may hold
+    /// vision tokens with an unknown delta, so the call refuses rather than
+    /// return logits at the wrong positions.
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
-        var state: LMOutput.State?
-        if let delta = ropeDeltaRegistry.delta(for: cache) {
-            state = LMOutput.State()
-            state?[ropeDeltasKey] = delta
+        let state: LMOutput.State?
+        do {
+            state = try tokenOnlyPositionState(cache: cache)
+        } catch {
+            preconditionFailure("\(error)")
         }
         return languageModel(inputs, cache: cache, state: state).logits
+    }
+
+    struct UnknownPositionStateError: Error, CustomStringConvertible {
+        var description: String {
+            "Qwen2VL token-only forward on a non-empty cache with unknown M-RoPE state; "
+                + "pass the prepare state through callAsFunction(_:cache:state:)"
+        }
+    }
+
+    /// The position state a token-only forward on `cache` needs, or a refusal.
+    func tokenOnlyPositionState(cache: [any KVCache]?) throws -> LMOutput.State? {
+        switch ropeDeltaRegistry.lookup(cache) {
+        case .known(let delta?):
+            var state = LMOutput.State()
+            state[ropeDeltasKey] = delta
+            return state
+        case .known(nil):
+            // Plain text: registered by prepare, or any cache before this model
+            // has prefilled vision. Record it so a later vision prefill elsewhere
+            // does not make it unknown.
+            ropeDeltaRegistry.record(nil, for: cache)
+            return nil
+        case .unknown:
+            guard cache?.first?.offset ?? 0 == 0 else { throw UnknownPositionStateError() }
+            ropeDeltaRegistry.record(nil, for: cache)
+            return nil
+        }
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
