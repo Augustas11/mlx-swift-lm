@@ -1240,13 +1240,14 @@ private let glm5NextHCPreSource = """
         }
       }
     #if DEFERRED
-      if (tile == 0) {
-        for (int c = 0; c < CH; c++) {
-          for (int i = 0; i < 4; i++) {
-            h_out_t[c * 4096 + int(lid) * 4 + i] = hv[c][i];
-          }
+      // Every tile stores h (the same values) and its gemv reads them back
+      // instead of recomputing the expand for each element it multiplies.
+      for (int c = 0; c < CH; c++) {
+        for (int i = 0; i < 4; i++) {
+          h_out_t[c * 4096 + int(lid) * 4 + i] = hv[c][i];
         }
       }
+      threadgroup_barrier(mem_flags::mem_device);
     #endif
 
       // --- hc_mix: rms_looped (lsize = 1024, N_READS = 4) ---
@@ -1291,7 +1292,11 @@ private let glm5NextHCPreSource = """
           float v_coeff[4];
           float inter[4];
           for (int tn = 0; tn < 4; tn++) {
+    #if DEFERRED
+            v_coeff[tn] = static_cast<float>(h_out_t[bn + tn]) * inv;
+    #else
             v_coeff[tn] = static_cast<float>(HVAL(bn + tn)) * inv;
+    #endif
           }
           for (int tn = 0; tn < 4; tn++) {
             inter[tn] = mrow[bn + tn];
