@@ -15,6 +15,21 @@ import XCTest
 
 @testable import MLXVLM
 
+private final class LockedCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
+}
+
 final class Qwen25VLContinuationTests: XCTestCase {
 
     // MARK: - Tiny models
@@ -194,7 +209,10 @@ final class Qwen25VLContinuationTests: XCTestCase {
     func testQwen2VLTokenOnlyStepAfterImagePrefillMatchesStatePath() throws {
         let model = try makeTinyQwen2VL()
         let tokens = concatenated(
-            [continuation.textTokens(5), continuation.imageRun(), continuation.textTokens(6, seed: 3)],
+            [
+                continuation.textTokens(5), continuation.imageRun(),
+                continuation.textTokens(6, seed: 3),
+            ],
             axis: 1)
         let image = continuation.image()
         let next = MLXArray([Int32(42), Int32(43)]).reshaped(1, 2)
@@ -228,6 +246,9 @@ final class Qwen25VLContinuationTests: XCTestCase {
         let (visionCache, _) = try imagePrefill()
         let copied = visionCache.map { $0.copy() }
         XCTAssertThrowsError(try model.tokenOnlyPositionState(cache: copied))
+        let refused = model(next, cache: copied)
+        eval(refused)
+        XCTAssertTrue(all(isNaN(refused)).item(Bool.self))
         // A fresh cache is plain text and stays allowed.
         XCTAssertNil(try model.tokenOnlyPositionState(cache: try model.newCache(parameters: nil)))
     }
@@ -241,7 +262,10 @@ final class Qwen25VLContinuationTests: XCTestCase {
         let model = try makeTinyQwen2VL()
         // 5 text + vision start + 4 image tokens + 6 text: the image span ends at 10.
         let tokens = concatenated(
-            [continuation.textTokens(5), continuation.imageRun(), continuation.textTokens(6, seed: 3)],
+            [
+                continuation.textTokens(5), continuation.imageRun(),
+                continuation.textTokens(6, seed: 3),
+            ],
             axis: 1)
         let image = continuation.image()
         let next = MLXArray([Int32(42), Int32(43)]).reshaped(1, 2)
@@ -283,12 +307,42 @@ final class Qwen25VLContinuationTests: XCTestCase {
         }
         XCTAssertEqual(intoImage.first?.offset, 9, "a refused forward must not touch the cache")
 
+        // The protocol overload refuses without stopping the process: all-NaN
+        // logits of the right shape, cache untouched.
+        let refused = model(next, cache: intoImage)
+        eval(refused)
+        XCTAssertEqual(refused.shape, [1, 2, 512])
+        XCTAssertTrue(all(isNaN(refused)).item(Bool.self))
+        XCTAssertEqual(intoImage.first?.offset, 9)
+
         // Regrowing past the span through the state path leaves it unknown.
         let (regrown, _) = try imagePrefill()
         trim(regrown, 7)
         _ = model(LMInput.Text(tokens: next), cache: regrown, state: nil).logits
         XCTAssertEqual(regrown.first?.offset, 11)
         XCTAssertThrowsError(try model.tokenOnlyPositionState(cache: regrown))
+    }
+
+    /// macprovider #2201 audit: concurrent sessions on one model each touch
+    /// only their own cache's registry entry, and a cache's key is stable.
+    func testQwen2VLRopeDeltaRegistryIsPerCacheUnderConcurrency() {
+        let registry = Qwen2VLRopeDeltaRegistry()
+        let caches: [[any KVCache]] = (0 ..< 64).map { _ in [KVCacheSimple()] }
+        let deltas = (0 ..< 64).map { MLXArray(Int32($0 + 1)) }
+        XCTAssertTrue((caches[0].first as AnyObject) === (caches[0].first as AnyObject))
+
+        let failures = LockedCounter()
+        DispatchQueue.concurrentPerform(iterations: 64 * 20) { step in
+            let i = step % 64
+            let vision = i.isMultiple(of: 2)
+            registry.record(vision ? deltas[i] : nil, visionEnd: 0, for: caches[i])
+            switch registry.lookup(caches[i]) {
+            case .known(let delta?) where vision && delta === deltas[i]: break
+            case .known(nil) where !vision: break
+            default: failures.increment()
+            }
+        }
+        XCTAssertEqual(failures.value, 0)
     }
 
     func testQwen2VLWindowedImagePrefillMatchesSingleShot() throws {
