@@ -404,6 +404,30 @@ public class NemotronHTests: XCTestCase {
         XCTAssertEqual(nextOutput.shape, [1, 1, 100])
     }
 
+    /// macprovider #2201: with bfloat16 weights cast the way the loader casts
+    /// them, the Mamba gated norm must not promote to float32. A float32
+    /// identity weight there made the whole residual stream float32 after the
+    /// first Mamba layer, which cost native decode about 2.7x against mlx-lm.
+    func testNemotronHBFloat16WeightsKeepBFloat16Activations() throws {
+        let model = NemotronHModel(makeTestConfig(pattern: "M*M-E"))
+        let cast = model.castPredicate!
+        let parameters = model.parameters().flattened().map { key, value in
+            (key, cast(key) ? value.asType(.bfloat16) : value)
+        }
+        model.update(parameters: ModuleParameters.unflattened(parameters))
+
+        let cache = try model.newCache(parameters: nil)
+        let prompt = model(MLXArray([1, 2, 3, 4, 5])[.newAxis, .ellipsis], cache: cache)
+        let next = model(MLXArray([6])[.newAxis, .ellipsis], cache: cache)
+        eval(prompt, next)
+
+        XCTAssertEqual(prompt.dtype, .bfloat16)
+        XCTAssertEqual(next.dtype, .bfloat16)
+        for case let kv as KVCacheSimple in cache {
+            XCTAssertEqual(kv.state.first?.dtype, .bfloat16)
+        }
+    }
+
     // MARK: - KV Heads Tests
 
     func testNemotronHKVHeads() throws {
