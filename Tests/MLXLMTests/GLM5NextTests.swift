@@ -957,6 +957,26 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
+    /// Prefill sparse attention with the heads on the query axis (one GEMM per
+    /// query) matches the per-head route; decode still equals prefill.
+    func testSparsePrefillHeadsAsQueriesMatchesPerHeadRoute() throws {
+        let model = GLM5NextTextModel(try configuration(indexTopk: 8))
+        randomize(model)
+        model.train(false)
+        let input = tokens(70)
+        func prefill(_ on: Bool) throws -> MLXArray {
+            for layer in model.model.layers where !layer.isLinear {
+                (layer.selfAttn as! GLM5NextAttention).headsAsQueriesPrefill = on
+            }
+            let logits = model(input, cache: try model.newCache(parameters: nil))
+            eval(logits)
+            return logits
+        }
+        let gemm = try prefill(true)
+        let perHead = try prefill(false)
+        XCTAssertLessThan(maxAbsDifference(gemm, perHead), 1e-3)
+    }
+
     /// End to end: decode logits with the fused KDA step equal the op path's.
     func testFusedDecodeKeepsModelLogitsBitwise() throws {
         let model = GLM5NextTextModel(try configuration(indexTopk: 8, linearHeadDim: 128))

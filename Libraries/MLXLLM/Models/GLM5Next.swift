@@ -914,6 +914,9 @@ final class GLM5NextAttention: Module {
     /// Queries per gathered sparse-attention block.
     static let sparseChunk = 64
 
+    /// Prefill sparse attention runs each query's heads as one GEMM.
+    var headsAsQueriesPrefill = true
+
     @ModuleInfo(key: "q_a_proj") var qAProj: Linear
     @ModuleInfo(key: "q_a_layernorm") var qALayerNorm: RMSNorm
     @ModuleInfo(key: "q_b_proj") var qBProj: Linear
@@ -1143,9 +1146,15 @@ final class GLM5NextAttention: Module {
             let safe = clip(indices, min: 0, max: max(T - 1, 0)) + batchOffsets
             let selected = take(flatLatent, safe.flattened(), axis: 0)
                 .reshaped(B * rows, 1, K, R)
+            // Prefill puts the heads on the query axis (one shared latent "kv
+            // head"): one GEMM per query instead of a GEMV per head, which
+            // was ~28% of 32K prefill GPU time (#2198). Same attention per
+            // head; decode and MTP verify (one query) keep the GEMV route.
+            let headsAsQueries = headsAsQueriesPrefill && L > 1
             let queries = qLatent[0..., 0..., c0 ..< c1]
                 .transposed(0, 2, 1, 3)
-                .reshaped(B * rows, H, 1, R)
+                .reshaped(
+                    headsAsQueries ? [B * rows, 1, H, R] : [B * rows, H, 1, R])
             let out = MLXFast.scaledDotProductAttention(
                 queries: queries, keys: selected, values: selected, scale: scale,
                 mask: .array(valid.reshaped(B * rows, 1, 1, K)))
