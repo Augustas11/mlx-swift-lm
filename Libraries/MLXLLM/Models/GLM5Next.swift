@@ -71,6 +71,12 @@ final class GLM5NextHyperConnection: Module {
     /// reference; every token is computed on its own.
     var fusedDecode = true
 
+    /// Prefill (more than 8 tokens) runs the Sinkhorn + collapse + branch
+    /// RMSNorm kernel on the op path's mixes, per token as in decode. On for
+    /// GLM-5.3 (`GLM5NextDecoderLayer`); DeepSeek-V4 keeps its reference
+    /// prefill arithmetic.
+    var fusedPrefill = false
+
     @ParameterInfo(key: "fn") var fn: MLXArray
     @ParameterInfo(key: "base") var base: MLXArray
     @ParameterInfo(key: "scale") var scale: MLXArray
@@ -139,6 +145,20 @@ final class GLM5NextHyperConnection: Module {
                 sinkhornIterations: sinkhornIterations, hcEps: hcEps, normEps: norm.eps)
         {
             return fused
+        }
+        if fusedPrefill, !training, x.dim(1) > 8, hcMult == 4 {
+            // Prefill: the op path's mixes (one GEMM), then the decode kernel's
+            // Sinkhorn + collapse + RMSNorm per token instead of ~60 dependent
+            // small ops per half-layer (27% of 32K prefill GPU time, #2198).
+            let (B, L, H, D) = (x.dim(0), x.dim(1), x.dim(2), x.dim(3))
+            let z = MLXFast.rmsNorm(
+                x.asType(.float32).reshaped(B, L, H * D), weight: MLXArray.mlxNone, eps: normEps)
+            if let fused = glm5NextHCNorm(
+                x, mixes: matmul(z, fn.T), scale: scale, base: base, normWeight: norm.weight,
+                sinkhornIterations: sinkhornIterations, hcEps: hcEps, normEps: norm.eps)
+            {
+                return fused
+            }
         }
         let (collapsed, post, comb) = self(x)
         return (norm(collapsed), post, comb)
@@ -1167,6 +1187,8 @@ final class GLM5NextDecoderLayer: Module {
         _attnHC.wrappedValue = GLM5NextHyperConnection(config)
         _ffnHC.wrappedValue = GLM5NextHyperConnection(config)
         super.init()
+        attnHC.fusedPrefill = true
+        ffnHC.fusedPrefill = true
     }
 
     /// `x: [B, L, hc_mult, D]`.

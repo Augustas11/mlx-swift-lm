@@ -473,6 +473,44 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
+    /// Prefill (more than 8 tokens) keeps the op path's mixes and runs the
+    /// Sinkhorn + collapse + RMSNorm kernel per token: post and comb within
+    /// 1e-6 of the op path, the normalized input within one bf16 ulp.
+    func testFusedHyperConnectionPrefillMatchesOpPath() throws {
+        var json = textConfigJSON()
+        json = json.replacingOccurrences(of: #""hidden_size": 64"#, with: #""hidden_size": 1024"#)
+        let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+        let connection = GLM5NextHyperConnection(config)
+        let norm = RMSNorm(dimensions: 1024, eps: config.rmsNormEps)
+        withRandomState(MLXRandom.RandomState(seed: 41)) {
+            connection.update(parameters: ModuleParameters.unflattened([
+                "fn": 0.05 * MLXRandom.normal(connection.fn.shape),
+                "base": 0.5 * MLXRandom.normal(connection.base.shape),
+                "scale": 1 + 0.2 * MLXRandom.normal([3]),
+            ]))
+            norm.update(parameters: ModuleParameters.unflattened([
+                "weight": (1 + 0.1 * MLXRandom.normal([1024])).asType(.bfloat16)
+            ]))
+        }
+        connection.train(false)
+        norm.train(false)
+        for (index, (rows, length)) in [(1, 9), (1, 64), (2, 300)].enumerated() {
+            let x = withRandomState(MLXRandom.RandomState(seed: UInt64(50 + index))) {
+                MLXRandom.normal([rows, length, 4, 1024]).asType(.bfloat16)
+            }
+            connection.fusedPrefill = false
+            let (normedOps, postOps, combOps) = connection.normalizedBranchInput(x, norm: norm)
+            connection.fusedPrefill = true
+            let (normed, post, comb) = connection.normalizedBranchInput(x, norm: norm)
+            eval(normedOps, postOps, combOps, normed, post, comb)
+            XCTAssertLessThanOrEqual(maxAbsDifference(post, postOps), 1e-6, "post at \(length)")
+            XCTAssertLessThanOrEqual(maxAbsDifference(comb, combOps), 1e-6, "comb at \(length)")
+            XCTAssertLessThanOrEqual(maxAbsDifference(normed, normedOps), 0.0625)
+            XCTAssertGreaterThan(
+                (normed .== normedOps).asType(.float32).mean().item(Float.self), 0.95)
+        }
+    }
+
     /// The deferred one-token hyper-connection chain (`glm5NextHCPre` with
     /// the previous expand folded in, `glm5NextHCPost` for post, comb and the
     /// comb product) reproduces expand + `glm5NextHCMix` + `glm5NextHCNorm`
