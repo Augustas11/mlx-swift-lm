@@ -3156,9 +3156,27 @@ private let glm5NextDSASelectSource = """
       const uint lane = thread_index_in_simdgroup;
       const uint sg = simdgroup_index_in_threadgroup;
       constexpr uint NT = 1024;
+    #if TAIL
+      constexpr int W = TOPK + KPOOL - 1;
+    #else
+      constexpr int W = TOPK;
+    #endif
+    #if ROWS
+      // One threadgroup per prefill query: dims = (pools, selectK, position
+      // of row 0). A query sees the pools that end at or before it.
+      const int row = int(threadgroup_position_in_grid.y);
+      const int kv_len = int(dims[2]) + row + 1;
+      const int P = metal::min(int(dims[0]), kv_len / KPOOL);
+      const int K = metal::min(int(dims[1]), P);
+      const size_t score_row = size_t(row) * size_t(dims[0]);
+      device int32_t* orow = out + size_t(row) * W;
+    #else
       const int P = int(dims[0]);
       const int K = int(dims[1]);          // pools to select
       const int kv_len = int(dims[2]);
+      constexpr size_t score_row = 0;
+      device int32_t* orow = out;
+    #endif
 
       threadgroup atomic_uint hist[256];
       threadgroup uint shared_u[4];
@@ -3170,7 +3188,7 @@ private let glm5NextDSASelectSource = """
     #if SELECT_ALL
         return 0u;
     #else
-        const float s = scores[i];
+        const float s = scores[score_row + i];
         if (metal::isnan(s)) {
           return 0u;
         }
@@ -3261,7 +3279,7 @@ private let glm5NextDSASelectSource = """
         if (sel) {
           const uint pos = carry_sel + part_b[sg] + sel_pre;
           for (int o = 0; o < KPOOL; o++) {
-            out[pos * KPOOL + o] = i * KPOOL + o;
+            orow[pos * KPOOL + o] = i * KPOOL + o;
           }
         }
         carry_sel += shared_u[3];
@@ -3271,7 +3289,7 @@ private let glm5NextDSASelectSource = """
 
       // -1 padding up to TOPK tokens, then the tail.
       for (int e = K * KPOOL + int(tid); e < TOPK; e += int(NT)) {
-        out[e] = -1;
+        orow[e] = -1;
       }
     #if TAIL
       if (tid < uint(KPOOL - 1)) {
@@ -3279,7 +3297,7 @@ private let glm5NextDSASelectSource = """
         const int count = visible % KPOOL;
         const int j = int(tid);
         const int index = visible - count + j;
-        out[TOPK + j] = (j < count && index < kv_len) ? index : -1;
+        orow[TOPK + j] = (j < count && index < kv_len) ? index : -1;
       }
     #endif
     """
@@ -3297,16 +3315,17 @@ private final class GLM5NextDSAKernels: @unchecked Sendable {
             header: "#include <metal_simdgroup>\n#include <metal_simdgroup_matrix>\n")
     }
 
-    func select(all: Bool, tail: Bool) -> MLXFast.MLXFastKernel {
-        let key = "\(all)-\(tail)"
+    func select(all: Bool, tail: Bool, rows: Bool = false) -> MLXFast.MLXFastKernel {
+        let key = "\(all)-\(tail)-\(rows)"
         lock.lock()
         defer { lock.unlock() }
         if let kernel = selects[key] { return kernel }
         let kernel = MLXFast.metalKernel(
-            name: "glm5next_dsa_select" + (all ? "_all" : "") + (tail ? "_tail" : ""),
+            name: "glm5next_dsa_select" + (rows ? "_rows" : "") + (all ? "_all" : "")
+                + (tail ? "_tail" : ""),
             inputNames: ["scores", "dims"], outputNames: ["out"],
             source: "#define SELECT_ALL \(all ? 1 : 0)\n#define TAIL \(tail ? 1 : 0)\n"
-                + glm5NextDSASelectSource)
+                + "#define ROWS \(rows ? 1 : 0)\n" + glm5NextDSASelectSource)
         selects[key] = kernel
         return kernel
     }
@@ -3349,4 +3368,30 @@ func glm5NextDSASelect(
         template: [("TOPK", indexTopk), ("KPOOL", kpool)],
         grid: (1024, 1, 1), threadGroup: (1024, 1, 1),
         outputShapes: [[1, 1, width]], outputDTypes: [.int32])[0]
+}
+
+/// `GLM5NextIndexer.select` for `rows` prefill queries of one sequence at
+/// positions `firstPosition ..< firstPosition + rows`: the token indices
+/// `[1, rows, indexTopk (+ kpool - 1 tail)]` int32, `-1` unused. `scores`
+/// `[rows, poolCount]` are the op path's fp32 indexer scores before the
+/// causal mask (`nil` when `selectK == poolCount`: every visible pool).
+/// One threadgroup per query replaces the op path's full-sort
+/// `argPartition`, its chronological `argSort` and the gathers around them;
+/// the selection, its tie order (lowest pools first), the order and the
+/// padding are the op path's.
+func glm5NextDSASelectRows(
+    scores: MLXArray?, poolCount: Int, selectK: Int, firstPosition: Int, rows: Int,
+    indexTopk: Int, kpool: Int, tail: Bool
+) -> MLXArray {
+    precondition(scores == nil || scores!.shape == [rows, poolCount])
+    let all = scores == nil
+    let width = indexTopk + (tail && kpool > 1 ? kpool - 1 : 0)
+    return GLM5NextDSAKernels.shared.select(all: all, tail: tail && kpool > 1, rows: true)(
+        [
+            scores?.asType(.float32) ?? MLXArray.zeros([1], dtype: .float32),
+            MLXArray([Int32(poolCount), Int32(selectK), Int32(firstPosition)]),
+        ],
+        template: [("TOPK", indexTopk), ("KPOOL", kpool)],
+        grid: (1024, rows, 1), threadGroup: (1024, 1, 1),
+        outputShapes: [[1, rows, width]], outputDTypes: [.int32])[0]
 }

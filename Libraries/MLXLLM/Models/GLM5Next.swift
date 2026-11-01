@@ -739,6 +739,10 @@ final class GLM5NextIndexer: Module {
     /// One decode token selects with `glm5NextDSASelect` (two kernels).
     var fusedDecode = true
 
+    /// Prefill queries (one sequence, `L > 1`) select with
+    /// `glm5NextDSASelectRows` on the op path's scores.
+    var fusedPrefill = true
+
     /// `q`, `weights`: `wq_b(qResid)` and `weights_proj(x)` when the caller
     /// computed them for more columns.
     func select(
@@ -756,9 +760,41 @@ final class GLM5NextIndexer: Module {
             return fused
         }
         let start = kvLength - L
-        let queryPositions = MLXArray(Int32(start) ..< Int32(kvLength))
         let poolCount = pooledKeys?.dim(1) ?? 0
         let selectK = min(indexTopk / kpool, poolCount)
+        if fusedPrefill, !training, B == 1, L > 1, let pooledKeys, poolCount > 0,
+            indexTopk % kpool == 0
+        {
+            // Same fp32 scores, chunked as below; one kernel per chunk selects.
+            let tail = alwaysSelectTail && kpool > 1
+            if selectK == poolCount {
+                return glm5NextDSASelectRows(
+                    scores: nil, poolCount: poolCount, selectK: selectK, firstPosition: start,
+                    rows: L, indexTopk: indexTopk, kpool: kpool, tail: tail)
+            }
+            let q = (precomputedQ ?? wqB(qResid)).reshaped(B, L, numHeads, headDim)
+                .asType(.float32)
+            let weights =
+                (precomputedWeights ?? weightsProj(x)).asType(.float32)
+                * (pow(Float(numHeads), -0.5) * softmaxScale)
+            let poolT = expandedDimensions(pooledKeys.asType(.float32), axis: 1)
+                .swappedAxes(-1, -2)
+            var chunks = [MLXArray]()
+            let chunk = scoreChunk(poolCount: poolCount)
+            for c0 in stride(from: 0, to: L, by: chunk) {
+                let c1 = min(c0 + chunk, L)
+                var scores = maximum(matmul(q[0..., c0 ..< c1], poolT), 0)
+                scores = (scores * expandedDimensions(weights[0..., c0 ..< c1], axis: -1))
+                    .sum(axis: 2)
+                chunks.append(
+                    glm5NextDSASelectRows(
+                        scores: scores.reshaped(c1 - c0, poolCount), poolCount: poolCount,
+                        selectK: selectK, firstPosition: start + c0, rows: c1 - c0,
+                        indexTopk: indexTopk, kpool: kpool, tail: tail))
+            }
+            return chunks.count == 1 ? chunks[0] : concatenated(chunks, axis: 1)
+        }
+        let queryPositions = MLXArray(Int32(start) ..< Int32(kvLength))
 
         var topk: MLXArray
         if let pooledKeys, poolCount > 0 {

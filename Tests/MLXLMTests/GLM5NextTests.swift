@@ -835,6 +835,90 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
+    /// `glm5NextDSASelectRows` reproduces the indexer's op-path selection bit
+    /// for bit for prefill queries: every visible pool (<= 512 pools), rows
+    /// that cross from "all visible pools" to a real top-k inside one chunk,
+    /// exact score ties, several score chunks, and a 64k-token context.
+    func testFusedPrefillDSASelectMatchesOpPathBitwise() throws {
+        var json = textConfigJSON(indexTopk: 2048)
+        for (from, to) in [
+            (#""index_head_dim": 16"#, #""index_head_dim": 128"#),
+            (#""index_n_heads": 2"#, #""index_n_heads": 32"#),
+        ] {
+            json = json.replacingOccurrences(of: from, with: to)
+        }
+        let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+        let indexer = GLM5NextIndexer(config)
+        randomize(indexer, seed: 201)
+        castToBFloat16(indexer)
+        indexer.train(false)
+        // (pools, queries, kvLength): kvLength / 4 >= pools, as the cache keeps.
+        for (pools, L, kvLength) in [
+            (100, 37, 403), (525, 200, 2100), (600, 300, 2402), (1030, 1500, 4123),
+            (16389, 300, 65559),
+        ] {
+            let x = withRandomState(MLXRandom.RandomState(seed: UInt64(202 + L))) {
+                MLXRandom.normal([1, L, config.hiddenSize]).asType(.bfloat16)
+            }
+            let qResid = withRandomState(MLXRandom.RandomState(seed: UInt64(203 + L))) {
+                MLXRandom.normal([1, L, config.qLoraRank]).asType(.bfloat16)
+            }
+            var keys = withRandomState(MLXRandom.RandomState(seed: UInt64(204 + pools))) {
+                MLXRandom.normal([1, pools, 128]).asType(.bfloat16)
+            }
+            if pools > 600 {
+                // Exact score ties across the selection boundary.
+                for (a, b) in [(7, pools - 1), (40, 300), (41, 299), (5, 6)] {
+                    keys[0..., b] = keys[0..., a]
+                }
+            }
+            indexer.fusedPrefill = false
+            let reference = indexer.select(x, qResid: qResid, pooledKeys: keys, kvLength: kvLength)
+            indexer.fusedPrefill = true
+            let fused = indexer.select(x, qResid: qResid, pooledKeys: keys, kvLength: kvLength)
+            assertBitwiseEqual(fused, reference, "\(L) queries over \(pools) pools")
+            if pools == 1030 {
+                // Every score equal: the boundary is decided by the tie order alone.
+                let same = broadcast(keys[0..., ..<1], to: [1, 1000, 128])
+                indexer.fusedPrefill = false
+                let tiedReference = indexer.select(
+                    x[0..., ..<64], qResid: qResid[0..., ..<64], pooledKeys: same, kvLength: 4002)
+                indexer.fusedPrefill = true
+                let tied = indexer.select(
+                    x[0..., ..<64], qResid: qResid[0..., ..<64], pooledKeys: same, kvLength: 4002)
+                assertBitwiseEqual(tied, tiedReference, "all-tied selection")
+            }
+        }
+    }
+
+    /// End to end: prefill logits (sparse DSA past `index_topk`, one shot and
+    /// chunked) with the fused prefill selection equal the op path's.
+    func testFusedPrefillSelectionKeepsModelLogitsBitwise() throws {
+        let model = GLM5NextTextModel(try configuration(indexTopk: 8))
+        randomize(model)
+        castToBFloat16(model)
+        model.train(false)
+        let input = tokens(70)
+
+        func prefill(fused: Bool) throws -> [MLXArray] {
+            for layer in model.model.layers where !layer.isLinear {
+                (layer.selfAttn as! GLM5NextAttention).indexer?.fusedPrefill = fused
+            }
+            let whole = model(input, cache: try model.newCache(parameters: nil))
+            let cache = try model.newCache(parameters: nil)
+            let pieces = [(0, 23), (23, 50), (50, 70)].map {
+                model(input[0..., $0.0 ..< $0.1], cache: cache)
+            }
+            eval(whole, pieces)
+            return [whole] + pieces
+        }
+        let fused = try prefill(fused: true)
+        let reference = try prefill(fused: false)
+        for (index, (a, b)) in zip(fused, reference).enumerated() {
+            assertBitwiseEqual(a, b, "prefill logits \(index)")
+        }
+    }
+
     /// End to end: decode logits with the fused KDA step equal the op path's.
     func testFusedDecodeKeepsModelLogitsBitwise() throws {
         let model = GLM5NextTextModel(try configuration(indexTopk: 8, linearHeadDim: 128))
