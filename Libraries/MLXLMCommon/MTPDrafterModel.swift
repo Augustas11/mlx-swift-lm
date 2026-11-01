@@ -213,6 +213,25 @@ public protocol MTPPackedStatefulDrafterModel: StatefulMTPDrafterModel {
     ) throws -> MTPPackedDrafterAdvanceResult
 }
 
+/// A packed drafter that continues every row's proposal chain past its seed.
+///
+/// ``chainPackedProposals(target:states:depth:sampler:)`` returns `[rows,
+/// depth]` proposals: column 0 is each row's seed (the proposal its last
+/// ``MTPPackedStatefulDrafterModel/advanceAndProposePacked(target:rows:sampler:)``
+/// sampled), and each later column is drafted from the previous column's
+/// token and drafter hidden state. The chain's own drafter cache entries are
+/// tentative and never published: the input states are returned to the
+/// caller unchanged, so the next advance recomputes the drafter state of
+/// every committed column from the target's hidden states (SPEC-048 MTP-6).
+public protocol MTPPackedChainingDrafterModel: MTPPackedStatefulDrafterModel {
+    func chainPackedProposals(
+        target: any LanguageModel,
+        states: [MTPDrafterState],
+        depth: Int,
+        sampler: any LogitSampler
+    ) throws -> MLXArray
+}
+
 /// Optional capability for MTP drafters that maintain per-stream state.
 ///
 /// This keeps the base ``MTPDrafterModel`` surface minimal for stateless

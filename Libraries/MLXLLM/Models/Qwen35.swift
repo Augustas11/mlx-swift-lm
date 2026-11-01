@@ -168,6 +168,48 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
 
 // MARK: - GatedDeltaNet
 
+/// What one GDN layer's depth-D MTP verification records so a rejection can
+/// rebuild the state after any kept prefix (tape rollback): the conv state
+/// the verify started from, its masked pre-conv projections, and the
+/// normalized keys, values, decay and write strength the recurrence read.
+/// A few tens of KB per column, against a recurrent state of several MB.
+struct Qwen35GDNVerifyTape {
+    let convBase: MLXArray
+    let qkv: MLXArray
+    let k: MLXArray
+    let v: MLXArray
+    let g: MLXArray
+    let beta: MLXArray
+    let mask: MLXArray?
+
+    /// The flat array order a compiled verify segment emits.
+    var arrays: [MLXArray] { [qkv, k, v, g, beta] }
+    static let compiledArrayCount = 5
+
+    /// Rebuild from a compiled segment's outputs (`arrays` order); the conv
+    /// base is the segment's state input.
+    init(convBase: MLXArray, compiled outputs: ArraySlice<MLXArray>) {
+        let values = Array(outputs)
+        precondition(values.count == Self.compiledArrayCount)
+        self.init(
+            convBase: convBase, qkv: values[0], k: values[1], v: values[2], g: values[3],
+            beta: values[4], mask: nil)
+    }
+
+    init(
+        convBase: MLXArray, qkv: MLXArray, k: MLXArray, v: MLXArray, g: MLXArray,
+        beta: MLXArray, mask: MLXArray?
+    ) {
+        self.convBase = convBase
+        self.qkv = qkv
+        self.k = k
+        self.v = v
+        self.g = g
+        self.beta = beta
+        self.mask = mask
+    }
+}
+
 final class Qwen35GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -342,21 +384,75 @@ final class Qwen35GatedDeltaNet: Module {
     ) -> MLXArray {
         let convState =
             cache?[0] ?? zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).conv
-        let (out, newConvState, newRecState, checkpoint) = forward(
+        let width = inputs.dim(1)
+        let recordsTape = cache != nil && Self.recordsVerifyTape(
+            width: width, checkpointAfter: checkpointAfter)
+        let (out, newConvState, newRecState, checkpoint, tape) = forward(
             inputs, convState: convState, recState: cache?[1], mask: mask,
-            checkpointAfter: checkpointAfter)
+            checkpointAfter: checkpointAfter, recordTape: recordsTape)
         if let cache {
             cache[0] = newConvState
             cache[1] = newRecState
+            if let checkpoint, let tape {
+                let prefixes = verifyPrefixStates(
+                    tape: tape, checkpoint: checkpoint, width: width)
+                if let mask = tape.mask {
+                    // A right-padded row's conv window ends at its last
+                    // valid column, as its (masked) recurrent state does.
+                    let valid = mask.asType(.int32).sum(axis: 1).reshaped([-1, 1, 1])
+                    var conv = newConvState
+                    for (keep, state) in prefixes {
+                        conv = MLX.where(valid .== Int32(keep), state[0], conv)
+                    }
+                    cache[0] = conv
+                }
+                cache.advance(width)
+                cache.saveSpeculativePrefixes(prefixes, width: width)
+                return out
+            }
             if let checkpoint, let checkpointAfter {
                 cache.saveSpeculativeCheckpoint(
                     convState: checkpoint.conv,
                     recurrentState: checkpoint.recurrent,
                     advancedBy: checkpointAfter)
             }
-            cache.advance(inputs.dim(1))
+            cache.advance(width)
         }
         return out
+    }
+
+    /// A depth-D (D >= 2) MTP verification checkpoints after its first
+    /// column and records the tape for every longer kept prefix. Depth one
+    /// (`width == 2`) keeps the single in-kernel checkpoint.
+    static func recordsVerifyTape(width: Int, checkpointAfter: Int?) -> Bool {
+        checkpointAfter == 1 && width > 2
+    }
+
+    /// The state after each kept prefix `k` (`1 <= k < width`) of a
+    /// `width`-column verification, as `[conv, recurrent]`: `k == 1` is the
+    /// in-kernel checkpoint; a longer prefix is the conv window ending at its
+    /// last kept column and a lazy tape replay of columns `1 ..< k` from the
+    /// checkpoint. Nothing is evaluated unless a rejection restores it, so an
+    /// accepted round pays only for recording the tape.
+    func verifyPrefixStates(
+        tape: Qwen35GDNVerifyTape, checkpoint: (conv: MLXArray, recurrent: MLXArray), width: Int
+    ) -> [Int: [MLXArray]] {
+        var prefixes: [Int: [MLXArray]] = [1: [checkpoint.conv, checkpoint.recurrent]]
+        guard width > 2 else { return prefixes }
+        let convInput = concatenated([tape.convBase, tape.qkv], axis: 1)
+        for keep in 2 ..< width {
+            let conv: MLXArray =
+                convKernelSize > 1
+                ? contiguous(convInput[0..., keep ..< (keep + convKernelSize - 1), 0...])
+                : MLXArray.zeros([tape.qkv.dim(0), 0, convDim], dtype: tape.qkv.dtype)
+            let recurrent = gatedDeltaReplayState(
+                k: tape.k[0..., 1 ..< keep], v: tape.v[0..., 1 ..< keep],
+                g: tape.g[0..., 1 ..< keep], beta: tape.beta[0..., 1 ..< keep],
+                state: checkpoint.recurrent, mask: tape.mask.map { $0[0..., 1 ..< keep] },
+                useKernel: !training)
+            prefixes[keep] = [conv, recurrent]
+        }
+        return prefixes
     }
 
     /// Zero conv/recurrent state — the shapes `callAsFunction` and
@@ -376,12 +472,14 @@ final class Qwen35GatedDeltaNet: Module {
         convState: MLXArray,
         recState: MLXArray?,
         mask: MLXArray?,
-        checkpointAfter: Int? = nil
+        checkpointAfter: Int? = nil,
+        recordTape: Bool = false
     ) -> (
         output: MLXArray,
         convState: MLXArray,
         recurrentState: MLXArray,
-        checkpoint: (conv: MLXArray, recurrent: MLXArray)?
+        checkpoint: (conv: MLXArray, recurrent: MLXArray)?,
+        tape: Qwen35GDNVerifyTape?
     ) {
         let B = x.dim(0)
         let S = x.dim(1)
@@ -417,11 +515,14 @@ final class Qwen35GatedDeltaNet: Module {
         let out: MLXArray
         let newRecState: MLXArray
         let checkpoint: (conv: MLXArray, recurrent: MLXArray)?
+        var tape: Qwen35GDNVerifyTape? = nil
         if let split = checkpointAfter, split > 0, split < S {
             // One recurrent pass that also emits the state after `split`
             // steps; bit-identical to two calls split at the checkpoint.
             let prefixState: MLXArray
-            (out, prefixState, newRecState) = gatedDeltaUpdateCheckpointed(
+            let g: MLXArray
+            let beta: MLXArray
+            (out, prefixState, newRecState, g, beta) = gatedDeltaUpdateCheckpointedWithGates(
                 q: qNormed,
                 k: kNormed,
                 v: v,
@@ -444,6 +545,11 @@ final class Qwen35GatedDeltaNet: Module {
                 checkpointConv = MLXArray.zeros([B, 0, convDim], dtype: qkv.dtype)
             }
             checkpoint = (checkpointConv, prefixState)
+            if recordTape {
+                tape = Qwen35GDNVerifyTape(
+                    convBase: convState, qkv: qkv, k: kNormed, v: v, g: g, beta: beta,
+                    mask: mask)
+            }
         } else {
             (out, newRecState) = gatedDeltaUpdate(
                 q: qNormed,
@@ -460,7 +566,7 @@ final class Qwen35GatedDeltaNet: Module {
         }
 
         let gated = norm(out, gate: z)
-        return (outProj(gated.reshaped(B, S, -1)), newConvState, newRecState, checkpoint)
+        return (outProj(gated.reshaped(B, S, -1)), newConvState, newRecState, checkpoint, tape)
     }
 
     /// The S == 1 depthwise conv as elementwise multiply-adds, so `compile`
@@ -872,7 +978,7 @@ final class Qwen35DecoderLayer: Module {
     func linearLayerBody(x: MLXArray, convState: MLXArray, recState: MLXArray) -> (
         MLXArray, MLXArray, MLXArray
     ) {
-        let (r, newConvState, newRecState, _) = linearAttn!.forward(
+        let (r, newConvState, newRecState, _, _) = linearAttn!.forward(
             inputLayerNorm(x), convState: convState, recState: recState, mask: nil)
         let h = x + r
         return (h + mlpForward(postAttentionLayerNorm(h)), newConvState, newRecState)
@@ -882,14 +988,19 @@ final class Qwen35DecoderLayer: Module {
     /// recurrent checkpoint after `checkpointAfter` (0 < it < T) columns. Same
     /// ops as the general layer path, with state passed explicitly.
     func linearLayerVerifyBody(
-        x: MLXArray, convState: MLXArray, recState: MLXArray, checkpointAfter: Int
-    ) -> (MLXArray, MLXArray, MLXArray, (conv: MLXArray, recurrent: MLXArray)) {
-        let (r, newConvState, newRecState, checkpoint) = linearAttn!.forward(
+        x: MLXArray, convState: MLXArray, recState: MLXArray, checkpointAfter: Int,
+        recordTape: Bool = false
+    ) -> (
+        MLXArray, MLXArray, MLXArray, (conv: MLXArray, recurrent: MLXArray),
+        Qwen35GDNVerifyTape?
+    ) {
+        let (r, newConvState, newRecState, checkpoint, tape) = linearAttn!.forward(
             inputLayerNorm(x), convState: convState, recState: recState, mask: nil,
-            checkpointAfter: checkpointAfter)
+            checkpointAfter: checkpointAfter, recordTape: recordTape)
         let h = x + r
         return (
-            h + mlpForward(postAttentionLayerNorm(h)), newConvState, newRecState, checkpoint!
+            h + mlpForward(postAttentionLayerNorm(h)), newConvState, newRecState, checkpoint!,
+            tape
         )
     }
 
@@ -917,7 +1028,7 @@ final class Qwen35DecoderLayer: Module {
 public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    fileprivate let layers: [Qwen35DecoderLayer]
+    let layers: [Qwen35DecoderLayer]
     let norm: RMSNorm
 
     let ssmIdx: Int
@@ -977,8 +1088,10 @@ public class Qwen35TextModelInner: Module {
                 }
                 return modules
             },
-            body: { model, index, checkpointAfter, arguments in
-                model.verifySegmentBody(at: index, checkpointAfter: checkpointAfter, arguments)
+            body: { model, index, key, arguments in
+                model.verifySegmentBody(
+                    at: index, checkpointAfter: key.checkpointAfter, recordsTape: key.recordsTape,
+                    arguments)
             })
 
         super.init()
@@ -1171,9 +1284,10 @@ public class Qwen35TextModelInner: Module {
 
     /// `segmentBody` for a `[B, T]` verification step. Each GDN layer emits
     /// `[newConvState, newRecState, checkpointConv, checkpointRec]`, the
-    /// checkpoint being the state after the first `checkpointAfter` columns.
+    /// checkpoint being the state after the first `checkpointAfter` columns,
+    /// then, when `recordsTape`, its tape (`Qwen35GDNVerifyTape.arrays`).
     private func verifySegmentBody(
-        at index: Int, checkpointAfter: Int, _ args: [MLXArray]
+        at index: Int, checkpointAfter: Int, recordsTape: Bool, _ args: [MLXArray]
     ) -> [MLXArray] {
         let segment = decodeSegments[index]
         var hiddenStates = index == 0 ? embedTokens(args[0]) : args[0]
@@ -1186,12 +1300,13 @@ public class Qwen35TextModelInner: Module {
         var states: [MLXArray] = []
         for (i, layerIndex) in segment.linearLayers.enumerated() {
             let slot = segment.stateInputOffset + 2 * i
-            let (out, newConvState, newRecState, checkpoint) = layers[layerIndex]
+            let (out, newConvState, newRecState, checkpoint, tape) = layers[layerIndex]
                 .linearLayerVerifyBody(
                     x: hiddenStates, convState: args[slot], recState: args[slot + 1],
-                    checkpointAfter: checkpointAfter)
+                    checkpointAfter: checkpointAfter, recordTape: recordsTape)
             hiddenStates = out
             states += [newConvState, newRecState, checkpoint.conv, checkpoint.recurrent]
+            if let tape { states += tape.arrays }
         }
 
         if let pre = segment.attentionPreLayer {
@@ -1241,6 +1356,11 @@ public class Qwen35TextModelInner: Module {
         // The general path builds this mask once from the full-attention
         // cache and uses it for every attention layer; so does this one.
         let faMask = createAttentionMask(h: inputs, cache: faCache)
+        let recordsTape = Qwen35GatedDeltaNet.recordsVerifyTape(
+            width: width, checkpointAfter: split)
+        // Outputs per GDN layer: new conv/recurrent state, checkpoint
+        // conv/recurrent state, then the tape when recorded.
+        let stride = 4 + (recordsTape ? Qwen35GDNVerifyTape.compiledArrayCount : 0)
 
         var carry = inputs
         var pendingAttention: [MLXArray] = []
@@ -1253,14 +1373,31 @@ public class Qwen35TextModelInner: Module {
                 args.append(mambaCache[1]!)
             }
 
-            let outputs = verifySegments(self, at: segmentIndex, checkpointAfter: split, args)
+            let outputs = verifySegments(
+                self, at: segmentIndex,
+                key: .init(checkpointAfter: split, recordsTape: recordsTape), args)
 
             carry = outputs[0]
             for (i, layerIndex) in segment.linearLayers.enumerated() {
                 let mambaCache = mambaCaches[layerIndex]!
-                let base = 1 + 4 * i
+                let base = 1 + stride * i
+                let convBase = mambaCache[0]!
                 mambaCache[0] = outputs[base]
                 mambaCache[1] = outputs[base + 1]
+                if recordsTape {
+                    // Depth D >= 2: every kept prefix, the longer ones
+                    // replayed lazily from the tape (as the general path).
+                    let tape = Qwen35GDNVerifyTape(
+                        convBase: convBase,
+                        compiled: outputs[(base + 4) ..< (base + stride)])
+                    mambaCache.advance(width)
+                    mambaCache.saveSpeculativePrefixes(
+                        layers[layerIndex].linearAttn!.verifyPrefixStates(
+                            tape: tape, checkpoint: (outputs[base + 2], outputs[base + 3]),
+                            width: width),
+                        width: width)
+                    continue
+                }
                 mambaCache.saveSpeculativeCheckpoint(
                     convState: outputs[base + 2],
                     recurrentState: outputs[base + 3],
@@ -1270,7 +1407,7 @@ public class Qwen35TextModelInner: Module {
 
             pendingAttention = []
             if let pre = segment.attentionPreLayer {
-                let head = 1 + 4 * segment.linearLayers.count
+                let head = 1 + stride * segment.linearLayers.count
                 let attention = layers[pre].attentionCacheStep(
                     queries: outputs[head], keys: outputs[head + 2],
                     values: outputs[head + 3], cache: cache[pre]!, mask: faMask)
@@ -1283,16 +1420,22 @@ public class Qwen35TextModelInner: Module {
 }
 
 /// Compiled verify segments, one `CompiledDecodeSegmentCache` per checkpoint
-/// column: the column is a constant of the traced body, so each value needs
-/// its own trace. MLX retraces each one per input shape.
+/// column and tape choice: both are constants of the traced body (the tape
+/// changes its output count), so each value needs its own trace. MLX
+/// retraces each one per input shape.
 final class CompiledVerifySegmentCaches<Owner: Module>: CompiledTraceInvalidating {
-    typealias Body = @Sendable (Owner, Int, Int, [MLXArray]) -> [MLXArray]
+    struct Key: Hashable, Sendable {
+        let checkpointAfter: Int
+        let recordsTape: Bool
+    }
+
+    typealias Body = @Sendable (Owner, Int, Key, [MLXArray]) -> [MLXArray]
 
     private let count: Int
     private let state: CompiledDecodeSegmentCache<Owner>.StateProvider
     private let body: Body
     private let lock = NSLock()
-    private var caches: [Int: CompiledDecodeSegmentCache<Owner>] = [:]
+    private var caches: [Key: CompiledDecodeSegmentCache<Owner>] = [:]
 
     init(
         count: Int, state: @escaping CompiledDecodeSegmentCache<Owner>.StateProvider,
@@ -1308,17 +1451,17 @@ final class CompiledVerifySegmentCaches<Owner: Module>: CompiledTraceInvalidatin
     }
 
     func callAsFunction(
-        _ owner: Owner, at index: Int, checkpointAfter: Int, _ arguments: [MLXArray]
+        _ owner: Owner, at index: Int, key: Key, _ arguments: [MLXArray]
     ) -> [MLXArray] {
         let cache = lock.withLock {
-            if let existing = caches[checkpointAfter] { return existing }
+            if let existing = caches[key] { return existing }
             let body = self.body
             let created = CompiledDecodeSegmentCache<Owner>(
                 count: count, state: state,
                 body: { owner, index, arguments in
-                    body(owner, index, checkpointAfter, arguments)
+                    body(owner, index, key, arguments)
                 })
-            caches[checkpointAfter] = created
+            caches[key] = created
             return created
         }
         return cache(owner, at: index, arguments)

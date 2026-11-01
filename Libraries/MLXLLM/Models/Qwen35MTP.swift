@@ -65,9 +65,12 @@ final class Qwen35MTPPredictor: Module {
     }
 }
 
-public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
+public final class Qwen35MTPDraftModel: Module, MTPPackedChainingDrafterModel {
     public let configuration: Qwen35TextConfiguration
-    public let maximumBlockSize: Int? = 2
+    /// Bonus token plus up to three chained proposals: the target's packed
+    /// verification keeps every kept prefix's recurrent state (tape
+    /// rollback) up to this width.
+    public let maximumBlockSize: Int? = 4
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = true
@@ -363,6 +366,68 @@ public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
                 proposalAppended: 0)
         }
         return MTPPackedDrafterAdvanceResult(states: states, proposals: proposals)
+    }
+
+    /// Chain every row from its seed to `depth` proposals with one MTP
+    /// forward per extra step for all rows. Each row attends its own
+    /// committed drafter K/V plus its own earlier chained entries; positions
+    /// follow each row's cache length, as the serial `draftBlock` chain does.
+    /// Row states are read, never written.
+    public func chainPackedProposals(
+        target: any LanguageModel,
+        states: [MTPDrafterState],
+        depth: Int,
+        sampler: any LogitSampler
+    ) throws -> MLXArray {
+        guard !states.isEmpty else { return MLXArray.zeros([0, depth], dtype: .int32) }
+        precondition(depth >= 1 && depth < (maximumBlockSize ?? 2), "unsupported chain depth")
+        let layerCount = mtp.layers.count
+        var live: [[[MLXArray]]] = []
+        var seeds: [MLXArray] = []
+        var seedHidden: [MLXArray] = []
+        for (index, state) in states.enumerated() {
+            guard let seed = state.seedToken, let hidden = state.seedHidden,
+                  state.proposalAppended == 0,
+                  state.cache.count == layerCount,
+                  state.cache.allSatisfy({ $0 is KVCacheSimple && $0.offset == state.nextPosition })
+            else { throw MTPPackedDrafterError.incompatibleState(row: index) }
+            live.append(state.cache.map { cache in
+                let kv = cache.state
+                guard state.nextPosition > 0, kv.count == 2 else { return [] }
+                return kv[0].dim(2) == state.nextPosition
+                    ? kv : kv.map { $0[.ellipsis, ..<state.nextPosition, 0...] }
+            })
+            seeds.append(normalizedMTPColumn(seed))
+            seedHidden.append(hidden)
+        }
+        var token = states.count == 1 ? seeds[0] : concatenated(seeds, axis: 0)
+        var hidden = states.count == 1 ? seedHidden[0] : concatenated(seedHidden, axis: 0)
+        var proposals = [token]
+        guard depth > 1 else { return token }
+
+        let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
+        let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
+        let ones = Array(repeating: 1, count: states.count)
+        for _ in 1 ..< depth {
+            let packed = (0 ..< layerCount).map { layer in
+                MTPPackedDrafterLayerCache(rowStates: live.map { $0[layer] }, inputCounts: ones)
+            }
+            hidden = mtp(
+                inputsEmbeds: inputEmbedding(token), hiddenStates: hidden, cache: packed,
+                positionOffset: nil)
+            let logits = lmHead.map { $0(hidden) } ?? targetEmbedTokens.asLinear(hidden)
+            token = sampler.sample(logits: logits[0..., -1, 0...]).reshaped([states.count, 1])
+            proposals.append(token)
+            var next = live.map { _ in [[MLXArray]]() }
+            for cache in packed {
+                guard let rows = cache.rowStates() else {
+                    throw MTPPackedDrafterError.incompatibleState(row: 0)
+                }
+                for row in rows.indices { next[row].append(rows[row]) }
+            }
+            live = next
+        }
+        return concatenated(proposals, axis: 1)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

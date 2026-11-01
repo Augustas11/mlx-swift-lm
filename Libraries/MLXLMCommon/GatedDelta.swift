@@ -586,6 +586,32 @@ public func gatedDeltaUpdateCheckpointed(
     checkpointAfter: Int,
     useKernel: Bool = true
 ) -> (MLXArray, MLXArray, MLXArray) {
+    let (y, checkpoint, final, _, _) = gatedDeltaUpdateCheckpointedWithGates(
+        q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias, state: state, mask: mask,
+        checkpointAfter: checkpointAfter, useKernel: useKernel)
+    return (y, checkpoint, final)
+}
+
+/// ``gatedDeltaUpdateCheckpointed(q:k:v:a:b:aLog:dtBias:state:mask:checkpointAfter:useKernel:)``
+/// that also returns the per-step decay `g` and write strength `beta` it fed
+/// the recurrence (`[B, T, Hv]`, float32). With `k` and `v` they are the
+/// verification tape ``gatedDeltaReplayState(k:v:g:beta:state:mask:useKernel:)``
+/// replays to rebuild the state after any kept prefix. Same ops as the
+/// wrapper; the extra results are the arrays the kernel already reads.
+/// Returns `(y, checkpointState, finalState, g, beta)`.
+public func gatedDeltaUpdateCheckpointedWithGates(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    a: MLXArray,
+    b: MLXArray,
+    aLog: MLXArray,
+    dtBias: MLXArray,
+    state: MLXArray? = nil,
+    mask: MLXArray? = nil,
+    checkpointAfter: Int,
+    useKernel: Bool = true
+) -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) {
     let beta = sigmoid(b).asType(.float32)
     let g = computeGatedDeltaG(aLog, a, dtBias)
 
@@ -619,7 +645,7 @@ public func gatedDeltaUpdateCheckpointed(
             q: q[0..., split...], k: k[0..., split...], v: v[0..., split...],
             g: g[0..., split...], beta: beta[0..., split...], state: mid,
             mask: mask.map { $0[0..., split...] })
-        return (concatenated([prefix, suffix], axis: 1), mid, final)
+        return (concatenated([prefix, suffix], axis: 1), mid, final, g, beta)
     }
 
     var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
@@ -642,5 +668,35 @@ public func gatedDeltaUpdateCheckpointed(
         outputShapes: [[B, T, Hv, Dv], state.shape, state.shape],
         outputDTypes: [q.dtype, state.dtype, state.dtype]
     )
-    return (outputs[0], outputs[2], outputs[1])
+    return (outputs[0], outputs[2], outputs[1], g, beta)
+}
+
+// MARK: - Tape replay
+
+/// The recurrent state after running `T` recorded steps from `state`: the
+/// tape replay that rebuilds a depth-D verification's kept-prefix state on
+/// rejection instead of materializing every prefix during the verify.
+///
+/// `k: [B, T, Hk, Dk]`, `v: [B, T, Hv, Dv]`, `g` and `beta: [B, T, Hv]` are
+/// the arrays a verify fed the recurrence (see
+/// ``gatedDeltaUpdateCheckpointedWithGates(q:k:v:a:b:aLog:dtBias:state:mask:checkpointAfter:useKernel:)``).
+/// It runs the same kernel with `k` standing in for `q`: the state update
+/// never reads `q`, and the fp32 state is stored exactly between kernels, so
+/// the result is bit-identical to the state the verify (or `T` single-token
+/// decode steps) reached after the same steps. A masked column leaves the
+/// state unchanged, as in the verify.
+public func gatedDeltaReplayState(
+    k: MLXArray,
+    v: MLXArray,
+    g: MLXArray,
+    beta: MLXArray,
+    state: MLXArray,
+    mask: MLXArray? = nil,
+    useKernel: Bool = true
+) -> MLXArray {
+    let state = state.dtype == .float32 ? state : state.asType(.float32)
+    if useKernel, GatedDeltaKernelManager.shared.kernel != nil, k.dim(3) % 32 == 0 {
+        return gatedDeltaKernel(q: k, k: k, v: v, g: g, beta: beta, state: state, mask: mask).1
+    }
+    return gatedDeltaOps(q: k, k: k, v: v, g: g, beta: beta, state: state, mask: mask).1
 }
