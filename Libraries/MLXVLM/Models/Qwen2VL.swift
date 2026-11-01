@@ -965,10 +965,16 @@ public struct Qwen2VLProcessor: UserInputProcessor {
 /// Which M-RoPE position state each cache needs for a token-only forward
 /// (macprovider #2201 audit). After an image prefill, text positions continue at
 /// `offset + rope delta`, not at the cache offset. `prepare` records the delta it
-/// returns for its cache (no delta: plain text), keyed weakly by the cache's
-/// first layer object, so entries die with their cache. A cache this model never
-/// saw (for example a caller's copy) is unknown: it is plain text only while
-/// this model has never prefilled vision.
+/// returns for its cache (no delta: plain text) and the cache offset where the
+/// last vision token ends, keyed weakly by the cache's first layer object, so
+/// entries die with their cache. The delta is valid only while the cache still
+/// holds that vision span: a forward that finds the cache trimmed below the
+/// recorded end drops the entry, and the cache stays unknown until `prepare`
+/// records it again. A cache this model never saw (for example a caller's copy)
+/// is unknown: it is plain text only while this model has never prefilled
+/// vision. Contents restored into the same cache object at or past the recorded
+/// end are not detectable here; callers that do that must use the
+/// state-carrying forward.
 private final class Qwen2VLRopeDeltaRegistry: @unchecked Sendable {
     enum Lookup {
         case known(MLXArray?)
@@ -978,6 +984,7 @@ private final class Qwen2VLRopeDeltaRegistry: @unchecked Sendable {
     private struct Entry {
         weak var cache: AnyObject?
         let delta: MLXArray?
+        let visionEnd: Int
     }
     private let lock = NSLock()
     private var entries: [Entry] = []
@@ -987,19 +994,42 @@ private final class Qwen2VLRopeDeltaRegistry: @unchecked Sendable {
         cache?.first.map { $0 as AnyObject }
     }
 
-    func record(_ delta: MLXArray?, for cache: [any KVCache]?) {
+    private static func offset(_ cache: [any KVCache]?) -> Int {
+        cache?.first?.offset ?? 0
+    }
+
+    func record(_ delta: MLXArray?, visionEnd: Int, for cache: [any KVCache]?) {
         guard let first = Self.key(cache) else { return }
         let nonzero = delta.map { any($0 .!= 0).item(Bool.self) } ?? false
         lock.lock(); defer { lock.unlock() }
         entries.removeAll { $0.cache == nil || $0.cache === first }
-        entries.append(Entry(cache: first, delta: nonzero ? delta : nil))
+        entries.append(Entry(cache: first, delta: nonzero ? delta : nil, visionEnd: nonzero ? visionEnd : 0))
         if nonzero { sawVision = true }
     }
 
+    /// The vision end recorded for `cache`, if it has a still-valid vision entry.
+    func visionEnd(_ cache: [any KVCache]?) -> Int? {
+        guard case .known(let delta) = lookup(cache), delta != nil,
+            let first = Self.key(cache)
+        else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return entries.first(where: { $0.cache === first })?.visionEnd
+    }
+
+    /// Drops the entry when the cache was trimmed back into or before its
+    /// recorded vision span, so the old delta is never applied to new contents.
     func lookup(_ cache: [any KVCache]?) -> Lookup {
         guard let first = Self.key(cache) else { return .known(nil) }
+        let offset = Self.offset(cache)
         lock.lock(); defer { lock.unlock() }
-        if let entry = entries.first(where: { $0.cache === first }) { return .known(entry.delta) }
+        if let index = entries.firstIndex(where: { $0.cache === first }) {
+            let entry = entries[index]
+            if entry.delta != nil, offset < entry.visionEnd {
+                entries.remove(at: index)
+                return .unknown
+            }
+            return .known(entry.delta)
+        }
         return sawVision ? .unknown : .known(nil)
     }
 }
@@ -1064,6 +1094,14 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
         cache.first?.offset ?? 0
     }
 
+    /// One past the last image or video token in a `[1, L]` prompt, if any.
+    private func lastVisionTokenEnd(_ inputIds: MLXArray) -> Int? {
+        let ids = inputIds.reshaped(-1).asType(.int32).asArray(Int32.self)
+        let image = Int32(config.baseConfiguration.imageTokenId)
+        let video = Int32(config.baseConfiguration.videoTokenId)
+        return ids.lastIndex(where: { $0 == image || $0 == video }).map { $0 + 1 }
+    }
+
     public func prepare(
         _ input: LMInput, cache: [any KVCache], state: LMOutput.State?,
         prefill: PrefillParameters
@@ -1100,7 +1138,10 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
         let result = languageModel(
             embeds == nil ? inputIds2D : nil, cache: cache, state: state, inputEmbedding: embeds)
 
-        ropeDeltaRegistry.record(result.state?[ropeDeltasKey], for: cache)
+        ropeDeltaRegistry.record(
+            result.state?[ropeDeltasKey],
+            visionEnd: pixels == nil ? 0 : lastVisionTokenEnd(inputIds2D) ?? inputIds2D.dim(-1),
+            for: cache)
 
         let total = inputIds2D.dim(-1)
         prefill.progress?(total, total)
@@ -1115,6 +1156,7 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
         precondition(remainderLength > 0, "prepareContinuation needs a non-empty remainder")
 
         let cacheOffset = faCacheOffset(cache)
+        let priorVisionEnd = ropeDeltaRegistry.visionEnd(cache)
         var anchorRopeDelta = 0
         if let seeded = state?[ropeDeltasKey] {
             anchorRopeDelta = seeded.asType(.int32).item(Int.self)
@@ -1159,7 +1201,13 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
 
         var resumeState = LMOutput.State()
         resumeState[ropeDeltasKey] = ropeDeltas - MLXArray(Int32(cacheOffset))
-        ropeDeltaRegistry.record(resumeState[ropeDeltasKey], for: cache)
+        // A cached prefix the registry cannot vouch for may hold vision anywhere
+        // before `cacheOffset`, so a seeded delta is valid only from there on.
+        let prefixVisionEnd = anchorRopeDelta != 0 ? (priorVisionEnd ?? cacheOffset) : 0
+        let remainderVisionEnd = lastVisionTokenEnd(inputIds).map { cacheOffset + $0 } ?? 0
+        ropeDeltaRegistry.record(
+            resumeState[ropeDeltasKey], visionEnd: max(prefixVisionEnd, remainderVisionEnd),
+            for: cache)
 
         return .logits(LMOutput(logits: lastLogits, state: resumeState))
     }
@@ -1168,29 +1216,40 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
-        languageModel(input.tokens, cache: cache, state: state)
+        // The caller's state is authoritative here; the lookup only drops a
+        // registry entry the cache was trimmed out of before this forward.
+        _ = ropeDeltaRegistry.lookup(cache)
+        return languageModel(input.tokens, cache: cache, state: state)
     }
 
     /// Token-only forward (the `LanguageModel` default traps). Positions follow
     /// the same state as the `LMInput.Text` path, which callers holding a
     /// prepare state should use: with no vision in the cache, sequential RoPE at
     /// the cache offset is exact; after a vision prefill through `prepare`, the
-    /// recorded M-RoPE delta is applied (mlx-vlm `rope_deltas`). A non-empty
-    /// cache this model did not prepare, once it has prefilled vision, may hold
-    /// vision tokens with an unknown delta, so the call refuses rather than
-    /// return logits at the wrong positions.
+    /// recorded M-RoPE delta is applied (mlx-vlm `rope_deltas`). When the cache
+    /// may hold vision tokens with an unknown delta (a copy, or a cache trimmed
+    /// into its image span), it refuses rather than return logits at the wrong
+    /// positions. The protocol requirement cannot throw, so this refusal stops
+    /// the process; callers that can handle the refusal use
+    /// ``tokenOnlyForward(_:cache:)``. No macprovider serving path drives this
+    /// model token-only (#2201 audit).
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
-        let state: LMOutput.State?
         do {
-            state = try tokenOnlyPositionState(cache: cache)
+            return try tokenOnlyForward(inputs, cache: cache)
         } catch {
             preconditionFailure("\(error)")
         }
+    }
+
+    /// The token-only forward, throwing ``UnknownPositionStateError`` instead of
+    /// stopping when the cache's M-RoPE position state is unknown.
+    public func tokenOnlyForward(_ inputs: MLXArray, cache: [any KVCache]?) throws -> MLXArray {
+        let state = try tokenOnlyPositionState(cache: cache)
         return languageModel(inputs, cache: cache, state: state).logits
     }
 
-    struct UnknownPositionStateError: Error, CustomStringConvertible {
-        var description: String {
+    public struct UnknownPositionStateError: Error, CustomStringConvertible {
+        public var description: String {
             "Qwen2VL token-only forward on a non-empty cache with unknown M-RoPE state; "
                 + "pass the prepare state through callAsFunction(_:cache:state:)"
         }
@@ -1207,11 +1266,11 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
             // Plain text: registered by prepare, or any cache before this model
             // has prefilled vision. Record it so a later vision prefill elsewhere
             // does not make it unknown.
-            ropeDeltaRegistry.record(nil, for: cache)
+            ropeDeltaRegistry.record(nil, visionEnd: 0, for: cache)
             return nil
         case .unknown:
             guard cache?.first?.offset ?? 0 == 0 else { throw UnknownPositionStateError() }
-            ropeDeltaRegistry.record(nil, for: cache)
+            ropeDeltaRegistry.record(nil, visionEnd: 0, for: cache)
             return nil
         }
     }

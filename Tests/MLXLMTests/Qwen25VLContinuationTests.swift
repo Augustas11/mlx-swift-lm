@@ -232,6 +232,65 @@ final class Qwen25VLContinuationTests: XCTestCase {
         XCTAssertNil(try model.tokenOnlyPositionState(cache: try model.newCache(parameters: nil)))
     }
 
+    /// macprovider #2201 audit (security MEDIUMs): the recorded delta holds only
+    /// while the cache still holds the image span. A trim within the trailing
+    /// text keeps the token-only step exact; a trim into the image makes the
+    /// state unknown, and it stays unknown after the cache grows back past the
+    /// span. The throwing forward refuses without stopping the process.
+    func testQwen2VLTokenOnlyStepAfterTrimMatchesOrRefuses() throws {
+        let model = try makeTinyQwen2VL()
+        // 5 text + vision start + 4 image tokens + 6 text: the image span ends at 10.
+        let tokens = concatenated(
+            [continuation.textTokens(5), continuation.imageRun(), continuation.textTokens(6, seed: 3)],
+            axis: 1)
+        let image = continuation.image()
+        let next = MLXArray([Int32(42), Int32(43)]).reshaped(1, 2)
+
+        func imagePrefill() throws -> ([any KVCache], LMOutput.State?) {
+            let cache = try model.newCache(parameters: nil)
+            let (_, state) = try continuation.lastLogits(
+                model.prepare(
+                    LMInput(text: .init(tokens: tokens), image: image),
+                    cache: cache, state: nil, prefill: PrefillParameters()))
+            return (cache, state)
+        }
+        func trim(_ cache: [any KVCache], _ n: Int) {
+            for layer in cache { XCTAssertEqual(layer.trim(n), n) }
+        }
+
+        // Trim within the trailing text: offset 13 is past the image end.
+        let (stateCache, state) = try imagePrefill()
+        trim(stateCache, 3)
+        let viaState = model(LMInput.Text(tokens: next), cache: stateCache, state: state).logits
+        let (tokenCache, _) = try imagePrefill()
+        trim(tokenCache, 3)
+        let viaTokens = try model.tokenOnlyForward(next, cache: tokenCache)
+        let (offsetCache, _) = try imagePrefill()
+        trim(offsetCache, 3)
+        let offsetOnly = model(LMInput.Text(tokens: next), cache: offsetCache, state: nil).logits
+        eval(viaState, viaTokens, offsetOnly)
+        XCTAssertGreaterThan(
+            continuation.maxAbsDiff(viaState, offsetOnly), 1e-3,
+            "fixture must make the rope delta matter")
+        XCTAssertLessThan(continuation.maxAbsDiff(viaState, viaTokens), 1e-4)
+
+        // Trim into the image: offset 9 is inside the span.
+        let (intoImage, _) = try imagePrefill()
+        trim(intoImage, 7)
+        XCTAssertThrowsError(try model.tokenOnlyPositionState(cache: intoImage))
+        XCTAssertThrowsError(try model.tokenOnlyForward(next, cache: intoImage)) {
+            XCTAssertTrue($0 is Qwen2VL.UnknownPositionStateError)
+        }
+        XCTAssertEqual(intoImage.first?.offset, 9, "a refused forward must not touch the cache")
+
+        // Regrowing past the span through the state path leaves it unknown.
+        let (regrown, _) = try imagePrefill()
+        trim(regrown, 7)
+        _ = model(LMInput.Text(tokens: next), cache: regrown, state: nil).logits
+        XCTAssertEqual(regrown.first?.offset, 11)
+        XCTAssertThrowsError(try model.tokenOnlyPositionState(cache: regrown))
+    }
+
     func testQwen2VLWindowedImagePrefillMatchesSingleShot() throws {
         try continuation.assertWindowedImagePrefill(makeTinyQwen2VL())
     }
