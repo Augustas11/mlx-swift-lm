@@ -648,8 +648,8 @@ private final class PrismPositionProbeCache: BaseKVCache {
 
     init(offsets: [Int]) {
         rowOffsets = MLXArray(offsets.map(Int32.init))
-        let values = offsets.flatMap { offset in
-            (0 ..< 3 * 128).map { Float(($0 + offset) % 29 - 14) / 29 }
+        let values: [Float] = offsets.flatMap { offset -> [Float] in
+            (0 ..< 3 * 128).map { (i: Int) -> Float in Float((i + offset) % 29 - 14) / 29 }
         }
         priorKeys = MLXArray(values).reshaped(offsets.count, 1, 3, 128)
         priorValues = priorKeys * 0.5
