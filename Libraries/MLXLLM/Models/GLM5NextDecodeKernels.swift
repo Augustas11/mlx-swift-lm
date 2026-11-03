@@ -1660,10 +1660,13 @@ private let glm5NextHCMixRowsSource = """
         }
       }
     #if DEFERRED
-      if (row < CH) {
-        for (int q = 0; q < 4; q++) {
+      // Rows 0 .. CH - 1 store h. Index hv by the unrolled i only: reading it as
+      // hv[4 * row + q] (a threadgroup-dependent index) returned wrong values
+      // for some slots at D = 4096 on the Studio's Metal compiler.
+      for (int i = 0; i < NI; i++) {
+        if (i / 4 == row) {
           for (int tn = 0; tn < 4; tn++) {
-            h_out_t[1024 * (4 * row + q) + int(lid) * 4 + tn] = hv[4 * row + q][tn];
+            h_out_t[1024 * i + int(lid) * 4 + tn] = hv[i][tn];
           }
         }
       }
