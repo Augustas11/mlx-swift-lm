@@ -98,11 +98,18 @@ final class MiniMaxM3ParityHarness: XCTestCase {
             "active_gb": Double(Memory.activeMemory) / 1e9,
         ])
 
+        // Wire the weights for the whole run, as mlx-lm / mlx-vlm generation
+        // does; unwired, a ~190 GB checkpoint is re-paged on every decode step.
+        let wired = WiredMemoryTicket(
+            size: GPU.maxRecommendedWorkingSetBytes() ?? 0, policy: MLX.WiredSumPolicy(),
+            manager: .shared, kind: .active)
         let chunk = plan.chunk ?? 2048
-        if mode == "perf" {
-            try perf(model: model, plan: plan, chunk: chunk, out: out)
-        } else {
-            try parity(model: model, plan: plan, chunk: chunk, out: out)
+        try await wired.withWiredLimit {
+            if mode == "perf" {
+                try perf(model: model, plan: plan, chunk: chunk, out: out)
+            } else {
+                try parity(model: model, plan: plan, chunk: chunk, out: out)
+            }
         }
         try out.write(["event": "done"])
     }

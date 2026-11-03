@@ -343,6 +343,26 @@ final class MiniMaxM3Tests: XCTestCase {
         XCTAssertEqual(maxAbsDifference(before, after), 0)
     }
 
+    /// The attention ropes q, k and the index heads in one call; partial
+    /// RoPE over the concatenated heads is bitwise the per-tensor RoPE.
+    func testBatchedRopeMatchesPerTensorRope() throws {
+        let rope = RoPE(dimensions: 64, traditional: false, base: 1e7)
+        for (L, offset) in [(1, 9000), (37, 0), (300, 4096)] {
+            let shapes = [64, 4, 1, 4].map { [1, L, $0, 128] }
+            let parts = shapes.map { MLXRandom.normal($0).asType(.bfloat16) }
+            let separate = parts.map { rope($0.transposed(0, 2, 1, 3), offset: offset) }
+            let all = rope(concatenated(parts, axis: 2).transposed(0, 2, 1, 3), offset: offset)
+            var start = 0
+            for (part, expected) in zip(parts, separate) {
+                let count = part.dim(2)
+                XCTAssertTrue(
+                    arrayEqual(all[0..., start ..< start + count], expected).item(Bool.self),
+                    "L=\(L) offset=\(offset) heads \(start)..<\(start + count)")
+                start += count
+            }
+        }
+    }
+
     // MARK: - Checkpoint loading
 
     /// An oQ3e-style `minimax_m3_vl` checkpoint: 3-bit affine routed experts

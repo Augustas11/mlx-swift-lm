@@ -431,9 +431,9 @@ final class MiniMaxM3Attention: Module {
         let (B, H, L) = (queries.dim(0), queries.dim(1), queries.dim(2))
         let total = keys.dim(2)
         var scores = matmul(queries.asType(.float32), keys.asType(.float32).swappedAxes(-1, -2))
-        let queryPositions = MLXArray(Int32(qStart) ..< Int32(qStart + L)).reshaped(1, 1, L, 1)
+        let queryPositions = arange(qStart, qStart + L, dtype: .int32).reshaped(1, 1, L, 1)
         scores = miniMaxM3MaskIndexScores(
-            scores * scale, MLXArray(Int32(0) ..< Int32(total)), queryPositions)
+            scores * scale, arange(total, dtype: .int32), queryPositions)
 
         let fullBlocks = total / blockSize
         let tail = total % blockSize
@@ -447,7 +447,7 @@ final class MiniMaxM3Attention: Module {
         }
 
         let current = floorDivide(queryPositions, MLXArray(Int32(blockSize)))
-        let blocks = MLXArray(Int32(0) ..< Int32(numBlocks))
+        let blocks = arange(numBlocks, dtype: .int32)
         let causal = blocks .<= current
         let negInf = MLXArray(-Float.infinity)
         var selected = MLX.where(causal .&& (blockScores .== blockScores), blockScores, negInf)
@@ -483,9 +483,9 @@ final class MiniMaxM3Attention: Module {
         let blockKeep = putAlong(
             MLXArray.zeros([B, H, L, numBlocks + 1], dtype: .bool), safe,
             values: MLXArray(true), axis: -1)
-        let keyPositions = MLXArray(Int32(0) ..< Int32(total))
+        let keyPositions = arange(total, dtype: .int32)
         var keep = blockKeep.take(floorDivide(keyPositions, MLXArray(Int32(blockSize))), axis: -1)
-        let queryPositions = MLXArray(Int32(qStart) ..< Int32(qStart + L)).reshaped(L, 1)
+        let queryPositions = arange(qStart, qStart + L, dtype: .int32).reshaped(L, 1)
         keep = keep .&& (keyPositions.reshaped(1, total) .<= queryPositions)
         return repeated(keep, count: heads / H, axis: 1)
     }
@@ -503,8 +503,36 @@ final class MiniMaxM3Attention: Module {
         }
         let offset = cache?.ropeOffset
         let qStart = cache?.offset ?? 0
-        q = applyRotaryPosition(rope, to: q.transposed(0, 2, 1, 3), offset: offset)
-        k = applyRotaryPosition(rope, to: k.transposed(0, 2, 1, 3), offset: offset)
+        // Up to topkBlocks blocks every query attends its whole prefix, so
+        // the index queries are only needed past that length.
+        let selecting = qStart + L > blockSize * topkBlocks
+
+        // RoPE is per head and position, so the heads of every roped tensor
+        // share one call (a partial-dims RoPE is a copy plus a rotation).
+        var parts = [q, k]
+        if sparse, let indexKProj, let indexKNorm {
+            parts.append(indexKNorm(indexKProj(x).reshaped(B, L, 1, indexDim)))
+            if selecting, let indexQProj, let indexQNorm {
+                parts.append(indexQNorm(indexQProj(x).reshaped(B, L, indexHeads, indexDim)))
+            }
+        }
+        let roped: [MLXArray]
+        if indexDim == headDim {
+            let counts = parts.map { $0.dim(2) }
+            let all = applyRotaryPosition(
+                rope, to: concatenated(parts, axis: 2).transposed(0, 2, 1, 3), offset: offset)
+            var start = 0
+            roped = counts.map { count in
+                defer { start += count }
+                return all[0..., start ..< start + count]
+            }
+        } else {
+            roped = parts.map {
+                applyRotaryPosition(rope, to: $0.transposed(0, 2, 1, 3), offset: offset)
+            }
+        }
+        q = roped[0]
+        k = roped[1]
 
         var keys = k
         var values = v
@@ -513,11 +541,8 @@ final class MiniMaxM3Attention: Module {
         }
 
         var attentionMask = mask
-        if sparse, let indexQProj, let indexKProj, let indexQNorm, let indexKNorm {
-            var iq = indexQNorm(indexQProj(x).reshaped(B, L, indexHeads, indexDim))
-            var ik = indexKNorm(indexKProj(x).reshaped(B, L, 1, indexDim))
-            iq = applyRotaryPosition(rope, to: iq.transposed(0, 2, 1, 3), offset: offset)
-            ik = applyRotaryPosition(rope, to: ik.transposed(0, 2, 1, 3), offset: offset)
+        if roped.count > 2 {
+            var ik = roped[2]
             if let cache {
                 guard let sparseCache = cache as? MiniMaxM3Cache else {
                     fatalError("MiniMax M3 sparse layers need a MiniMaxM3Cache, got \(type(of: cache))")
@@ -525,8 +550,8 @@ final class MiniMaxM3Attention: Module {
                 ik = sparseCache.updateIndex(ik)
             }
             let total = ik.dim(2)
-            // Up to topkBlocks blocks every query attends its whole prefix.
-            if total > blockSize * topkBlocks {
+            if roped.count > 3 {
+                let iq = roped[3]
                 let selectedLength = blockSize * topkBlocks
                 let useKernel =
                     L > 1
@@ -535,7 +560,7 @@ final class MiniMaxM3Attention: Module {
                 let blocks = selectBlocks(queries: iq, keys: ik, qStart: qStart, sorted: useKernel)
                 if useKernel {
                     let positions = broadcast(
-                        MLXArray(Int32(qStart) ..< Int32(qStart + L)).reshaped(1, L), to: [B, L])
+                        arange(qStart, qStart + L, dtype: .int32).reshaped(1, L), to: [B, L])
                     if let output = miniMaxM3SparseAttention(
                         queries: q, keys: keys, values: values, blockIndices: blocks,
                         queryPositions: positions, scale: scale, blockSize: blockSize)
