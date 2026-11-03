@@ -419,7 +419,7 @@ struct Qwen35MTPRegistrationTests {
             configuration: Data(qwen35StandaloneMTPConfigJSON().utf8),
             modelType: "qwen3_5_mtp")
         #expect(standalone is MLXLLM.Qwen35MTPDraftModel)
-        #expect(standalone.maximumBlockSize == 2)
+        #expect(standalone.maximumBlockSize == 4)
         #expect(standalone.requiresPromptPrefill)
         #expect(!standalone.requiresSharedTargetKV)
         #expect(standalone.requiresGreedySampling)

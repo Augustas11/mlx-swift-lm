@@ -179,8 +179,11 @@ final class Qwen35TapeRollbackTests: XCTestCase {
     }
 
     func testDepthTwoAndThreeVerifyPrefixesMatchSerialDecode() throws {
-        let model = try quantizedModel(seed: 2199)
         for width in [3, 4] {
+            // Widths 3 and 4 share one compiled-segment key per model, and the
+            // compiled count does not grow on a shape retrace: a fresh model
+            // per width lets each width prove it took the compiled path.
+            let model = try quantizedModel(seed: 2199)
             for compiled in [true, false] {
                 try assertPrefixesMatchSerialDecode(
                     model, width: width, compiled: compiled, seed: UInt64(30 + width))
