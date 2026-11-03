@@ -584,6 +584,56 @@ final class GLM5NextTests: XCTestCase {
         assertBitwiseEqual(nextNormalized, nextChain.0, "branch input after a folded expand")
     }
 
+    /// The deferred chain at the artifact's hidden size (D = 4096, where
+    /// `glm5NextHCPre` keeps 16 values per thread and its collapse takes a
+    /// separate branch): over three half-layers, `glm5NextHCPre` +
+    /// `glm5NextHCPost` with the previous expand folded in equal expand +
+    /// `glm5NextHCMix` + `glm5NextHCNorm` bit for bit, one row and three, one
+    /// token and an 8-column verify.
+    func testDeferredHyperConnectionChainBitwiseAtArtifactWidth() throws {
+        guard glm5NextHCDeferredExact else { return }
+        let D = 4096
+        let (fn, scale, base, normWeight) = withRandomState(MLXRandom.RandomState(seed: 81)) {
+            (
+                0.05 * MLXRandom.normal([24, 4 * D]), 1 + 0.2 * MLXRandom.normal([3]),
+                0.5 * MLXRandom.normal([24]), (1 + 0.1 * MLXRandom.normal([D])).asType(.bfloat16)
+            )
+        }
+        for (B, L) in [(1, 1), (3, 1), (1, 8)] {
+            var x = withRandomState(MLXRandom.RandomState(seed: UInt64(82 + B + L))) {
+                MLXRandom.normal([B, L, 4, D]).asType(.bfloat16)
+            }
+            var deferred: (y: MLXArray, mm: MLXArray, post: MLXArray)? = nil
+            for step in 0 ..< 3 {
+                let at = "B=\(B) L=\(L) step \(step)"
+                let mixes = try XCTUnwrap(glm5NextHCMix(x, fn: fn, eps: 1e-5))
+                let chain = try XCTUnwrap(
+                    glm5NextHCNorm(
+                        x, mixes: mixes, scale: scale, base: base, normWeight: normWeight,
+                        sinkhornIterations: 20, hcEps: 1e-6, normEps: 1e-5))
+                let (normalized, preMixes, h) = glm5NextHCPre(
+                    x: deferred == nil ? x : nil, deferred: deferred, fn: fn, scale: scale,
+                    base: base, normWeight: normWeight, normEps: 1e-5, hcEps: 1e-6,
+                    branchNormEps: 1e-5)
+                let (post, comb, mm) = glm5NextHCPost(
+                    mixes: preMixes, scale: scale, base: base, residual: h,
+                    sinkhornIterations: 20, hcEps: 1e-6)
+                assertBitwiseEqual(h, x, "residual \(at)")
+                assertBitwiseEqual(normalized, chain.0, "branch input \(at)")
+                assertBitwiseEqual(post, chain.1, "post \(at)")
+                assertBitwiseEqual(comb, chain.2, "comb \(at)")
+                assertBitwiseEqual(
+                    mm.reshaped(B, L, 4, D),
+                    matmul(comb.swappedAxes(-1, -2), x.asType(.float32)), "comb product \(at)")
+                let y = withRandomState(MLXRandom.RandomState(seed: UInt64(95 + step))) {
+                    MLXRandom.normal([B, L, D]).asType(.bfloat16)
+                }
+                x = glm5NextHCExpand(y, x, post, comb)
+                deferred = (y, mm, post)
+            }
+        }
+    }
+
     /// `glm5NextMoEExperts` (gate/up with the router's selection replayed,
     /// down + routing-weighted combine + shared expert) reproduces the MoE op
     /// path bit for bit on an affine-quantized layer: 4-bit routed experts
