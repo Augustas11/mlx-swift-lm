@@ -72,9 +72,9 @@ final class GLM5NextHyperConnection: Module {
     var fusedDecode = true
 
     /// Prefill (more than 8 tokens) runs the Sinkhorn + collapse + branch
-    /// RMSNorm kernel on the op path's mixes, per token as in decode. On for
-    /// GLM-5.3 (`GLM5NextDecoderLayer`); DeepSeek-V4 keeps its reference
-    /// prefill arithmetic.
+    /// RMSNorm kernel on the op path's mixes, per token as in decode. Off: the
+    /// kernel's arithmetic (fast exp, FMA collapse) is not the op path's, so
+    /// prefill logits and the tokens that follow move off the reference.
     var fusedPrefill = false
 
     @ParameterInfo(key: "fn") var fn: MLXArray
@@ -1196,8 +1196,6 @@ final class GLM5NextDecoderLayer: Module {
         _attnHC.wrappedValue = GLM5NextHyperConnection(config)
         _ffnHC.wrappedValue = GLM5NextHyperConnection(config)
         super.init()
-        attnHC.fusedPrefill = true
-        ffnHC.fusedPrefill = true
     }
 
     /// `x: [B, L, hc_mult, D]`.
