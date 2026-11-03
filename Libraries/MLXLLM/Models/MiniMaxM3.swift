@@ -52,9 +52,263 @@ final class MiniMaxM3RMSNorm: Module, UnaryLayer {
         guard gemma else {
             return MLXFast.rmsNorm(x, weight: weight, eps: eps).asType(x.dtype)
         }
+        if let w = scale.value, let out = miniMaxM3RMSNorm(x, scale: w, eps: eps) {
+            return out
+        }
         let w = scale.value ?? (weight.asType(.float32) + 1)
         return MLXFast.rmsNorm(x, weight: w, eps: eps).asType(x.dtype)
     }
+}
+
+/// `MLXFast.rmsNorm` of a half-precision `x` against a float32 scale, cast
+/// back to `x`'s dtype, in one launch instead of three (cast to float32,
+/// float32 norm, cast back). Each row replays MLX's `rms_single_row` (rows
+/// up to 4096) or `rms_looped` arithmetic with the same threadgroup, so the
+/// result is bitwise the three-op chain.
+private let miniMaxM3RMSNormSource = """
+        constexpr int N_READS = 4;
+        constexpr int SIMD_SIZE = 32;
+        const uint axis_size = AXIS;
+        uint gid = threadgroup_position_in_grid.y;
+        uint lid = thread_position_in_threadgroup.x;
+        uint lsize = threads_per_threadgroup.x;
+        uint simd_lane_id = thread_index_in_simdgroup;
+        uint simd_group_id = simdgroup_index_in_threadgroup;
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[SIMD_SIZE];
+
+        const device T* xr = x + gid * size_t(axis_size) + lid * N_READS;
+        const device float* wr = w + lid * N_READS;
+        device T* outr = out + gid * size_t(axis_size) + lid * N_READS;
+
+        float acc = 0;
+        float thread_x[N_READS];
+        if (!LOOPED) {
+          if (lid * N_READS + N_READS <= axis_size) {
+            for (int i = 0; i < N_READS; i++) {
+              thread_x[i] = xr[i];
+              acc += thread_x[i] * thread_x[i];
+            }
+          } else {
+            for (int i = 0; i < N_READS; i++) {
+              thread_x[i] = (lid * N_READS + i < axis_size) ? (float)xr[i] : 0;
+              acc += thread_x[i] * thread_x[i];
+            }
+          }
+        } else {
+          for (uint r = 0; r < axis_size; r += lsize * N_READS) {
+            if (r + lid * N_READS + N_READS <= axis_size) {
+              for (int i = 0; i < N_READS; i++) {
+                float xi = xr[i + r];
+                acc += xi * xi;
+              }
+            } else {
+              for (int i = 0; i < N_READS; i++) {
+                if ((r + lid * N_READS + i) < axis_size) {
+                  float xi = xr[i + r];
+                  acc += xi * xi;
+                }
+              }
+            }
+          }
+        }
+        acc = simd_sum(acc);
+        if (simd_group_id == 0) {
+          local_sums[simd_lane_id] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_lane_id == 0) {
+          local_sums[simd_group_id] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group_id == 0) {
+          acc = simd_sum(local_sums[simd_lane_id]);
+          if (simd_lane_id == 0) {
+            local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps[0]);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (!LOOPED) {
+          for (int i = 0; i < N_READS; i++) {
+            if (lid * N_READS + i < axis_size) {
+              float normed = thread_x[i] * local_inv_mean[0];
+              outr[i] = static_cast<T>(wr[i] * normed);
+            }
+          }
+        } else {
+          for (uint r = 0; r < axis_size; r += lsize * N_READS) {
+            for (int i = 0; i < N_READS; i++) {
+              if ((r + lid * N_READS + i) < axis_size) {
+                float normed = float(xr[r + i]) * local_inv_mean[0];
+                outr[r + i] = static_cast<T>(wr[r + i] * normed);
+              }
+            }
+          }
+        }
+    """
+
+private final class MiniMaxM3RMSNormKernel: @unchecked Sendable {
+    static let shared = MiniMaxM3RMSNormKernel()
+
+    /// MLX's `RMS_LOOPED_LIMIT` and its looped threadgroup.
+    static let loopedLimit = 4096
+    static let loopedThreads = 1024
+
+    let kernel = MLXFast.metalKernel(
+        name: "minimax_m3_rms_norm",
+        inputNames: ["x", "w", "eps"],
+        outputNames: ["out"],
+        source: miniMaxM3RMSNormSource,
+        header: "#include <metal_simdgroup>\nusing namespace metal;\n")
+}
+
+func miniMaxM3RMSNorm(_ x: MLXArray, scale: MLXArray, eps: Float) -> MLXArray? {
+    let axis = x.dim(-1)
+    guard x.ndim >= 1, axis > 0, x.dtype == .bfloat16 || x.dtype == .float16,
+        scale.dtype == .float32, scale.shape == [axis]
+    else { return nil }
+    let rows = x.size / axis
+    guard rows > 0 else { return nil }
+    let looped = axis > MiniMaxM3RMSNormKernel.loopedLimit
+    let threads =
+        looped ? MiniMaxM3RMSNormKernel.loopedThreads : ((axis + 3) / 4 + 31) / 32 * 32
+    return MiniMaxM3RMSNormKernel.shared.kernel(
+        [x, scale, MLXArray([eps])],
+        template: [("T", x.dtype), ("AXIS", axis), ("LOOPED", looped)],
+        grid: (threads, rows, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [x.shape],
+        outputDTypes: [x.dtype])[0]
+}
+
+/// The per-head norms of up to four `[B, L, H_t, D]` tensors (`x0` ...
+/// `x3`, `H_t` heads each, scale `w_t`), written as one `[B, sum H_t, L, D]`
+/// tensor: the concatenated, head-major input the attention ropes in one
+/// call. Each row is `miniMaxM3RMSNormSource`'s single-row arithmetic.
+private let miniMaxM3HeadNormsSource = """
+        constexpr int N_READS = 4;
+        constexpr int SIMD_SIZE = 32;
+        constexpr int HEADS = H0 + H1 + H2 + H3;
+        const uint axis_size = AXIS;
+        uint row = threadgroup_position_in_grid.y;
+        uint lid = thread_position_in_threadgroup.x;
+        uint simd_lane_id = thread_index_in_simdgroup;
+        uint simd_group_id = simdgroup_index_in_threadgroup;
+
+        // Output rows are (b, head, l); find the source tensor and its row.
+        uint l = row % SEQ;
+        uint head = (row / SEQ) % HEADS;
+        uint b = row / (SEQ * HEADS);
+        const device T* xr;
+        const device float* wr;
+        if (head < H0) {
+          xr = x0 + ((b * SEQ + l) * H0 + head) * size_t(axis_size);
+          wr = w0;
+        } else if (head < H0 + H1) {
+          xr = x1 + ((b * SEQ + l) * H1 + (head - H0)) * size_t(axis_size);
+          wr = w1;
+        } else if (head < H0 + H1 + H2) {
+          xr = x2 + ((b * SEQ + l) * H2 + (head - H0 - H1)) * size_t(axis_size);
+          wr = w2;
+        } else {
+          xr = x3 + ((b * SEQ + l) * H3 + (head - H0 - H1 - H2)) * size_t(axis_size);
+          wr = w3;
+        }
+        xr += lid * N_READS;
+        wr += lid * N_READS;
+        device T* outr = out + row * size_t(axis_size) + lid * N_READS;
+
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[SIMD_SIZE];
+
+        float acc = 0;
+        float thread_x[N_READS];
+        if (lid * N_READS + N_READS <= axis_size) {
+          for (int i = 0; i < N_READS; i++) {
+            thread_x[i] = xr[i];
+            acc += thread_x[i] * thread_x[i];
+          }
+        } else {
+          for (int i = 0; i < N_READS; i++) {
+            thread_x[i] = (lid * N_READS + i < axis_size) ? (float)xr[i] : 0;
+            acc += thread_x[i] * thread_x[i];
+          }
+        }
+        acc = simd_sum(acc);
+        if (simd_group_id == 0) {
+          local_sums[simd_lane_id] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_lane_id == 0) {
+          local_sums[simd_group_id] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group_id == 0) {
+          acc = simd_sum(local_sums[simd_lane_id]);
+          if (simd_lane_id == 0) {
+            local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps[0]);
+          }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int i = 0; i < N_READS; i++) {
+          if (lid * N_READS + i < axis_size) {
+            float normed = thread_x[i] * local_inv_mean[0];
+            outr[i] = static_cast<T>(wr[i] * normed);
+          }
+        }
+    """
+
+private final class MiniMaxM3HeadNormsKernel: @unchecked Sendable {
+    static let shared = MiniMaxM3HeadNormsKernel()
+
+    let kernel = MLXFast.metalKernel(
+        name: "minimax_m3_head_norms",
+        inputNames: ["x0", "x1", "x2", "x3", "w0", "w1", "w2", "w3", "eps"],
+        outputNames: ["out"],
+        source: miniMaxM3HeadNormsSource,
+        header: "#include <metal_simdgroup>\nusing namespace metal;\n")
+}
+
+/// Normalize each `[B, L, H_t, D]` tensor in `parts` with its float32
+/// `scales[t]` and return them as one `[B, sum H_t, L, D]` tensor (heads in
+/// `parts` order), bitwise each norm cast back to the input dtype and
+/// concatenated and transposed. `nil` when the shapes are not covered.
+func miniMaxM3HeadNorms(_ parts: [MLXArray], scales: [MLXArray], eps: Float) -> MLXArray? {
+    guard (1 ... 4).contains(parts.count), scales.count == parts.count,
+        let first = parts.first, first.ndim == 4,
+        first.dtype == .bfloat16 || first.dtype == .float16
+    else { return nil }
+    let (B, L, D) = (first.dim(0), first.dim(1), first.dim(3))
+    guard D <= MiniMaxM3RMSNormKernel.loopedLimit,
+        parts.allSatisfy({
+            $0.ndim == 4 && $0.dim(0) == B && $0.dim(1) == L && $0.dim(3) == D
+                && $0.dtype == first.dtype
+        }),
+        scales.allSatisfy({ $0.dtype == .float32 && $0.shape == [D] })
+    else { return nil }
+    var heads = parts.map { $0.dim(2) }
+    var inputs = parts
+    var weights = scales
+    while inputs.count < 4 {
+        heads.append(0)
+        inputs.append(first)
+        weights.append(scales[0])
+    }
+    let total = heads.reduce(0, +)
+    let threads = ((D + 3) / 4 + 31) / 32 * 32
+    return MiniMaxM3HeadNormsKernel.shared.kernel(
+        inputs + weights + [MLXArray([eps])],
+        template: [
+            ("T", first.dtype), ("AXIS", D), ("SEQ", L),
+            ("H0", heads[0]), ("H1", heads[1]), ("H2", heads[2]), ("H3", heads[3]),
+        ],
+        grid: (threads, B * total * L, 1),
+        threadGroup: (threads, 1, 1),
+        outputShapes: [[B, total, L, D]],
+        outputDTypes: [first.dtype])[0]
 }
 
 /// `(clip(up, ±limit) + beta) * g * sigmoid(alpha * g)` with `g = min(gate,
@@ -497,37 +751,47 @@ final class MiniMaxM3Attention: Module {
         var q = qProj(x).reshaped(B, L, heads, headDim)
         var k = kProj(x).reshaped(B, L, kvHeads, headDim)
         let v = vProj(x).reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
-        if let qNorm, let kNorm {
-            q = qNorm(q)
-            k = kNorm(k)
-        }
         let offset = cache?.ropeOffset
         let qStart = cache?.offset ?? 0
         // Up to topkBlocks blocks every query attends its whole prefix, so
         // the index queries are only needed past that length.
         let selecting = qStart + L > blockSize * topkBlocks
 
-        // RoPE is per head and position, so the heads of every roped tensor
-        // share one call (a partial-dims RoPE is a copy plus a rotation).
-        var parts = [q, k]
+        // Every roped tensor with the norm that precedes its RoPE.
+        var raw: [(MLXArray, MiniMaxM3RMSNorm?)] = [(q, qNorm), (k, kNorm)]
         if sparse, let indexKProj, let indexKNorm {
-            parts.append(indexKNorm(indexKProj(x).reshaped(B, L, 1, indexDim)))
+            raw.append((indexKProj(x).reshaped(B, L, 1, indexDim), indexKNorm))
             if selecting, let indexQProj, let indexQNorm {
-                parts.append(indexQNorm(indexQProj(x).reshaped(B, L, indexHeads, indexDim)))
+                raw.append((indexQProj(x).reshaped(B, L, indexHeads, indexDim), indexQNorm))
             }
         }
+        let counts = raw.map { $0.0.dim(2) }
+
+        // RoPE is per head and position, so the heads of every roped tensor
+        // share one call (a partial-dims RoPE is a copy plus a rotation). The
+        // head norms write that concatenated, head-major input in one launch.
+        var headMajor: MLXArray?
+        let norms = raw.compactMap { $0.1 }
+        let scales = norms.compactMap { $0.scale.value }
+        if indexDim == headDim, scales.count == raw.count,
+            norms.allSatisfy({ $0.eps == norms[0].eps })
+        {
+            headMajor = miniMaxM3HeadNorms(raw.map { $0.0 }, scales: scales, eps: norms[0].eps)
+        }
+        func normed() -> [MLXArray] { raw.map { x, norm in norm.map { $0(x) } ?? x } }
         let roped: [MLXArray]
         if indexDim == headDim {
-            let counts = parts.map { $0.dim(2) }
             let all = applyRotaryPosition(
-                rope, to: concatenated(parts, axis: 2).transposed(0, 2, 1, 3), offset: offset)
+                rope,
+                to: headMajor ?? concatenated(normed(), axis: 2).transposed(0, 2, 1, 3),
+                offset: offset)
             var start = 0
             roped = counts.map { count in
                 defer { start += count }
                 return all[0..., start ..< start + count]
             }
         } else {
-            roped = parts.map {
+            roped = normed().map {
                 applyRotaryPosition(rope, to: $0.transposed(0, 2, 1, 3), offset: offset)
             }
         }

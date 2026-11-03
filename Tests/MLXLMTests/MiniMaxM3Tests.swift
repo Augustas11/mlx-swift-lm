@@ -343,6 +343,39 @@ final class MiniMaxM3Tests: XCTestCase {
         XCTAssertEqual(maxAbsDifference(before, after), 0)
     }
 
+    /// The one-launch norm is bitwise MLX's cast, float32 rms_norm, cast
+    /// chain, on single-row and looped row lengths, with and without tails.
+    func testFusedNormMatchesMLXChain() throws {
+        for dtype in [DType.bfloat16, .float16] {
+            for shape in [[3, 7, 128], [2, 6144], [5, 100], [1, 4100], [2368, 128], [4, 4096]] {
+                let x = (3 * MLXRandom.normal(shape)).asType(dtype)
+                let w = 1 + 0.1 * MLXRandom.normal([shape.last!])
+                let expected = MLXFast.rmsNorm(x, weight: w, eps: 1e-6).asType(dtype)
+                let actual = try XCTUnwrap(miniMaxM3RMSNorm(x, scale: w, eps: 1e-6))
+                XCTAssertEqual(actual.dtype, dtype)
+                XCTAssertTrue(
+                    arrayEqual(actual, expected).item(Bool.self), "\(dtype) \(shape)")
+            }
+        }
+    }
+
+    /// The multi-tensor head norm is bitwise each MLX norm chain, then the
+    /// concatenation over heads and the head-major transpose.
+    func testHeadNormsMatchPerTensorChain() throws {
+        for (B, L, heads) in [(1, 1, [64, 4, 1]), (1, 37, [64, 4, 1, 4]), (2, 5, [8, 2, 1, 2])] {
+            let parts = heads.map { (2 * MLXRandom.normal([B, L, $0, 128])).asType(.bfloat16) }
+            let scales = heads.map { _ in 1 + 0.1 * MLXRandom.normal([128]) }
+            let expected = concatenated(
+                zip(parts, scales).map {
+                    MLXFast.rmsNorm($0, weight: $1, eps: 1e-6).asType(.bfloat16)
+                }, axis: 2
+            ).transposed(0, 2, 1, 3)
+            let actual = try XCTUnwrap(miniMaxM3HeadNorms(parts, scales: scales, eps: 1e-6))
+            XCTAssertEqual(actual.shape, expected.shape)
+            XCTAssertTrue(arrayEqual(actual, expected).item(Bool.self), "B=\(B) L=\(L) \(heads)")
+        }
+    }
+
     /// The attention ropes q, k and the index heads in one call; partial
     /// RoPE over the concatenated heads is bitwise the per-tensor RoPE.
     func testBatchedRopeMatchesPerTensorRope() throws {
