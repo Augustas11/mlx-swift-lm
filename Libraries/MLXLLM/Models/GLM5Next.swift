@@ -171,24 +171,29 @@ final class GLM5NextHyperConnection: Module {
                 normWeight: norm.weight)
     }
 
-    /// One-token-per-row branch input: the values of `glm5NextHCPre` +
-    /// `glm5NextHCPost` (the expand, mix and Sinkhorn + collapse + RMSNorm
-    /// chain) from the split kernels of `glm5NextHCBranchStep`, as
-    /// `(normalized, h, post, comb, mm)`.
+    /// One-token-per-row branch input as `glm5NextHCPre` + `glm5NextHCPost`:
+    /// `(normalized, h, post, comb, mm)`, the values of the expand, mix and
+    /// Sinkhorn + collapse + RMSNorm chain.
     func deferredBranchInput(_ state: GLM5NextHCState, norm: RMSNorm) -> (
         MLXArray, MLXArray, MLXArray, MLXArray, MLXArray
     ) {
-        let x: MLXArray?
-        let deferred: (y: MLXArray, mm: MLXArray, post: MLXArray)?
+        let (normalized, mixes, h): (MLXArray, MLXArray, MLXArray)
         switch state {
-        case .materialized(let h): (x, deferred) = (h, nil)
-        case .deferred(let y, _, let post, _, let mm): (x, deferred) = (nil, (y, mm, post))
+        case .materialized(let x):
+            (normalized, mixes, h) = glm5NextHCPre(
+                x: x, deferred: nil, fn: fn, scale: scale, base: base, normWeight: norm.weight,
+                normEps: normEps, hcEps: hcEps, branchNormEps: norm.eps)
+        case .deferred(let y, _, let post, _, let mm):
+            (normalized, mixes, h) = glm5NextHCPre(
+                x: nil, deferred: (y, mm, post), fn: fn, scale: scale, base: base,
+                normWeight: norm.weight, normEps: normEps, hcEps: hcEps,
+                branchNormEps: norm.eps)
         }
-        let (normalized, _, h, post, comb, mm) = glm5NextHCBranchStep(
-            x: x, deferred: deferred, fn: fn, scale: scale, base: base, normWeight: norm.weight,
-            normEps: normEps, hcEps: hcEps, branchNormEps: norm.eps,
-            sinkhornIterations: sinkhornIterations)
-        return (normalized, h, post, comb, mm)
+        let (post, comb, mm) = glm5NextHCPost(
+            mixes: mixes, scale: scale, base: base, residual: h,
+            sinkhornIterations: sinkhornIterations, hcEps: hcEps)
+        // Encode the post kernel before the branch so it runs beside it.
+        return (depends(input: normalized, dependencies: [post]), h, post, comb, mm)
     }
 }
 

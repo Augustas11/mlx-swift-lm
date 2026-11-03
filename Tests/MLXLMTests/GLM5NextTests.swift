@@ -584,55 +584,6 @@ final class GLM5NextTests: XCTestCase {
         assertBitwiseEqual(nextNormalized, nextChain.0, "branch input after a folded expand")
     }
 
-    /// `glm5NextHCBranchStep` (the split mix-rows + finish kernels the model
-    /// decodes with) equals `glm5NextHCPre` followed by `glm5NextHCPost` bit
-    /// for bit, in both forms, over a chain of half-layers: the artifact's
-    /// hidden 4096 and the test models' 1024, bf16 and fp16, one row and
-    /// three, one token and an 8-column verify.
-    func testSplitHyperConnectionKernelsMatchPrePostBitwise() throws {
-        for (D, dtype) in [(4096, DType.bfloat16), (1024, .bfloat16), (1024, .float16)] {
-            let (fn, scale, base, normWeight) = withRandomState(MLXRandom.RandomState(seed: 71)) {
-                (
-                    0.05 * MLXRandom.normal([24, 4 * D]), 1 + 0.2 * MLXRandom.normal([3]),
-                    0.5 * MLXRandom.normal([24]), (1 + 0.1 * MLXRandom.normal([D])).asType(dtype)
-                )
-            }
-            for (B, L) in [(1, 1), (3, 1), (1, 8), (2, 8)] {
-                let label = "D=\(D) \(dtype) B=\(B) L=\(L)"
-                var x = withRandomState(MLXRandom.RandomState(seed: UInt64(72 + B + L))) {
-                    MLXRandom.normal([B, L, 4, D]).asType(dtype)
-                }
-                var deferred: (y: MLXArray, mm: MLXArray, post: MLXArray)? = nil
-                for step in 0 ..< 3 {
-                    let reference = glm5NextHCPre(
-                        x: deferred == nil ? x : nil, deferred: deferred, fn: fn, scale: scale,
-                        base: base, normWeight: normWeight, normEps: 1e-5, hcEps: 1e-6,
-                        branchNormEps: 1e-5)
-                    let (post, comb, mm) = glm5NextHCPost(
-                        mixes: reference.1, scale: scale, base: base, residual: reference.2,
-                        sinkhornIterations: 20, hcEps: 1e-6)
-                    let split = glm5NextHCBranchStep(
-                        x: deferred == nil ? x : nil, deferred: deferred, fn: fn, scale: scale,
-                        base: base, normWeight: normWeight, normEps: 1e-5, hcEps: 1e-6,
-                        branchNormEps: 1e-5, sinkhornIterations: 20)
-                    let at = "\(label) step \(step)"
-                    assertBitwiseEqual(split.0, reference.0, "normalized \(at)")
-                    assertBitwiseEqual(split.1, reference.1, "mixes \(at)")
-                    assertBitwiseEqual(split.2, reference.2, "h \(at)")
-                    assertBitwiseEqual(split.3, post, "post \(at)")
-                    assertBitwiseEqual(split.4, comb, "comb \(at)")
-                    assertBitwiseEqual(split.5, mm, "mm \(at)")
-                    // The branch output feeding the next half-layer's deferred form.
-                    let y = withRandomState(MLXRandom.RandomState(seed: UInt64(90 + step))) {
-                        MLXRandom.normal([B, L, D]).asType(dtype)
-                    }
-                    x = reference.2
-                    deferred = (y, mm, post)
-                }
-            }
-        }
-    }
-
     /// `glm5NextMoEExperts` (gate/up with the router's selection replayed,
     /// down + routing-weighted combine + shared expert) reproduces the MoE op
     /// path bit for bit on an affine-quantized layer: 4-bit routed experts
