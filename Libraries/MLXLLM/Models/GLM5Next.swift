@@ -914,11 +914,8 @@ final class GLM5NextAttention: Module {
     /// Queries per gathered sparse-attention block.
     static let sparseChunk = 64
 
-    /// Prefill sparse attention runs each query's heads as one GEMM. Off: with
-    /// the heads on the query axis SDPA leaves its one-query kernel and sums
-    /// in another order, so prefill past the indexer's top-k moves off the
-    /// reference.
-    var headsAsQueriesPrefill = false
+    /// Prefill sparse attention runs each query's heads as one GEMM.
+    var headsAsQueriesPrefill = true
 
     @ModuleInfo(key: "q_a_proj") var qAProj: Linear
     @ModuleInfo(key: "q_a_layernorm") var qALayerNorm: RMSNorm
