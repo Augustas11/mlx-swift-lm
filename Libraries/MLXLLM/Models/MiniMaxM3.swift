@@ -349,6 +349,123 @@ final class MiniMaxM3MLP: Module, UnaryLayer {
 
 // MARK: - MoE
 
+/// Sigmoid routing with a score-correction bias in one launch: per token, the
+/// top `K` experts by `sigmoid(gate) + bias`, weights the unbiased scores of
+/// those experts normalized, both in ascending expert order. Bitwise the
+/// compiled reference route: the sigmoid is MLX's `Sigmoid` functor, the
+/// selection is the stable ascending sort `argPartition` runs on `-biased`
+/// (ties to the lower expert, NaN last), the weight sum adds in selection
+/// order as MLX's small row reduction does.
+private let miniMaxM3RouteSource = """
+        uint row = thread_position_in_grid.x;
+        // An input smaller than 8 elements arrives in the constant address
+        // space. A one-token route over a handful of experts is that small.
+        auto g = gates + size_t(row) * EXPERTS;
+
+        float top_key[K];
+        float top_score[K];
+        uint top_index[K];
+        int filled = 0;
+        for (int e = 0; e < EXPERTS; e++) {
+          float x = static_cast<float>(g[e]);
+          float y = 1 / (1 + metal::precise::exp(metal::abs(x)));
+          float score = (x < 0) ? y : 1 - y;
+          float key = -(score + static_cast<float>(bias[e]));
+          // First slot whose key this one sorts strictly before.
+          int pos = filled;
+          for (int j = filled - 1; j >= 0; j--) {
+            bool kn = metal::isnan(key);
+            bool tn = metal::isnan(top_key[j]);
+            bool before = (kn | tn) ? ((!kn) & tn) : (key < top_key[j]);
+            if (!before) break;
+            pos = j;
+          }
+          if (pos >= K) continue;
+          for (int j = min(filled, K - 1); j > pos; j--) {
+            top_key[j] = top_key[j - 1];
+            top_score[j] = top_score[j - 1];
+            top_index[j] = top_index[j - 1];
+          }
+          top_key[pos] = key;
+          top_score[pos] = score;
+          top_index[pos] = uint(e);
+          filled = min(filled + 1, K);
+        }
+
+        float total = 0;
+        for (int j = 0; j < K; j++) {
+          total = top_score[j] + total;
+        }
+        float denominator = total + 1e-20f;
+        float weight[K];
+        for (int j = 0; j < K; j++) {
+          weight[j] = top_score[j] / denominator;
+        }
+
+        // Ascending expert order (distinct experts).
+        for (int i = 1; i < K; i++) {
+          uint index = top_index[i];
+          float w = weight[i];
+          int j = i - 1;
+          while (j >= 0 && top_index[j] > index) {
+            top_index[j + 1] = top_index[j];
+            weight[j + 1] = weight[j];
+            j--;
+          }
+          top_index[j + 1] = index;
+          weight[j + 1] = w;
+        }
+        for (int j = 0; j < K; j++) {
+          indices[size_t(row) * K + j] = top_index[j];
+          weights[size_t(row) * K + j] = weight[j];
+        }
+    """
+
+private final class MiniMaxM3RouteKernel: @unchecked Sendable {
+    static let shared = MiniMaxM3RouteKernel()
+
+    let kernel = MLXFast.metalKernel(
+        name: "minimax_m3_route",
+        inputNames: ["gates", "bias"],
+        outputNames: ["indices", "weights"],
+        source: miniMaxM3RouteSource)
+}
+
+/// `[indices (uint32), weights (float32)]`, each `[..., k]`, of the sigmoid
+/// route over `gates` (`[..., E]`) with score-correction `bias` (`[E]`);
+/// `nil` when the shapes are not covered.
+func miniMaxM3Route(gates: MLXArray, bias: MLXArray, k: Int) -> [MLXArray]? {
+    let experts = gates.dim(-1)
+    guard gates.ndim >= 1, experts > 0, k >= 1, k <= experts, bias.shape == [experts],
+        [DType.float32, .bfloat16, .float16].contains(gates.dtype),
+        [DType.float32, .bfloat16, .float16].contains(bias.dtype)
+    else { return nil }
+    let rows = gates.size / experts
+    guard rows > 0 else { return nil }
+    var shape = gates.shape
+    shape[shape.count - 1] = k
+    return MiniMaxM3RouteKernel.shared.kernel(
+        [gates, bias],
+        template: [("T", gates.dtype), ("B", bias.dtype), ("EXPERTS", experts), ("K", k)],
+        grid: (rows, 1, 1),
+        threadGroup: (min(rows, 256), 1, 1),
+        outputShapes: [shape, shape],
+        outputDTypes: [.uint32, .float32])
+}
+
+/// The routed experts' gate and up projections as one `[E, 2 * I, *]`
+/// quantized weight, built at `prepare()`. A reference type, so module
+/// reflection never sees it as a parameter.
+final class MiniMaxM3FusedGateUp: @unchecked Sendable {
+    var weight: MLXArray?
+    var scales: MLXArray?
+    var biases: MLXArray?
+    var hidden = 0
+    var groupSize = 0
+    var bits = 0
+    var mode: QuantizationMode = .affine
+}
+
 final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
     let topK: Int
     let routedScalingFactor: Float
@@ -359,16 +476,21 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
     @ModuleInfo(key: "shared_experts") var sharedExperts: MiniMaxM3MLP?
     @ParameterInfo(key: "e_score_correction_bias") var eScoreCorrectionBias: MLXArray?
 
+    let activation: @Sendable (MLXArray, MLXArray) -> MLXArray
+    let fused = MiniMaxM3FusedGateUp()
+
     /// `[gates, bias] -> [indices, weights]`: top-k on the biased scores,
     /// weights from the unbiased ones, normalized.
-    private let route: @Sendable ([MLXArray]) -> [MLXArray]
-    /// `(outputs [.., k, D], weights [.., k]) -> [.., D]`.
-    private let combine: @Sendable (MLXArray, MLXArray) -> MLXArray
+    let route: @Sendable ([MLXArray]) -> [MLXArray]
+    /// `[outputs [.., k, D], weights [.., k], shared?, residual?] -> [y]`:
+    /// the weighted expert sum, then `+ shared`, then `residual +`.
+    let combine: @Sendable ([MLXArray]) -> [MLXArray]
 
     init(_ config: MiniMaxM3Configuration, activation: @escaping @Sendable (MLXArray, MLXArray) -> MLXArray) {
         self.topK = config.numExpertsPerTok
         self.routedScalingFactor = config.routedScalingFactor
         self.sigmoidScoring = config.scoringFunc == "sigmoid"
+        self.activation = activation
         _gate.wrappedValue = Linear(config.hiddenSize, config.numLocalExperts, bias: false)
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize, hiddenDims: config.intermediateSize,
@@ -396,30 +518,139 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
             return [takeAlong(indices, order, axis: -1), takeAlong(weights, order, axis: -1)]
         }
         let factor = routedScalingFactor
-        combine = compile { outputs, weights in
+        combine = compile { arrays in
             // Each weighted expert output and each running sum round to the
-            // activation dtype; the routed scale applies last.
+            // activation dtype; the routed scale applies last. The shared
+            // expert and the residual add after it, each rounded, as the
+            // separate eager adds do.
+            let outputs = arrays[0]
             let dtype = outputs.dtype
-            let weighted = (outputs.asType(.float32) * expandedDimensions(weights, axis: -1))
+            let weighted = (outputs.asType(.float32) * expandedDimensions(arrays[1], axis: -1))
                 .asType(dtype)
             var result = weighted[.ellipsis, 0, 0...]
             for i in 1 ..< weighted.dim(-2) {
                 result = (result.asType(.float32) + weighted[.ellipsis, i, 0...].asType(.float32))
                     .asType(dtype)
             }
-            return (result.asType(.float32) * factor).asType(dtype)
+            var y = (result.asType(.float32) * factor).asType(dtype)
+            if arrays.count > 2 { y = y + arrays[2] }
+            if arrays.count > 3 { y = arrays[3] + y }
+            return [y]
         }
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let gates = gate(x).asType(.float32)
-        let routed = route([gates] + (eScoreCorrectionBias.map { [$0] } ?? []))
-        var y = combine(switchMLP(x, routed[0]), routed[1])
-        if let sharedExperts {
-            y = y + sharedExperts(x)
+    /// The router logits. An unquantized router's matmul switches from a
+    /// vector product to a matrix product past one row, so each row of a
+    /// multi-row batch takes its own, as its serial forward does.
+    private func routerLogits(_ x: MLXArray) -> MLXArray {
+        guard x.dim(0) > 1, !(gate is QuantizedLinear) else { return gate(x) }
+        return concatenated((0 ..< x.dim(0)).map { gate(x[$0 ..< ($0 + 1)]) }, axis: 0)
+    }
+
+    private func routeTokens(_ x: MLXArray) -> [MLXArray] {
+        let gates = routerLogits(x).asType(.float32)
+        if sigmoidScoring, let bias = eScoreCorrectionBias,
+            let routed = miniMaxM3Route(gates: gates, bias: bias, k: topK)
+        {
+            return routed
         }
-        return y
+        return route([gates] + (eScoreCorrectionBias.map { [$0] } ?? []))
+    }
+
+    /// `switchMLP(x, indices)`, with the gate and up projections in one
+    /// gather once `fuseGateUp()` has run.
+    private func experts(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        guard let weight = fused.weight, let scales = fused.scales else {
+            return switchMLP(x, indices)
+        }
+        var x = expandedDimensions(x, axes: [-2, -3])
+        let doSort = indices.size >= 64
+        var idx = indices
+        var inverseOrder = MLXArray()
+        if doSort {
+            (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
+        }
+        let gateUp = gatherQuantizedMM(
+            x, weight, scales: scales, biases: fused.biases, rhsIndices: idx, transpose: true,
+            groupSize: fused.groupSize, bits: fused.bits, mode: fused.mode,
+            sortedIndices: doSort)
+        let h = fused.hidden
+        let activated = activation(gateUp[.ellipsis, ..<h], gateUp[.ellipsis, h...])
+        var out = switchMLP.downProjection(activated, idx, sortedIndices: doSort)
+        if doSort {
+            out = scatterUnsort(x: out, invOrder: inverseOrder, shape: indices.shape)
+        }
+        return squeezed(out, axis: -2)
+    }
+
+    /// Concatenate the routed gate and up projections per expert along the
+    /// output rows (quantization groups run along the input) into one
+    /// weight, then release the separate ones. Each output row of a
+    /// quantized gather is its own dot product, so the fused gather is
+    /// bitwise the two. Skipped unless both are plain quantized switch
+    /// layers with one quantization; idempotent.
+    func fuseGateUp() throws {
+        guard fused.weight == nil,
+            let gateProj = switchMLP.gateProjection as? QuantizedSwitchLinear,
+            let upProj = switchMLP.upProjection as? QuantizedSwitchLinear,
+            type(of: gateProj) == QuantizedSwitchLinear.self,
+            type(of: upProj) == QuantizedSwitchLinear.self,
+            gateProj.groupSize == upProj.groupSize, gateProj.bits == upProj.bits,
+            gateProj.mode == upProj.mode
+        else { return }
+        let g = gateProj.quantizedParts
+        let u = upProj.quantizedParts
+        guard g.bias == nil, u.bias == nil, (g.biases == nil) == (u.biases == nil),
+            g.weight.ndim == 3, g.weight.size > 0, g.weight.shape == u.weight.shape,
+            g.scales.shape == u.scales.shape
+        else { return }
+        let weight = concatenated([g.weight, u.weight], axis: 1)
+        let scales = concatenated([g.scales, u.scales], axis: 1)
+        let biases = g.biases.flatMap { gb in u.biases.map { concatenated([gb, $0], axis: 1) } }
+        eval([weight, scales] + (biases.map { [$0] } ?? []))
+        fused.weight = weight
+        fused.scales = scales
+        fused.biases = biases
+        fused.hidden = g.weight.dim(1)
+        fused.groupSize = gateProj.groupSize
+        fused.bits = gateProj.bits
+        fused.mode = gateProj.mode
+        func released(_ parts: (weight: MLXArray, scales: MLXArray, biases: MLXArray?, bias: MLXArray?))
+            -> ModuleParameters
+        {
+            var entries = [
+                ("weight", MLXArray.zeros([0], dtype: parts.weight.dtype)),
+                ("scales", MLXArray.zeros([0], dtype: parts.scales.dtype)),
+            ]
+            if let biases = parts.biases {
+                entries.append(("biases", MLXArray.zeros([0], dtype: biases.dtype)))
+            }
+            return ModuleParameters.unflattened(entries)
+        }
+        _ = try gateProj.update(parameters: released(g), verify: .none)
+        _ = try upProj.update(parameters: released(u), verify: .none)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        callAsFunction(x, residual: nil)
+    }
+
+    /// The MoE output, plus `residual` when given (`residual + moe(x)`).
+    func callAsFunction(_ x: MLXArray, residual: MLXArray?) -> MLXArray {
+        let routed = routeTokens(x)
+        var inputs = [experts(x, routed[0]), routed[1]]
+        if let sharedExperts {
+            inputs.append(sharedExperts(x))
+        }
+        if let residual {
+            // The combine reads the residual as its fourth input.
+            if sharedExperts == nil {
+                return residual + combine(inputs)[0]
+            }
+            inputs.append(residual)
+        }
+        return combine(inputs)[0]
     }
 }
 
@@ -744,25 +975,94 @@ final class MiniMaxM3Attention: Module {
         return repeated(keep, count: heads / H, axis: 1)
     }
 
+    /// A `MiniMaxM3BatchedSparseCache` holds one cache per row of `x`
+    /// (continuous batching): the projections run on all rows at once, then
+    /// each row's norms, RoPE, cache update, block selection and attention
+    /// run against its own cache with its own offset, exactly as a serial
+    /// forward of that row. Any other cache serves all of `x`.
+    ///
+    /// Batched rows match their serial runs bit for bit while a forward
+    /// carries no more flattened tokens (rows x tokens per row) than the
+    /// MLX core's quantized-matmul vector limit: past it the projections
+    /// switch from qmv to qmm.
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
+        if let batch = cache as? any MiniMaxM3BatchedSparseCache {
+            return batchedAttention(x, batch: batch)
+        }
+        let selecting = (cache?.offset ?? 0) + x.dim(1) > blockSize * topkBlocks
+        let indexKeys = sparse ? indexKProj.map { $0(x) } : nil
+        let indexQueries = sparse && selecting ? indexQProj.map { $0(x) } : nil
+        return oProj(
+            attend(
+                q: qProj(x), k: kProj(x), v: vProj(x), indexK: indexKeys, indexQ: indexQueries,
+                mask: mask, cache: cache))
+    }
+
+    private func batchedAttention(_ x: MLXArray, batch: any MiniMaxM3BatchedSparseCache)
+        -> MLXArray
+    {
+        let rows = batch.rowCaches
         let (B, L) = (x.dim(0), x.dim(1))
-        var q = qProj(x).reshaped(B, L, heads, headDim)
-        var k = kProj(x).reshaped(B, L, kvHeads, headDim)
-        let v = vProj(x).reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
+        precondition(
+            rows.count == B, "MiniMax M3 batched cache has \(rows.count) rows for a batch of \(B)")
+        let lengths = batch.rowLengths
+        precondition(lengths == nil || lengths!.count == B)
+        let valid = (0 ..< B).map { lengths?[$0] ?? L }
+        let selecting = zip(rows, valid).map { $0.offset + $1 > blockSize * topkBlocks }
+
+        let q = qProj(x)
+        let k = kProj(x)
+        let v = vProj(x)
+        let indexKeys = sparse ? indexKProj.map { $0(x) } : nil
+        let indexQueries = sparse && selecting.contains(true) ? indexQProj.map { $0(x) } : nil
+
+        var outputs = [MLXArray]()
+        for (index, rowCache) in rows.enumerated() {
+            let n = valid[index]
+            precondition(n >= 1 && n <= L, "MiniMax M3 row length \(n) outside 1...\(L)")
+            func row(_ a: MLXArray) -> MLXArray {
+                if B == 1 && n == L { return a }
+                return n == L ? a[index ..< (index + 1)] : a[index ..< (index + 1), ..<n]
+            }
+            // A lone forward of the row: no mask for one token, causal past it.
+            let out = attend(
+                q: row(q), k: row(k), v: row(v), indexK: indexKeys.map(row),
+                indexQ: selecting[index] ? indexQueries.map(row) : nil,
+                mask: n == 1 ? .none : .causal, cache: rowCache)
+            if n < L {
+                // Padded columns attend nothing and wrote no cache.
+                let padding = MLXArray.zeros([1, L - n, out.dim(2)], dtype: out.dtype)
+                outputs.append(concatenated([out, padding], axis: 1))
+            } else {
+                outputs.append(out)
+            }
+        }
+        return oProj(outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0))
+    }
+
+    /// `[B, L, heads * headDim]` attention before `o_proj` of the projected
+    /// queries, keys and values (`[B, L, *]`); `indexK` and `indexQ` are the
+    /// indexer projections (`indexQ` only when the queries select blocks).
+    private func attend(
+        q qProjected: MLXArray, k kProjected: MLXArray, v vProjected: MLXArray,
+        indexK: MLXArray?, indexQ: MLXArray?,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        let (B, L) = (qProjected.dim(0), qProjected.dim(1))
+        var q = qProjected.reshaped(B, L, heads, headDim)
+        var k = kProjected.reshaped(B, L, kvHeads, headDim)
+        let v = vProjected.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
         let offset = cache?.ropeOffset
         let qStart = cache?.offset ?? 0
-        // Up to topkBlocks blocks every query attends its whole prefix, so
-        // the index queries are only needed past that length.
-        let selecting = qStart + L > blockSize * topkBlocks
 
         // Every roped tensor with the norm that precedes its RoPE.
         var raw: [(MLXArray, MiniMaxM3RMSNorm?)] = [(q, qNorm), (k, kNorm)]
-        if sparse, let indexKProj, let indexKNorm {
-            raw.append((indexKProj(x).reshaped(B, L, 1, indexDim), indexKNorm))
-            if selecting, let indexQProj, let indexQNorm {
-                raw.append((indexQProj(x).reshaped(B, L, indexHeads, indexDim), indexQNorm))
+        if let indexK, let indexKNorm {
+            raw.append((indexK.reshaped(B, L, 1, indexDim), indexKNorm))
+            if let indexQ, let indexQNorm {
+                raw.append((indexQ.reshaped(B, L, indexHeads, indexDim), indexQNorm))
             }
         }
         let counts = raw.map { $0.0.dim(2) }
@@ -798,6 +1098,14 @@ final class MiniMaxM3Attention: Module {
         q = roped[0]
         k = roped[1]
 
+        // A dense layer on a cache that attends from its own storage
+        // (a continuous-batching row batch) attends there.
+        if roped.count == 2, let attentionCache = cache as? KVCacheAttentionProtocol {
+            let output = attentionCache.updateAndAttend(
+                queries: q, keys: k, values: v, scale: scale, mask: mask)
+            return output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        }
+
         var keys = k
         var values = v
         if let cache {
@@ -808,8 +1116,9 @@ final class MiniMaxM3Attention: Module {
         if roped.count > 2 {
             var ik = roped[2]
             if let cache {
-                guard let sparseCache = cache as? MiniMaxM3Cache else {
-                    fatalError("MiniMax M3 sparse layers need a MiniMaxM3Cache, got \(type(of: cache))")
+                guard let sparseCache = cache as? any MiniMaxM3SparseCache else {
+                    fatalError(
+                        "MiniMax M3 sparse layers need a MiniMaxM3SparseCache, got \(type(of: cache))")
                 }
                 ik = sparseCache.updateIndex(ik)
             }
@@ -829,7 +1138,7 @@ final class MiniMaxM3Attention: Module {
                         queries: q, keys: keys, values: values, blockIndices: blocks,
                         queryPositions: positions, scale: scale, blockSize: blockSize)
                     {
-                        return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+                        return output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
                     }
                 }
                 attentionMask = .array(blockMask(blocks, total: total, qStart: qStart))
@@ -838,7 +1147,7 @@ final class MiniMaxM3Attention: Module {
 
         let output = MLXFast.scaledDotProductAttention(
             queries: q, keys: keys, values: values, scale: scale, mask: attentionMask)
-        return oProj(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        return output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
     }
 }
 
@@ -879,7 +1188,7 @@ final class MiniMaxM3DecoderLayer: Module {
         let h = x + selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         let normed = postAttentionLayerNorm(h)
         if let blockSparseMoe {
-            return h + blockSparseMoe(normed)
+            return blockSparseMoe(normed, residual: h)
         }
         return h + mlp!(normed)
     }
@@ -938,9 +1247,14 @@ public final class MiniMaxM3TextModel: Module, LLMModel {
         return model.embedTokens.asLinear(out)
     }
 
-    /// Cache every Gemma norm's `1 + weight`.
+    /// Cache every Gemma norm's `1 + weight` and fuse each MoE layer's routed
+    /// gate and up projections (one layer at a time, so the copy never
+    /// holds more than one layer's projections twice).
     public func prepare() throws {
         eval(model.norms.compactMap { $0.prepare() })
+        for layer in model.layers {
+            try layer.blockSparseMoe?.fuseGateUp()
+        }
     }
 
     /// Sparse layers keep the whole context for the indexer, so `maxKVSize`

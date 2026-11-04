@@ -13,7 +13,61 @@
 import Foundation
 import MLX
 
-public final class MiniMaxM3Cache: BaseKVCache, CustomDebugStringConvertible {
+/// The cache a MiniMax M3 sparse-attention layer reads and writes for one
+/// sequence: the attention keys and values (`update(keys:values:)`) and the
+/// indexer keys of the same tokens (`updateIndex`).
+public protocol MiniMaxM3SparseCache: KVCache {
+    /// Append the indexer keys (`[1, 1, L, D]`) of the tokens the last
+    /// `update(keys:values:)` added; return every cached indexer key
+    /// (`[1, 1, offset, D]`).
+    func updateIndex(_ keys: MLXArray) -> MLXArray
+}
+
+/// A sparse-attention layer cache for several sequences decoded in one
+/// forward (continuous batching). The model projects every row together and
+/// runs each row's norms, RoPE, block selection and attention against its own
+/// `rowCaches` entry, as a serial forward of that row does.
+public protocol MiniMaxM3BatchedSparseCache: KVCache {
+    /// One cache per batch row, in row order.
+    var rowCaches: [any MiniMaxM3SparseCache] { get }
+
+    /// Valid leading columns per row of the current forward (right-padded
+    /// rows), or `nil` when every column of every row is valid. A padded
+    /// column attends nothing and writes no cache.
+    var rowLengths: [Int]? { get }
+}
+
+/// `MiniMaxM3BatchedSparseCache` over existing per-sequence caches. The rows
+/// carry the state; `offset` is unused.
+public final class MiniMaxM3CacheBatch: BaseKVCache, MiniMaxM3BatchedSparseCache {
+    public let rowCaches: [any MiniMaxM3SparseCache]
+    public private(set) var rowLengths: [Int]?
+
+    public init(rowCaches: [any MiniMaxM3SparseCache]) {
+        precondition(!rowCaches.isEmpty, "MiniMaxM3CacheBatch needs at least one row")
+        self.rowCaches = rowCaches
+        super.init()
+    }
+
+    public override func innerState() -> [MLXArray] {
+        rowCaches.flatMap { $0.innerState() }
+    }
+
+    public override func copy() -> any KVCache {
+        MiniMaxM3CacheBatch(rowCaches: rowCaches.map { $0.copy() as! any MiniMaxM3SparseCache })
+    }
+
+    /// Ragged packed forward: valid leading columns per row.
+    public override func prepare(lengths: [Int]?) {
+        rowLengths = lengths.flatMap { Set($0).count <= 1 ? nil : $0 }
+    }
+
+    public override func finalize() {
+        rowLengths = nil
+    }
+}
+
+public final class MiniMaxM3Cache: BaseKVCache, MiniMaxM3SparseCache, CustomDebugStringConvertible {
     public var step = 256
 
     private var keys: MLXArray?
