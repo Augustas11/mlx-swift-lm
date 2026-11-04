@@ -77,11 +77,8 @@ private class NemotronHRMSNormGated: Module {
         let unflattened = states.reshaped(newShape)
 
         // Python: x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
-        // Apply RMS norm per group WITHOUT scaling (pass ones as weight)
-        // Swift rmsNorm doesn't accept nil, so we use identity weight. It must
-        // carry the input dtype: `rmsNorm` returns the promoted type of input
-        // and weight, so a float32 identity turned every Mamba output, and the
-        // residual stream after the first Mamba layer, into float32 (#2201).
+        // Swift rmsNorm doesn't accept nil. The identity must use the input
+        // dtype, or the result promotes to float32.
         let identityWeight = MLXArray.ones([groupSize], dtype: unflattened.dtype)
         let normed = MLXFast.rmsNorm(unflattened, weight: identityWeight, eps: eps)
 
