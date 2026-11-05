@@ -390,8 +390,14 @@ public func loadWeights(
     }
 
     // apply the loaded weights
-    let parameters = ModuleParameters.unflattened(weights)
-    try model.update(parameters: parameters, verify: [.all])
+    do {
+        let parameters = ModuleParameters.unflattened(weights)
+        try model.update(parameters: parameters, verify: [.all])
+    }
+    // The model now holds every array. Drop the loader's references so a
+    // tensor that preparation replaces (a fused projection) can be freed
+    // there; held here, each stays resident beside its replacement.
+    weights.removeAll()
 
     // Build derived inference-only state and realize the model while the loader
     // still has exclusive access. Forward passes must remain read-only.

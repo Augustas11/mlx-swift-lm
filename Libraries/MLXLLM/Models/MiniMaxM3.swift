@@ -1254,6 +1254,11 @@ public final class MiniMaxM3TextModel: Module, LLMModel {
         eval(model.norms.compactMap { $0.prepare() })
         for layer in model.layers {
             try layer.blockSparseMoe?.fuseGateUp()
+            // The replaced gate/up tensors return to MLX's buffer cache, whose
+            // default bound sits past physical memory: across the layers of a
+            // 194 GB checkpoint they would hold a second copy of every
+            // projection the fused weights replaced.
+            Memory.clearCache()
         }
     }
 

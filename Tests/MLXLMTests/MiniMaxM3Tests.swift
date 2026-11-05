@@ -693,6 +693,50 @@ final class MiniMaxM3Tests: XCTestCase {
         XCTAssertEqual(maxAbsDifference(actual, expected), 0)
     }
 
+    /// Loading fuses each gate/up pair. The separate projections it replaces
+    /// must leave memory as each layer fuses: neither the loader's references
+    /// nor MLX's buffer cache (whose default bound sits past physical memory)
+    /// may keep them. Either one holds a second copy of a 194 GB checkpoint's
+    /// gate/up tensors. A loader that still held them releases them only on
+    /// return, after the last clear, so they would show here as cache.
+    func testLoadingReleasesProjectionsReplacedByFusion() throws {
+        let directory = URL(filePath: NSTemporaryDirectory())
+            .appending(component: "minimax-m3-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gateUpBytes = try autoreleasepool { () -> Int in
+            let reference = MiniMaxM3Model(try configuration(nested: true))
+            randomize(reference)
+            quantize(model: reference) { path, module in
+                if path.hasSuffix("block_sparse_moe.gate") { return nil }
+                guard module is Linear || module is Embedding || module is SwitchLinear else {
+                    return nil
+                }
+                return (32, 3, .affine)
+            }
+            eval(reference)
+            let arrays = Dictionary(uniqueKeysWithValues: reference.parameters().flattened())
+            try save(arrays: arrays, url: directory.appending(component: "model.safetensors"))
+            return arrays.filter {
+                $0.key.contains("switch_mlp.gate_proj.") || $0.key.contains("switch_mlp.up_proj.")
+            }.values.reduce(0) { $0 + $1.nbytes }
+        }
+        XCTAssertGreaterThan(gateUpBytes, 0)
+        Stream.gpu.synchronize()
+        Memory.clearCache()
+        let model = MiniMaxM3Model(try configuration(nested: true))
+        try loadWeights(
+            modelDirectory: directory, model: model,
+            quantization: .init(groupSize: 32, bits: 3))
+        Stream.gpu.synchronize()
+        let cached = Memory.cacheMemory
+        let up = model.leafModules().flattened().first {
+            $0.0.hasSuffix("layers.2.block_sparse_moe.switch_mlp.up_proj")
+        }?.1 as? QuantizedSwitchLinear
+        XCTAssertEqual(up?.weight.size, 0, "gate/up fused at load")
+        XCTAssertLessThan(cached, gateUpBytes / 2)
+    }
+
     /// Raw per-expert tensors stack into `switch_mlp`.
     func testSanitizeStacksExpertsAndDropsVision() throws {
         let config = try configuration(nested: true)
