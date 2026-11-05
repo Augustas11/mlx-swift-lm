@@ -41,10 +41,23 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
     /// Drafter-cache tokens a round leaves tentative: the chained drafts.
     public static let maxTrim = 7
 
-    public init(_ configuration: GLM5NextConfiguration, maximumDepth: Int = 1) {
+    /// Prompt columns the head prefills: the last `promptWindow` of them. The
+    /// trunk's sparse attention is NoPE, so the head's cache needs no absolute
+    /// positions, and prefilling the whole prompt cost about 4% of TTFT at
+    /// 32K, more than the decode gain returns on short outputs. Prompts no
+    /// longer than the window prefill exactly as before.
+    public static let defaultPromptWindow = 4096
+    public let promptWindow: Int
+
+    public init(
+        _ configuration: GLM5NextConfiguration, maximumDepth: Int = 1,
+        promptWindow: Int = GLM5NextMTPDraftModel.defaultPromptWindow
+    ) {
         precondition((1 ... Self.maxTrim).contains(maximumDepth))
+        precondition(promptWindow > 0)
         self.configuration = configuration
         self.maximumDepth = maximumDepth
+        self.promptWindow = promptWindow
         super.init()
     }
 
@@ -111,10 +124,12 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
         let prompt = normalizedMTPTokenBatch(promptTokens)
         guard prompt.dim(-1) > 0 else { return }
         let shifted = concatenated([prompt[0..., 1...], normalizedMTPColumn(firstBonus)], axis: 1)
+        let length = shifted.dim(1)
+        let start = max(0, length - promptWindow)
         let raw = head.forward(
-            tokens: shifted, hidden: targetHidden[0..., ..<shifted.dim(1), 0...],
+            tokens: shifted[0..., start...], hidden: targetHidden[0..., start ..< length, 0...],
             cache: state.cache[0])
-        state.nextPosition = shifted.dim(1)
+        state.nextPosition = length - start
         state.seedHidden = raw[0..., (-1)..., 0...]
         state.seedToken = head.sample(state.seedHidden!, sampler: sampler)
         state.proposalAppended = 0
