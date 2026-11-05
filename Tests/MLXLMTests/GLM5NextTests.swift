@@ -2061,6 +2061,48 @@ final class GLM5NextTests: XCTestCase {
         model.model.deferredDecode = true
     }
 
+    func testMTPDrafterPromptWindowMatchesTruncatedPrompt() throws {
+        let model = try fusedShapesModel(seed: 205)
+        let sampler = GenerateParameters(temperature: 0).sampler()
+        let length = 13
+        let window = 8
+        let prompt = tokens(length, seed: 206)
+        let cache = try model.newCache(parameters: nil)
+        let out = model(LMInput.Text(tokens: prompt), cache: cache, state: emitState())
+        let bonus = argMax(out.logits[0..., -1, 0...], axis: -1)
+        let hidden = try XCTUnwrap(out.state?[mtpLastHiddenStatesKey])
+
+        // The windowed head sees the last `window` shifted columns.
+        let windowed = GLM5NextMTPDraftModel(model.configuration, promptWindow: window)
+        var a = windowed.makeState(parameters: nil)
+        windowed.prepareDrafterState(
+            target: model, promptTokens: prompt, targetHidden: hidden, firstBonus: bonus,
+            positionDeltas: nil, state: &a, sampler: sampler)
+        eval(a.cache, a.seedToken!, a.seedHidden!)
+        XCTAssertEqual(a.nextPosition, window)
+        XCTAssertEqual(a.cache[0].offset, window)
+
+        // A full-prompt head fed the same columns as a shorter prompt.
+        let full = GLM5NextMTPDraftModel(model.configuration)
+        var b = full.makeState(parameters: nil)
+        let start = length - window
+        full.prepareDrafterState(
+            target: model, promptTokens: prompt[0..., start...],
+            targetHidden: hidden[0..., start..., 0...], firstBonus: bonus,
+            positionDeltas: nil, state: &b, sampler: sampler)
+        eval(b.cache, b.seedToken!, b.seedHidden!)
+        XCTAssertEqual(b.nextPosition, window)
+        XCTAssertEqual(a.seedToken!.asArray(Int32.self), b.seedToken!.asArray(Int32.self))
+        XCTAssertTrue(arrayEqual(a.seedHidden!, b.seedHidden!).item(Bool.self))
+
+        // Prompts within the window prefill every column, as before.
+        var c = full.makeState(parameters: nil)
+        full.prepareDrafterState(
+            target: model, promptTokens: prompt, targetHidden: hidden, firstBonus: bonus,
+            positionDeltas: nil, state: &c, sampler: sampler)
+        XCTAssertEqual(c.nextPosition, length)
+    }
+
     func testMTPDrafterRollbackAndPackedAdvanceMatchSerialCommit() throws {
         let model = try fusedShapesModel(seed: 201)
         let drafter = GLM5NextMTPDraftModel(model.configuration, maximumDepth: 2)
