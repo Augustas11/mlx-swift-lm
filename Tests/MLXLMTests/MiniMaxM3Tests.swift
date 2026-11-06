@@ -365,6 +365,23 @@ final class MiniMaxM3Tests: XCTestCase {
         }
     }
 
+    /// The norm's float32 copy output: the half-precision output is bitwise
+    /// the one-output kernel's, the copy bitwise its cast to float32.
+    func testFusedNormFloat32CopyMatchesCast() throws {
+        for dtype in [DType.bfloat16, .float16] {
+            for shape in [[1, 1, 6144], [4, 1, 64], [5, 100], [1, 4100], [3, 7, 128]] {
+                let x = (3 * MLXRandom.normal(shape)).asType(dtype)
+                let w = 1 + 0.1 * MLXRandom.normal([shape.last!])
+                let single = try XCTUnwrap(miniMaxM3RMSNorm(x, scale: w, eps: 1e-6))
+                let pair = try XCTUnwrap(miniMaxM3RMSNormWithFloat32Copy(x, scale: w, eps: 1e-6))
+                XCTAssertEqual(pair.count, 2)
+                XCTAssertEqual(pair[1].dtype, .float32)
+                XCTAssertTrue(bitwiseEqual(pair[0], single), "\(dtype) \(shape)")
+                XCTAssertTrue(bitwiseEqual(pair[1], single.asType(.float32)), "\(dtype) \(shape)")
+            }
+        }
+    }
+
     /// The multi-tensor head norm is bitwise each MLX norm chain, then the
     /// concatenation over heads and the head-major transpose.
     func testHeadNormsMatchPerTensorChain() throws {
@@ -549,6 +566,22 @@ final class MiniMaxM3Tests: XCTestCase {
         let actual = try XCTUnwrap(miniMaxM3Route(gates: gates, bias: bias, k: 2))
         XCTAssertTrue(bitwiseEqual(actual[0], expected[0]))
         XCTAssertTrue(bitwiseEqual(actual[1], expected[1]))
+    }
+
+    /// A float32 router fed the norm's float32 copy gives the MoE output it
+    /// gives casting the half-precision input itself, single and multi-row.
+    func testFloat32RouterInputMatchesCast() throws {
+        let model = try quantizedModel()
+        let block = try XCTUnwrap(model.model.layers[1].blockSparseMoe)
+        XCTAssertTrue(block.routerReadsFloat32)
+        for shape in [[1, 1, 64], [4, 1, 64], [1, 9, 64]] {
+            let x = MLXRandom.normal(shape).asType(.bfloat16)
+            let h = MLXRandom.normal(shape).asType(.bfloat16)
+            let expected = block(x, residual: h)
+            let actual = block(x, residual: h, routerInput: x.asType(.float32))
+            eval(expected, actual)
+            XCTAssertTrue(bitwiseEqual(actual, expected), "\(shape)")
+        }
     }
 
     /// The fused gate/up gather is bitwise the two projections, on decode

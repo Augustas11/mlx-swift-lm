@@ -58,14 +58,31 @@ final class MiniMaxM3RMSNorm: Module, UnaryLayer {
         let w = scale.value ?? (weight.asType(.float32) + 1)
         return MLXFast.rmsNorm(x, weight: w, eps: eps).asType(x.dtype)
     }
+
+    /// `[self(x), self(x).asType(.float32)]` from one launch; `nil` where the
+    /// one-launch norm does not apply.
+    func withFloat32Copy(_ x: MLXArray) -> [MLXArray]? {
+        guard gemma, let w = scale.value else { return nil }
+        return miniMaxM3RMSNormWithFloat32Copy(x, scale: w, eps: eps)
+    }
 }
 
 /// `MLXFast.rmsNorm` of a half-precision `x` against a float32 scale, cast
 /// back to `x`'s dtype, in one launch instead of three (cast to float32,
 /// float32 norm, cast back). Each row replays MLX's `rms_single_row` (rows
 /// up to 4096) or `rms_looped` arithmetic with the same threadgroup, so the
-/// result is bitwise the three-op chain.
-private let miniMaxM3RMSNormSource = """
+/// result is bitwise the three-op chain. With `float32Copy` the kernel also
+/// writes each rounded output widened to float32 (`out_f32`), bitwise
+/// `out.asType(.float32)`, for a float32 consumer such as the MoE router.
+private func miniMaxM3RMSNormSource(float32Copy: Bool) -> String {
+    let rowF32 =
+        float32Copy ? "device float* outfr = out_f32 + gid * size_t(axis_size) + lid * N_READS;" : ""
+    func store(_ index: String) -> String {
+        let value = "static_cast<T>(wr[\(index)] * normed)"
+        guard float32Copy else { return "outr[\(index)] = \(value);" }
+        return "T v = \(value); outr[\(index)] = v; outfr[\(index)] = static_cast<float>(v);"
+    }
+    return """
         constexpr int N_READS = 4;
         constexpr int SIMD_SIZE = 32;
         const uint axis_size = AXIS;
@@ -81,6 +98,7 @@ private let miniMaxM3RMSNormSource = """
         const device T* xr = x + gid * size_t(axis_size) + lid * N_READS;
         const device float* wr = w + lid * N_READS;
         device T* outr = out + gid * size_t(axis_size) + lid * N_READS;
+        \(rowF32)
 
         float acc = 0;
         float thread_x[N_READS];
@@ -134,7 +152,7 @@ private let miniMaxM3RMSNormSource = """
           for (int i = 0; i < N_READS; i++) {
             if (lid * N_READS + i < axis_size) {
               float normed = thread_x[i] * local_inv_mean[0];
-              outr[i] = static_cast<T>(wr[i] * normed);
+              \(store("i"))
             }
           }
         } else {
@@ -142,12 +160,13 @@ private let miniMaxM3RMSNormSource = """
             for (int i = 0; i < N_READS; i++) {
               if ((r + lid * N_READS + i) < axis_size) {
                 float normed = float(xr[r + i]) * local_inv_mean[0];
-                outr[r + i] = static_cast<T>(wr[r + i] * normed);
+                \(store("r + i"))
               }
             }
           }
         }
     """
+}
 
 private final class MiniMaxM3RMSNormKernel: @unchecked Sendable {
     static let shared = MiniMaxM3RMSNormKernel()
@@ -160,11 +179,29 @@ private final class MiniMaxM3RMSNormKernel: @unchecked Sendable {
         name: "minimax_m3_rms_norm",
         inputNames: ["x", "w", "eps"],
         outputNames: ["out"],
-        source: miniMaxM3RMSNormSource,
+        source: miniMaxM3RMSNormSource(float32Copy: false),
+        header: "#include <metal_simdgroup>\nusing namespace metal;\n")
+
+    let float32CopyKernel = MLXFast.metalKernel(
+        name: "minimax_m3_rms_norm_f32_copy",
+        inputNames: ["x", "w", "eps"],
+        outputNames: ["out", "out_f32"],
+        source: miniMaxM3RMSNormSource(float32Copy: true),
         header: "#include <metal_simdgroup>\nusing namespace metal;\n")
 }
 
 func miniMaxM3RMSNorm(_ x: MLXArray, scale: MLXArray, eps: Float) -> MLXArray? {
+    miniMaxM3RMSNorm(x, scale: scale, eps: eps, float32Copy: false)?[0]
+}
+
+/// `[norm, norm.asType(.float32)]` from one launch.
+func miniMaxM3RMSNormWithFloat32Copy(_ x: MLXArray, scale: MLXArray, eps: Float) -> [MLXArray]? {
+    miniMaxM3RMSNorm(x, scale: scale, eps: eps, float32Copy: true)
+}
+
+private func miniMaxM3RMSNorm(_ x: MLXArray, scale: MLXArray, eps: Float, float32Copy: Bool)
+    -> [MLXArray]?
+{
     let axis = x.dim(-1)
     guard x.ndim >= 1, axis > 0, x.dtype == .bfloat16 || x.dtype == .float16,
         scale.dtype == .float32, scale.shape == [axis]
@@ -174,13 +211,14 @@ func miniMaxM3RMSNorm(_ x: MLXArray, scale: MLXArray, eps: Float) -> MLXArray? {
     let looped = axis > MiniMaxM3RMSNormKernel.loopedLimit
     let threads =
         looped ? MiniMaxM3RMSNormKernel.loopedThreads : ((axis + 3) / 4 + 31) / 32 * 32
-    return MiniMaxM3RMSNormKernel.shared.kernel(
+    let kernels = MiniMaxM3RMSNormKernel.shared
+    return (float32Copy ? kernels.float32CopyKernel : kernels.kernel)(
         [x, scale, MLXArray([eps])],
         template: [("T", x.dtype), ("AXIS", axis), ("LOOPED", looped)],
         grid: (threads, rows, 1),
         threadGroup: (threads, 1, 1),
-        outputShapes: [x.shape],
-        outputDTypes: [x.dtype])[0]
+        outputShapes: float32Copy ? [x.shape, x.shape] : [x.shape],
+        outputDTypes: float32Copy ? [x.dtype, .float32] : [x.dtype])
 }
 
 /// The per-head norms of up to four `[B, L, H_t, D]` tensors (`x0` ...
@@ -540,11 +578,21 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
         super.init()
     }
 
+    /// An unquantized float32 router: its matmul casts a half-precision
+    /// input to float32 first, a launch of its own. The decoder hands it the
+    /// post-attention norm's float32 copy instead (`routerInput`).
+    var routerReadsFloat32: Bool {
+        !(gate is QuantizedLinear) && gate.weight.dtype == .float32
+    }
+
     /// The router logits. An unquantized router's matmul switches from a
     /// vector product to a matrix product past one row, so each row of a
-    /// multi-row batch takes its own, as its serial forward does.
+    /// multi-row batch takes its own, as its serial forward does. A float32
+    /// router reads one float32 input for every row (`astype` is elementwise,
+    /// so each row's product sees the same values its own cast gives).
     private func routerLogits(_ x: MLXArray) -> MLXArray {
         guard x.dim(0) > 1, !(gate is QuantizedLinear) else { return gate(x) }
+        let x = gate.weight.dtype == .float32 ? x.asType(.float32) : x
         return concatenated((0 ..< x.dim(0)).map { gate(x[$0 ..< ($0 + 1)]) }, axis: 0)
     }
 
@@ -637,8 +685,11 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
     }
 
     /// The MoE output, plus `residual` when given (`residual + moe(x)`).
-    func callAsFunction(_ x: MLXArray, residual: MLXArray?) -> MLXArray {
-        let routed = routeTokens(x)
+    /// `routerInput`, when given, is `x` already in the router's dtype.
+    func callAsFunction(_ x: MLXArray, residual: MLXArray?, routerInput: MLXArray? = nil)
+        -> MLXArray
+    {
+        let routed = routeTokens(routerInput ?? x)
         var inputs = [experts(x, routed[0]), routed[1]]
         if let sharedExperts {
             inputs.append(sharedExperts(x))
@@ -1186,11 +1237,17 @@ final class MiniMaxM3DecoderLayer: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let h = x + selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        let normed = postAttentionLayerNorm(h)
         if let blockSparseMoe {
-            return blockSparseMoe(normed, residual: h)
+            // A float32 router takes the norm's float32 copy from the same
+            // launch rather than casting the norm output on its own.
+            if blockSparseMoe.routerReadsFloat32,
+                let normed = postAttentionLayerNorm.withFloat32Copy(h)
+            {
+                return blockSparseMoe(normed[0], residual: h, routerInput: normed[1])
+            }
+            return blockSparseMoe(postAttentionLayerNorm(h), residual: h)
         }
-        return h + mlp!(normed)
+        return h + mlp!(postAttentionLayerNorm(h))
     }
 }
 
