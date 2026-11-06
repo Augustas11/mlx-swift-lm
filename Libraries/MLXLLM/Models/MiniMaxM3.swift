@@ -366,6 +366,75 @@ func makeMiniMaxM3SwiGLU(alpha: Float, limit: Float, beta: Float)
     }
 }
 
+/// `makeMiniMaxM3SwiGLU` over a fused `[..., 2 * H]` gate/up product (gate
+/// first) in one launch. The compiled activation splits into more than one
+/// launch (its chain passes MLX's fusion depth and `glu` feeds two
+/// branches), and a custom kernel would copy strided gate/up slices, so this
+/// reads both halves of the contiguous product itself. Each step is the
+/// compiled graph's op on the same dtypes: `clip` is MLX's `Maximum` then
+/// `Minimum` (NaN propagates from the input) against the limit rounded to
+/// `T`, the sigmoid is MLX's `Sigmoid` functor in float32, and every
+/// intermediate rounds to `T` where `asType(dtype)` does.
+private let miniMaxM3SwiGLUSource = """
+        uint idx = thread_position_in_grid.x;
+        uint row = idx / H;
+        uint j = idx - row * H;
+        const device T* gu = gate_up + size_t(row) * (2 * H);
+        T gate = gu[j];
+        T up = gu[H + j];
+        float alpha = params[0];
+        T hi = static_cast<T>(params[1]);
+        T lo = static_cast<T>(-params[1]);
+        float beta = params[2];
+
+        float gf = static_cast<float>(gate);
+        T glu = (metal::isnan(gf) || gf < static_cast<float>(hi)) ? gate : hi;
+        float uf = static_cast<float>(up);
+        T raised = (metal::isnan(uf) || uf > static_cast<float>(lo)) ? up : lo;
+        float rf = static_cast<float>(raised);
+        T linear = (metal::isnan(rf) || rf < static_cast<float>(hi)) ? raised : hi;
+
+        T scaled = static_cast<T>(static_cast<float>(glu) * alpha);
+        float sx = static_cast<float>(scaled);
+        float y = 1 / (1 + metal::precise::exp(metal::abs(sx)));
+        T sig = static_cast<T>((sx < 0) ? y : 1 - y);
+        T g = static_cast<T>(static_cast<float>(glu) * static_cast<float>(sig));
+        T l = static_cast<T>(static_cast<float>(linear) + beta);
+        out[idx] = static_cast<T>(static_cast<float>(l) * static_cast<float>(g));
+    """
+
+private final class MiniMaxM3SwiGLUKernel: @unchecked Sendable {
+    static let shared = MiniMaxM3SwiGLUKernel()
+
+    let kernel = MLXFast.metalKernel(
+        name: "minimax_m3_swiglu",
+        inputNames: ["gate_up", "params"],
+        outputNames: ["out"],
+        source: miniMaxM3SwiGLUSource)
+}
+
+/// The clamped SwiGLU of a contiguous `[..., 2 * H]` gate/up product (gate
+/// in the first `H` columns), `[..., H]`, bitwise
+/// `makeMiniMaxM3SwiGLU(...)(gateUp[..., ..<H], gateUp[..., H...])`; `nil`
+/// when the shape or dtype is not covered.
+func miniMaxM3SwiGLU(_ gateUp: MLXArray, alpha: Float, limit: Float, beta: Float) -> MLXArray? {
+    guard gateUp.ndim >= 1, gateUp.dim(-1) > 0, gateUp.dim(-1) % 2 == 0,
+        [DType.bfloat16, .float16, .float32].contains(gateUp.dtype)
+    else { return nil }
+    let hidden = gateUp.dim(-1) / 2
+    let total = gateUp.size / 2
+    guard total > 0, total <= Int(UInt32.max) else { return nil }
+    var shape = gateUp.shape
+    shape[shape.count - 1] = hidden
+    return MiniMaxM3SwiGLUKernel.shared.kernel(
+        [gateUp, MLXArray([alpha, limit, beta])],
+        template: [("T", gateUp.dtype), ("H", hidden)],
+        grid: (total, 1, 1),
+        threadGroup: (min(total, 256), 1, 1),
+        outputShapes: [shape],
+        outputDTypes: [gateUp.dtype])[0]
+}
+
 final class MiniMaxM3MLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
@@ -508,6 +577,9 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
     let topK: Int
     let routedScalingFactor: Float
     let sigmoidScoring: Bool
+    let swigluAlpha: Float
+    let swigluLimit: Float
+    let swigluBeta: Float
 
     @ModuleInfo(key: "gate") var gate: Linear
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
@@ -528,6 +600,9 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
         self.topK = config.numExpertsPerTok
         self.routedScalingFactor = config.routedScalingFactor
         self.sigmoidScoring = config.scoringFunc == "sigmoid"
+        self.swigluAlpha = config.swigluAlpha
+        self.swigluLimit = config.swigluLimit
+        self.swigluBeta = config.swigluBeta
         self.activation = activation
         _gate.wrappedValue = Linear(config.hiddenSize, config.numLocalExperts, bias: false)
         _switchMLP.wrappedValue = SwitchGLU(
@@ -624,7 +699,9 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
             groupSize: fused.groupSize, bits: fused.bits, mode: fused.mode,
             sortedIndices: doSort)
         let h = fused.hidden
-        let activated = activation(gateUp[.ellipsis, ..<h], gateUp[.ellipsis, h...])
+        let activated =
+            miniMaxM3SwiGLU(gateUp, alpha: swigluAlpha, limit: swigluLimit, beta: swigluBeta)
+            ?? activation(gateUp[.ellipsis, ..<h], gateUp[.ellipsis, h...])
         var out = switchMLP.downProjection(activated, idx, sortedIndices: doSort)
         if doSort {
             out = scatterUnsort(x: out, invOrder: inverseOrder, shape: indices.shape)
