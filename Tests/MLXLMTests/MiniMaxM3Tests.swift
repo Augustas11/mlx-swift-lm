@@ -584,6 +584,34 @@ final class MiniMaxM3Tests: XCTestCase {
         }
     }
 
+    /// The one-launch SwiGLU over a fused gate/up product is bitwise the
+    /// compiled activation on its two halves: decode (routed and shared) and
+    /// prefill shapes, values past and exactly at the clamp, and NaN.
+    func testSwiGLUKernelMatchesCompiledActivation() throws {
+        let activation = makeMiniMaxM3SwiGLU(alpha: 1.702, limit: 7.0, beta: 1.0)
+        for dtype in [DType.bfloat16, .float16, .float32] {
+            for shape in [[1, 1, 4, 1, 64], [4, 1, 4, 1, 64], [4, 1, 128], [37, 6144], [3, 5, 2]] {
+                var gateUp = (6 * MLXRandom.normal(shape)).asType(dtype)
+                let last = shape.count - 1
+                var flat = gateUp.reshaped(-1, shape[last])
+                flat[0, 0] = MLXArray(Float(7)).asType(dtype)
+                flat[0, 1] = MLXArray(Float(-7)).asType(dtype)
+                flat[0, shape[last] - 1] = MLXArray(Float.nan).asType(dtype)
+                gateUp = flat.reshaped(shape)
+                let h = shape[last] / 2
+                let expected = activation(gateUp[.ellipsis, ..<h], gateUp[.ellipsis, h...])
+                let actual = try XCTUnwrap(
+                    miniMaxM3SwiGLU(gateUp, alpha: 1.702, limit: 7.0, beta: 1.0))
+                eval(expected, actual)
+                XCTAssertEqual(actual.shape, expected.shape)
+                XCTAssertEqual(actual.dtype, expected.dtype)
+                XCTAssertTrue(
+                    arrayEqual(actual, expected, equalNAN: true).item(Bool.self), "\(dtype) \(shape)")
+            }
+        }
+        XCTAssertNil(miniMaxM3SwiGLU(MLXArray.zeros([2, 3]), alpha: 1, limit: 7, beta: 1))
+    }
+
     /// The fused gate/up gather is bitwise the two projections, on decode
     /// (unsorted) and prefill (sorted) shapes, and releases them.
     func testFusedGateUpMatchesSeparateProjections() throws {
