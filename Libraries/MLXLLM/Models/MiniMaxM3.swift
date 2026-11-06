@@ -435,22 +435,111 @@ func miniMaxM3SwiGLU(_ gateUp: MLXArray, alpha: Float, limit: Float, beta: Float
         outputDTypes: [gateUp.dtype])[0]
 }
 
+/// The quantized-weight parameters of a projection a fusion replaced, as
+/// empty arrays, so updating the module releases the originals.
+private func miniMaxM3ReleasedParameters(weight: MLXArray, scales: MLXArray, biases: MLXArray?)
+    -> ModuleParameters
+{
+    var entries = [
+        ("weight", MLXArray.zeros([0], dtype: weight.dtype)),
+        ("scales", MLXArray.zeros([0], dtype: scales.dtype)),
+    ]
+    if let biases {
+        entries.append(("biases", MLXArray.zeros([0], dtype: biases.dtype)))
+    }
+    return ModuleParameters.unflattened(entries)
+}
+
+/// The band of MLX's `get_qmv_batch_limit(K, N)`, the row count at which a
+/// quantized matmul leaves the per-row `qmv` for `qmm`. Its thresholds sit at
+/// 2048 and 4096 on every architecture.
+private func miniMaxM3QMVBatchLimitBand(_ k: Int, _ n: Int) -> Int {
+    if k <= 2048 && n <= 2048 { return 0 }
+    if k <= 4096 && n <= 4096 { return 1 }
+    return 2
+}
+
 final class MiniMaxM3MLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
     let activation: @Sendable (MLXArray, MLXArray) -> MLXArray
+    let swigluAlpha: Float
+    let swigluLimit: Float
+    let swigluBeta: Float
+    let fused = MiniMaxM3FusedGateUp()
 
-    init(hiddenSize: Int, intermediateSize: Int, activation: @escaping @Sendable (MLXArray, MLXArray) -> MLXArray) {
+    init(
+        hiddenSize: Int, intermediateSize: Int, config: MiniMaxM3Configuration,
+        activation: @escaping @Sendable (MLXArray, MLXArray) -> MLXArray
+    ) {
         _gateProj.wrappedValue = Linear(hiddenSize, intermediateSize, bias: false)
         _upProj.wrappedValue = Linear(hiddenSize, intermediateSize, bias: false)
         _downProj.wrappedValue = Linear(intermediateSize, hiddenSize, bias: false)
         self.activation = activation
+        self.swigluAlpha = config.swigluAlpha
+        self.swigluLimit = config.swigluLimit
+        self.swigluBeta = config.swigluBeta
         super.init()
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(activation(gateProj(x), upProj(x)))
+        guard let weight = fused.weight, let scales = fused.scales else {
+            return downProj(activation(gateProj(x), upProj(x)))
+        }
+        let gateUp = quantizedMM(
+            x, weight, scales: scales, biases: fused.biases, transpose: true,
+            groupSize: fused.groupSize, bits: fused.bits, mode: fused.mode)
+        let h = fused.hidden
+        let activated =
+            miniMaxM3SwiGLU(gateUp, alpha: swigluAlpha, limit: swigluLimit, beta: swigluBeta)
+            ?? activation(gateUp[.ellipsis, ..<h], gateUp[.ellipsis, h...])
+        return downProj(activated)
+    }
+
+    /// Concatenate the gate and up projections along the output rows into
+    /// one quantized weight (one `qmv` launch at decode instead of two), then
+    /// release the separate ones. Each output row of a quantized matmul is
+    /// its own dot product over the input, so the fused product is bitwise
+    /// the two, provided the kernel choice is the same: the doubled output
+    /// width must stay in the same `get_qmv_batch_limit` band, and NVFP4
+    /// (global scales; an output-width-dependent qmv tile on some GPUs) is
+    /// left alone. Skipped unless both are plain quantized linears with one
+    /// quantization and no bias; idempotent.
+    func fuseGateUp() throws {
+        guard fused.weight == nil,
+            let gate = gateProj as? QuantizedLinear, let up = upProj as? QuantizedLinear,
+            type(of: gate) == QuantizedLinear.self, type(of: up) == QuantizedLinear.self,
+            gate.groupSize == up.groupSize, gate.bits == up.bits, gate.mode == up.mode,
+            gate.mode != .nvfp4, gate.globalScale == nil, up.globalScale == nil,
+            gate.bias == nil, up.bias == nil, !gate.referencePrefill, !up.referencePrefill,
+            (gate.biases == nil) == (up.biases == nil),
+            gate.weight.ndim == 2, gate.weight.size > 0, gate.weight.shape == up.weight.shape,
+            gate.scales.shape == up.scales.shape
+        else { return }
+        let (outputs, inputs) = gate.shape
+        guard miniMaxM3QMVBatchLimitBand(inputs, outputs)
+            == miniMaxM3QMVBatchLimitBand(inputs, 2 * outputs)
+        else { return }
+        let weight = concatenated([gate.weight, up.weight], axis: 0)
+        let scales = concatenated([gate.scales, up.scales], axis: 0)
+        let biases = gate.biases.flatMap { gb in up.biases.map { concatenated([gb, $0], axis: 0) } }
+        eval([weight, scales] + (biases.map { [$0] } ?? []))
+        fused.weight = weight
+        fused.scales = scales
+        fused.biases = biases
+        fused.hidden = outputs
+        fused.groupSize = gate.groupSize
+        fused.bits = gate.bits
+        fused.mode = gate.mode
+        _ = try gate.update(
+            parameters: miniMaxM3ReleasedParameters(
+                weight: gate.weight, scales: gate.scales, biases: gate.biases),
+            verify: .none)
+        _ = try up.update(
+            parameters: miniMaxM3ReleasedParameters(
+                weight: up.weight, scales: up.scales, biases: up.biases),
+            verify: .none)
     }
 }
 
@@ -611,7 +700,7 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
         if config.nSharedExperts > 0 {
             _sharedExperts.wrappedValue = MiniMaxM3MLP(
                 hiddenSize: config.hiddenSize, intermediateSize: config.sharedIntermediateSize,
-                activation: activation)
+                config: config, activation: activation)
         }
         if config.useRoutingBias {
             _eScoreCorrectionBias.wrappedValue = MLXArray.zeros([config.numLocalExperts])
@@ -744,14 +833,7 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
         func released(_ parts: (weight: MLXArray, scales: MLXArray, biases: MLXArray?, bias: MLXArray?))
             -> ModuleParameters
         {
-            var entries = [
-                ("weight", MLXArray.zeros([0], dtype: parts.weight.dtype)),
-                ("scales", MLXArray.zeros([0], dtype: parts.scales.dtype)),
-            ]
-            if let biases = parts.biases {
-                entries.append(("biases", MLXArray.zeros([0], dtype: biases.dtype)))
-            }
-            return ModuleParameters.unflattened(entries)
+            miniMaxM3ReleasedParameters(weight: parts.weight, scales: parts.scales, biases: parts.biases)
         }
         _ = try gateProj.update(parameters: released(g), verify: .none)
         _ = try upProj.update(parameters: released(u), verify: .none)
@@ -1301,7 +1383,7 @@ final class MiniMaxM3DecoderLayer: Module {
         } else {
             _mlp.wrappedValue = MiniMaxM3MLP(
                 hiddenSize: config.hiddenSize, intermediateSize: config.denseIntermediateSize,
-                activation: activation)
+                config: config, activation: activation)
         }
         super.init()
     }
@@ -1381,13 +1463,16 @@ public final class MiniMaxM3TextModel: Module, LLMModel {
         return model.embedTokens.asLinear(out)
     }
 
-    /// Cache every Gemma norm's `1 + weight` and fuse each MoE layer's routed
-    /// gate and up projections (one layer at a time, so the copy never
-    /// holds more than one layer's projections twice).
+    /// Cache every Gemma norm's `1 + weight` and fuse each layer's gate and
+    /// up projections: the routed experts, the shared expert and the dense
+    /// MLP (one layer at a time, so the copy never holds more than one
+    /// layer's projections twice).
     public func prepare() throws {
         eval(model.norms.compactMap { $0.prepare() })
         for layer in model.layers {
             try layer.blockSparseMoe?.fuseGateUp()
+            try layer.blockSparseMoe?.sharedExperts?.fuseGateUp()
+            try layer.mlp?.fuseGateUp()
             // The replaced gate/up tensors return to MLX's buffer cache, whose
             // default bound sits past physical memory: across the layers of a
             // 194 GB checkpoint they would hold a second copy of every
