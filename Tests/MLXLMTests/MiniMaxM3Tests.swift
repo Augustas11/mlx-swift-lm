@@ -687,6 +687,50 @@ final class MiniMaxM3Tests: XCTestCase {
         }
     }
 
+    /// The one-launch combine is bitwise the compiled combine (and the eager
+    /// shared and residual adds it folds), with and without the shared
+    /// expert and the residual, on single-row, batched and prefill shapes.
+    func testCombineKernelMatchesCompiledCombine() throws {
+        let block = try XCTUnwrap(try quantizedModel().model.layers[1].blockSparseMoe)
+        for (lead, k, d) in [([1, 1], 2, 64), ([4, 1], 2, 64), ([1, 9], 2, 64), ([2, 1], 4, 6144)] {
+            let outputs = (4 * MLXRandom.normal(lead + [k, d])).asType(.bfloat16)
+            let raw = MLXRandom.uniform(low: 0.01, high: 1, lead + [k])
+            let weights = raw / raw.sum(axis: -1, keepDims: true)
+            let shared = MLXRandom.normal(lead + [d]).asType(.bfloat16)
+            let residual = (8 * MLXRandom.normal(lead + [d])).asType(.bfloat16)
+            let routed = block.combine([outputs, weights])[0]
+            for (withShared, withResidual) in [(false, false), (true, false), (false, true), (true, true)] {
+                var expected = routed
+                if withShared { expected = expected + shared }
+                if withResidual { expected = residual + expected }
+                let actual = try XCTUnwrap(
+                    miniMaxM3Combine(
+                        outputs: outputs, weights: weights, factor: block.routedScalingFactor,
+                        shared: withShared ? shared : nil, residual: withResidual ? residual : nil))
+                // The block's compiled combine agrees as well.
+                var inputs = [outputs, weights]
+                if withShared { inputs.append(shared) }
+                if withResidual, withShared { inputs.append(residual) }
+                var blockCombine = block.combine(inputs)[0]
+                if withResidual, !withShared { blockCombine = residual + blockCombine }
+                eval(expected, actual, blockCombine)
+                let label = "\(lead) k\(k) d\(d) shared \(withShared) residual \(withResidual)"
+                XCTAssertTrue(bitwiseEqual(actual, expected), label)
+                XCTAssertTrue(bitwiseEqual(actual, blockCombine), label)
+                // Each batched row is its own single-row combine.
+                for row in 0 ..< lead[0] where lead[0] > 1 {
+                    let one = try XCTUnwrap(
+                        miniMaxM3Combine(
+                            outputs: outputs[row ..< (row + 1)], weights: weights[row ..< (row + 1)],
+                            factor: block.routedScalingFactor,
+                            shared: withShared ? shared[row ..< (row + 1)] : nil,
+                            residual: withResidual ? residual[row ..< (row + 1)] : nil))
+                    XCTAssertTrue(bitwiseEqual(actual[row ..< (row + 1)], one), "\(label) row \(row)")
+                }
+            }
+        }
+    }
+
     /// Decoding a prepared model (one-launch route, fused gate/up, folded
     /// combine) gives the unprepared model's logits bit for bit.
     func testPreparedQuantizedModelMatchesUnprepared() throws {

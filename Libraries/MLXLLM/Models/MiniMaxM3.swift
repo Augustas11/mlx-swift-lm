@@ -379,7 +379,8 @@ private let miniMaxM3SwiGLUSource = """
         uint idx = thread_position_in_grid.x;
         uint row = idx / H;
         uint j = idx - row * H;
-        const device T* gu = gate_up + size_t(row) * (2 * H);
+        // Inputs under 8 elements arrive in the constant address space.
+        auto gu = gate_up + size_t(row) * (2 * H);
         T gate = gu[j];
         T up = gu[H + j];
         float alpha = params[0];
@@ -649,6 +650,78 @@ func miniMaxM3Route(gates: MLXArray, bias: MLXArray, k: Int) -> [MLXArray]? {
         outputDTypes: [.uint32, .float32])
 }
 
+/// The expert combine in one launch, one thread per output element:
+/// each routed expert output weighted in float32 and rounded to `T`, the
+/// running sum added in float32 and rounded after each expert (ascending
+/// expert order, the order the route emits), the routed scale applied last,
+/// then `+ shared` and `residual +` as `T` adds. Bitwise the compiled
+/// combine, which runs as several launches: it materializes the weighted
+/// outputs to slice them, and its rounded chain passes MLX's fusion depth.
+private let miniMaxM3CombineSource = """
+        uint idx = thread_position_in_grid.x;
+        uint row = idx / D;
+        uint d = idx - row * D;
+        // Inputs under 8 elements (a one-row route's weights) arrive in the
+        // constant address space.
+        auto o = outputs + size_t(row) * (K * D) + d;
+        auto w = weights + size_t(row) * K;
+        T result = static_cast<T>(static_cast<float>(o[0]) * w[0]);
+        for (int i = 1; i < K; i++) {
+          T weighted = static_cast<T>(static_cast<float>(o[size_t(i) * D]) * w[i]);
+          result = static_cast<T>(static_cast<float>(result) + static_cast<float>(weighted));
+        }
+        T y = static_cast<T>(static_cast<float>(result) * factor[0]);
+        if (HAS_SHARED) {
+          T s = shared[idx];
+          y = y + s;
+        }
+        if (HAS_RESIDUAL) {
+          T r = residual[idx];
+          y = r + y;
+        }
+        out[idx] = y;
+    """
+
+private final class MiniMaxM3CombineKernel: @unchecked Sendable {
+    static let shared = MiniMaxM3CombineKernel()
+
+    let kernel = MLXFast.metalKernel(
+        name: "minimax_m3_combine",
+        inputNames: ["outputs", "weights", "shared", "residual", "factor"],
+        outputNames: ["out"],
+        source: miniMaxM3CombineSource)
+}
+
+/// `residual + ((sum_k weights[k] * outputs[k]) * factor + shared)` with the
+/// compiled combine's roundings, from `outputs` (`[..., K, D]`), float32
+/// `weights` (`[..., K]`) and optional `shared` and `residual` (`[..., D]`,
+/// `outputs`' dtype); `nil` when the shapes or dtypes are not covered.
+func miniMaxM3Combine(
+    outputs: MLXArray, weights: MLXArray, factor: Float, shared: MLXArray?, residual: MLXArray?
+) -> MLXArray? {
+    guard outputs.ndim >= 2, [DType.bfloat16, .float16, .float32].contains(outputs.dtype),
+        weights.dtype == .float32, weights.shape == Array(outputs.shape.dropLast())
+    else { return nil }
+    let (k, d) = (outputs.dim(-2), outputs.dim(-1))
+    var shape = outputs.shape
+    shape.remove(at: shape.count - 2)
+    for extra in [shared, residual] {
+        if let extra, extra.dtype != outputs.dtype || extra.shape != shape { return nil }
+    }
+    let total = outputs.size / k
+    guard k >= 1, d >= 1, total > 0, total <= Int(UInt32.max) else { return nil }
+    return MiniMaxM3CombineKernel.shared.kernel(
+        [outputs, weights, shared ?? outputs, residual ?? outputs, MLXArray([factor])],
+        template: [
+            ("T", outputs.dtype), ("K", k), ("D", d),
+            ("HAS_SHARED", shared != nil), ("HAS_RESIDUAL", residual != nil),
+        ],
+        grid: (total, 1, 1),
+        threadGroup: (min(total, 256), 1, 1),
+        outputShapes: [shape],
+        outputDTypes: [outputs.dtype])[0]
+}
+
 /// The routed experts' gate and up projections as one `[E, 2 * I, *]`
 /// quantized weight, built at `prepare()`. A reference type, so module
 /// reflection never sees it as a parameter.
@@ -849,9 +922,17 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
         -> MLXArray
     {
         let routed = routeTokens(routerInput ?? x)
-        var inputs = [experts(x, routed[0]), routed[1]]
-        if let sharedExperts {
-            inputs.append(sharedExperts(x))
+        let routedOutputs = experts(x, routed[0])
+        let shared = sharedExperts.map { $0(x) }
+        if let y = miniMaxM3Combine(
+            outputs: routedOutputs, weights: routed[1], factor: routedScalingFactor,
+            shared: shared, residual: residual)
+        {
+            return y
+        }
+        var inputs = [routedOutputs, routed[1]]
+        if let shared {
+            inputs.append(shared)
         }
         if let residual {
             // The combine reads the residual as its fourth input.
