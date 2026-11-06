@@ -188,6 +188,18 @@ public struct GenerateParameters: Sendable {
     /// Recovery and validation rules for generated tool calls.
     public var toolCallPolicy: ToolCallPolicy
 
+    /// Run ``TokenIterator``'s single-token decode steps through `MLX.compile`
+    /// when the model and cache allow it (issue #406).
+    ///
+    /// Applies only to an audited ``FixedCapacityKVCacheProviding`` model whose
+    /// cache is all ``KVCacheSimple`` layers at batch 1, with no per-call model
+    /// state, no pending dynamic cache conversion, and plain text input. Any
+    /// other request decodes eagerly exactly as before. Prefill and the first
+    /// decode step stay eager. The caller's ``KVCacheSimple`` layers hold the
+    /// complete cache after every token, so cache reuse and serialization are
+    /// unchanged. See <doc:compiled-kv-cache>.
+    public var compiledDecode: Bool = false
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -733,6 +745,17 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     var kvCachePlan: KVCachePlan { cacheStorage.plan }
 
+    /// ``GenerateParameters/compiledDecode`` as requested; cleared once the
+    /// model or cache turns out to be ineligible, so later steps skip the check.
+    var compiledDecodeRequested = false
+
+    /// Compiled decode over the caller's ``KVCacheSimple`` layers, built at the
+    /// second decode step and rebuilt if the layers change under it.
+    var compiledDecoder: SerialCompiledDecoder?
+
+    /// Number of decode steps that ran through the compiled path.
+    public internal(set) var compiledDecodeStepCount = 0
+
     // Internal metrics
     public var promptPrefillTime: TimeInterval = 0.0
 
@@ -805,6 +828,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.processor = components.logitProcessor(parameters: parameters)
         self.sampler = parameters.sampler()
         self.maxTokens = parameters.maxTokens
+        self.compiledDecodeRequested = parameters.compiledDecode
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, prefill: parameters.prefill)
@@ -914,6 +938,13 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     /// Evaluate the next token and return the new token (y), updating cache state
     mutating func step(previous: LMInput.Text) -> MLXArray {
+        if let logits = compiledDecodeStep(previous: previous) {
+            cacheStorage.commitProcessedTokens(previous.cacheSequenceLength)
+            kvCachePlan.apply(to: cacheStorage)
+            compiledDecodeStepCount += 1
+            return convertToToken(logits: logits)
+        }
+
         let result = withPreparedCache(cache, lengths: previous.sequenceLengths) {
             model(previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
         }
@@ -924,6 +955,44 @@ public struct TokenIterator: TokenIteratorProtocol {
         kvCachePlan.apply(to: cacheStorage)
 
         return convertToToken(logits: result.logits)
+    }
+
+    /// Logits for `previous` from the compiled decode path, or `nil` to run the
+    /// eager forward.
+    ///
+    /// Prefill (inside ``prepare(input:prefill:)``) and the first decode step
+    /// (`tokenCount == 0`) always run eagerly: the first compiled call traces
+    /// the model, and doing that before the first token is returned would add
+    /// the trace to time-to-first-token.
+    private mutating func compiledDecodeStep(previous: LMInput.Text) -> MLXArray? {
+        guard compiledDecodeRequested, tokenCount > 0 else { return nil }
+        guard state == nil, previous.mask == nil, previous.tokens.size == 1,
+            kvCachePlan.configuration == nil || cacheStorage.isApplicationTerminal,
+            !cacheStorage.roundIsOpen
+        else {
+            compiledDecoder = nil
+            return nil
+        }
+
+        // Tokens still to be fed, this one included.
+        let remainingTokens = maxTokens.map { Swift.max(1, $0 - tokenCount) }
+        if let decoder = compiledDecoder, !decoder.owns(cache) {
+            // The layers were replaced or trimmed under the decoder: adopt them
+            // again rather than write stale buffers back.
+            compiledDecoder = nil
+        }
+        if compiledDecoder == nil {
+            guard
+                let decoder = SerialCompiledDecoder.make(
+                    model: model, cache: cache, remainingTokens: remainingTokens)
+            else {
+                compiledDecodeRequested = false
+                return nil
+            }
+            compiledDecoder = decoder
+        }
+        return compiledDecoder?.step(
+            previous.tokens.reshaped(1, 1), remainingTokens: remainingTokens)
     }
 
     mutating public func next() -> Int? {
