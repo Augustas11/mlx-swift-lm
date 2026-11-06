@@ -634,6 +634,41 @@ final class MiniMaxM3Tests: XCTestCase {
         }
     }
 
+    /// The fused shared-expert and dense-MLP gate/up product (one quantized
+    /// matmul, one-launch SwiGLU) is bitwise the two projections and the
+    /// compiled activation, on decode, batched-decode and prefill shapes, and
+    /// releases them.
+    func testFusedSharedAndDenseGateUpMatchSeparateProjections() throws {
+        let model = try quantizedModel(prepared: false)
+        let mlps = [
+            try XCTUnwrap(model.model.layers[0].mlp),
+            try XCTUnwrap(model.model.layers[1].blockSparseMoe?.sharedExperts),
+        ]
+        let inputs = [[1, 1, 64], [4, 1, 64], [1, 40, 64]].map {
+            MLXRandom.normal($0).asType(.bfloat16)
+        }
+        for (index, mlp) in mlps.enumerated() {
+            let before = inputs.map { mlp($0) }
+            eval(before)
+            try mlp.fuseGateUp()
+            XCTAssertNotNil(mlp.fused.weight, "mlp \(index)")
+            XCTAssertEqual(mlp.gateProj.weight.size, 0)
+            XCTAssertEqual(mlp.upProj.weight.size, 0)
+            try mlp.fuseGateUp()
+            let after = inputs.map { mlp($0) }
+            eval(after)
+            for (shape, (a, b)) in zip(inputs.map(\.shape), zip(before, after)) {
+                XCTAssertTrue(bitwiseEqual(a, b), "mlp \(index) \(shape)")
+            }
+            // Each batched row is its single-row result.
+            let rows = (0 ..< 4).map { mlp(inputs[1][$0 ..< ($0 + 1)]) }
+            eval(rows)
+            for row in 0 ..< 4 {
+                XCTAssertTrue(bitwiseEqual(after[1][row ..< (row + 1)], rows[row]), "mlp \(index) row \(row)")
+            }
+        }
+    }
+
     /// The MoE output with the shared expert and the residual folded into
     /// the compiled combine is bitwise the eager adds.
     func testCombineFoldsSharedAndResidualBitwise() throws {
