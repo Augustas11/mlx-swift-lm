@@ -220,14 +220,21 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
         // `Gemma4BackboneProviding` (`Gemma4`: E-series, 26B-A4B, 31B;
         // `Gemma4Unified`: 12B). Stateless wrt target by construction (no
         // ivars retain anything derived from `target`).
-        guard let provider = target as? Gemma4BackboneProviding else {
+        let inputEmbed: (MLXArray) -> MLXArray
+        let embedScale: Float
+        if let provider = target as? Gemma4BackboneProviding {
+            let backbone = provider.textBackbone
+            inputEmbed = { backbone.embedTokens($0) }
+            embedScale = backbone.embedScale
+        } else if let provider = target as? MTPTargetInputEmbeddingProvider {
+            // The MLXLLM text-only Gemma 4 target.
+            inputEmbed = { provider.mtpInputEmbeddings($0) }
+            embedScale = provider.mtpInputEmbeddingScale
+        } else {
             fatalError(
-                "Gemma4AssistantDraftModel.draftBlock: target is not a Gemma 4 VLM "
+                "Gemma4AssistantDraftModel.draftBlock: target is not a Gemma 4 model "
                     + "(got \(type(of: target)))")
         }
-        let backbone = provider.textBackbone
-        let inputEmbed = backbone.embedTokens
-        let embedScale = backbone.embedScale
 
         // tok shape: [B, 1]
         var tok =
@@ -338,5 +345,198 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
             sanitized["masked_embedding.token_ordering"] = tokenOrdering.asType(.int32)
         }
         return sanitized
+    }
+}
+
+// MARK: - Row-owned state and packed advance
+
+extension Gemma4AssistantDraftModel: MTPPackedStatefulDrafterModel {
+    /// The assistant owns no cache: every proposal attends over the target's K/V.
+    public func makeState(parameters _: GenerateParameters?) -> MTPDrafterState {
+        MTPDrafterState(cache: [])
+    }
+
+    public func draftBlock(
+        target: any LanguageModel,
+        lastToken: MLXArray,
+        lastHidden: MLXArray,
+        sharedKV: [String: (MLXArray, MLXArray)],
+        positionDeltas: MLXArray?,
+        queryOffset: Int,
+        blockSize: Int,
+        state _: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) -> MLXArray {
+        draftBlock(
+            target: target, lastToken: lastToken, lastHidden: lastHidden, sharedKV: sharedKV,
+            positionDeltas: positionDeltas, queryOffset: queryOffset, blockSize: blockSize,
+            sampler: sampler)
+    }
+
+    /// Proposes each row's next token from the target state its verification left.
+    ///
+    /// For a row whose verification input was `[last, p1, ..., pN]` with `a` proposals accepted,
+    /// the proposal is the depth-one draft at the final token's position: the target hidden
+    /// state of column `a` (the one that produced the final token), and the row's shared K/V
+    /// without its `N - a` rejected columns, the sliding entry clamped to the window. This is
+    /// the input ``MTPSpeculativeTokenIterator`` hands ``draftBlock`` after its commit.
+    ///
+    /// Rows attend over K/V of different lengths, so each row runs its own forward; rows never
+    /// read each other's state.
+    public func advanceAndProposePacked(
+        target: any LanguageModel,
+        rows: [MTPPackedDrafterAdvanceRow],
+        sampler: any LogitSampler
+    ) throws -> MTPPackedDrafterAdvanceResult {
+        let slidingWindow = config.textConfiguration.slidingWindow
+        let prepared = try rows.enumerated().map { index, row in
+            try Self.packedRowInput(row, index: index, slidingWindow: slidingWindow)
+        }
+        var states: [MTPDrafterState] = []
+        var proposals: [MLXArray] = []
+        states.reserveCapacity(rows.count)
+        proposals.reserveCapacity(rows.count)
+        for input in prepared {
+            let proposal = draftBlock(
+                target: target,
+                lastToken: MLXArray([Int32(input.finalToken)]),
+                lastHidden: input.hidden,
+                sharedKV: input.sharedKV,
+                positionDeltas: nil,
+                queryOffset: input.queryOffset,
+                blockSize: 2,
+                sampler: sampler
+            ).asType(.int32).reshaped([1, 1])
+            proposals.append(proposal)
+            states.append(
+                MTPDrafterState(
+                    cache: [], nextPosition: input.queryOffset, seedToken: proposal))
+        }
+        return MTPPackedDrafterAdvanceResult(
+            states: states, proposals: concatenated(proposals, axis: 0))
+    }
+
+    struct PackedRowInput {
+        let finalToken: Int
+        let hidden: MLXArray
+        let sharedKV: [String: (MLXArray, MLXArray)]
+        let queryOffset: Int
+    }
+
+    /// Validates one row and derives the drafter input, before any forward runs.
+    static func packedRowInput(
+        _ row: MTPPackedDrafterAdvanceRow, index: Int, slidingWindow: Int
+    ) throws -> PackedRowInput {
+        let hidden = row.targetHidden
+        guard hidden.ndim == 3, hidden.dim(0) == 1, hidden.dim(1) >= 1 else {
+            throw MTPPackedDrafterError.invalidTargetHidden(row: index, shape: hidden.shape)
+        }
+        let inputCount = hidden.dim(1)
+        let accepted = row.acceptedTokens.count
+        guard accepted < inputCount else {
+            throw MTPPackedDrafterError.invalidAcceptedCount(
+                row: index, acceptedCount: accepted, inputCount: inputCount)
+        }
+        guard row.state.cache.isEmpty, row.state.proposalAppended == 0,
+            let sharedKV = row.sharedKV, let offset = row.sharedKVOffset,
+            let full = sharedKV["full_attention"], let sliding = sharedKV["sliding_attention"]
+        else {
+            throw MTPPackedDrafterError.incompatibleState(row: index)
+        }
+        let rejected = inputCount - 1 - accepted
+        let queryOffset = offset - rejected
+        guard queryOffset > 0 else {
+            throw MTPPackedDrafterError.positionMismatch(
+                row: index, nextPosition: queryOffset, cacheOffset: offset)
+        }
+        func keep(_ pair: (MLXArray, MLXArray), window: Int?) throws -> (MLXArray, MLXArray) {
+            let (keys, values) = pair
+            guard keys.ndim == 4, keys.shape == values.shape, keys.dim(0) == 1 else {
+                throw MTPPackedDrafterError.incompatibleState(row: index)
+            }
+            let end = keys.dim(2) - rejected
+            guard end > 0 else { throw MTPPackedDrafterError.incompatibleState(row: index) }
+            let start = window.map { Swift.max(0, end - $0) } ?? 0
+            return (keys[0..., 0..., start ..< end, 0...], values[0..., 0..., start ..< end, 0...])
+        }
+        return PackedRowInput(
+            finalToken: row.finalToken,
+            hidden: hidden[0..., accepted ..< (accepted + 1), 0...],
+            sharedKV: [
+                "full_attention": try keep(full, window: nil),
+                "sliding_attention": try keep(sliding, window: slidingWindow),
+            ],
+            queryOffset: queryOffset)
+    }
+}
+
+// MARK: - Embedded assistant loading
+
+/// Errors from ``Gemma4AssistantDraftModel/loadEmbedded(targetDirectory:)``.
+public enum Gemma4EmbeddedAssistantError: Error, Equatable {
+    case missingAssistantConfig
+    case missingWeightFile(String)
+    case unexpectedTensor(String)
+}
+
+extension Gemma4AssistantDraftModel {
+    /// File that carries the embedded assistant beside the target's own shards.
+    public static let embeddedWeightFileName = "model-mtp.safetensors"
+
+    /// Prefix of every embedded assistant tensor in ``embeddedWeightFileName``.
+    public static let embeddedTensorPrefix = "language_model.mtp."
+
+    /// Loads the assistant a Gemma 4 checkpoint embeds: its config is the target's
+    /// `text_config.mtp_assistant_config` and its tensors are the `language_model.mtp.*` keys of
+    /// `model-mtp.safetensors`. Any other tensor in that file, or a missing one, fails the load.
+    public static func loadEmbedded(targetDirectory: URL) throws -> Gemma4AssistantDraftModel {
+        let configData = try Data(
+            contentsOf: targetDirectory.appendingPathComponent("config.json"))
+        guard let root = try JSONSerialization.jsonObject(with: configData) as? [String: Any],
+            let assistant =
+                ((root["text_config"] as? [String: Any])?["mtp_assistant_config"]
+                ?? root["mtp_assistant_config"]) as? [String: Any]
+        else {
+            throw Gemma4EmbeddedAssistantError.missingAssistantConfig
+        }
+        let config = try JSONDecoder().decode(
+            Gemma4AssistantConfiguration.self,
+            from: JSONSerialization.data(withJSONObject: assistant))
+        let model = Gemma4AssistantDraftModel(config)
+
+        let url = targetDirectory.appendingPathComponent(embeddedWeightFileName)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw Gemma4EmbeddedAssistantError.missingWeightFile(embeddedWeightFileName)
+        }
+        var weights: [String: MLXArray] = [:]
+        for (key, value) in try loadArrays(url: url) {
+            guard key.hasPrefix(embeddedTensorPrefix) else {
+                throw Gemma4EmbeddedAssistantError.unexpectedTensor(key)
+            }
+            weights[String(key.dropFirst(embeddedTensorPrefix.count))] = value
+        }
+        weights = model.sanitize(weights: weights)
+
+        if weights.keys.contains(where: { $0.hasSuffix(".scales") }) {
+            let quantization = (root["quantization"] as? [String: Any]) ?? [:]
+            let groupSize = quantization["group_size"] as? Int ?? 64
+            let bits = quantization["bits"] as? Int ?? 4
+            quantize(model: model) { path, _ in
+                weights["\(path).scales"] != nil ? (groupSize, bits, .affine) : nil
+            }
+        }
+
+        try model.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+        eval(model)
+        return model
+    }
+
+    /// ``loadEmbedded(targetDirectory:)`` wrapped for the shared drafter surface.
+    public static func loadEmbeddedContainer(targetDirectory: URL) throws -> MTPDrafterContainer {
+        let model = try loadEmbedded(targetDirectory: targetDirectory)
+        return MTPDrafterContainer(
+            context: MTPDrafterContext(
+                configuration: ModelConfiguration(directory: targetDirectory),
+                model: model))
     }
 }
