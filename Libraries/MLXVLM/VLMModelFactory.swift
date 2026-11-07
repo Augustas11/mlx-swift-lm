@@ -501,6 +501,7 @@ public final class VLMModelFactory: GenericModelFactory {
             weightFileSelection: configuration.weightFileSelection)
 
         let tokenizer = try await tokenizerTask
+        try model.validate(tokenizer: tokenizer)
         let processorConfiguration: VLMProcessorConfiguration
         do {
             processorConfiguration = try await processorConfigTask
