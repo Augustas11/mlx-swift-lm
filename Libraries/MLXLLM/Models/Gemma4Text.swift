@@ -750,6 +750,20 @@ private class Gemma4TextExperts: Module {
         _ inputs: MLXArray,
         cache: [KVCache]? = nil
     ) -> MLXArray {
+        forward(inputs, cache: cache, emitDrafterState: false).hidden
+    }
+
+    /// The decoder stack. With `emitDrafterState`, also returns the K/V of the last layer of
+    /// each attention type and the cache entry it came from, as the MLXVLM backbone does for
+    /// the MTP assistant. Both are nil/empty unless both types are present unquantized.
+    func forward(
+        _ inputs: MLXArray,
+        cache: [KVCache]?,
+        emitDrafterState: Bool
+    ) -> (
+        hidden: MLXArray, sharedKV: [String: (MLXArray, MLXArray)]?,
+        sharedKVSources: [String: Int]
+    ) {
         let inputEmbeddings = embedTokens(inputs)
         var h = inputEmbeddings * embedScale
 
@@ -834,7 +848,23 @@ private class Gemma4TextExperts: Module {
             intermediates[idx] = (kvPair, positionOffset)
         }
 
-        return norm(h)
+        let hidden = norm(h)
+        guard emitDrafterState else { return (hidden, nil, [:]) }
+
+        var sharedKV: [String: (MLXArray, MLXArray)] = [:]
+        var sharedKVSources: [String: Int] = [:]
+        let targetTypes: Set<String> = ["full_attention", "sliding_attention"]
+        for idx in stride(from: layers.count - 1, through: 0, by: -1) {
+            let layerType = layers[idx].layerType
+            guard targetTypes.contains(layerType), sharedKV[layerType] == nil else { continue }
+            if case .regular(let keys, let values) = intermediates[idx].kv {
+                sharedKV[layerType] = (keys, values)
+                sharedKVSources[layerType] = previousKvs[idx]
+            }
+            if sharedKV.count == targetTypes.count { break }
+        }
+        guard sharedKV.count == targetTypes.count else { return (hidden, nil, [:]) }
+        return (hidden, sharedKV, sharedKVSources)
     }
 }
 
@@ -862,7 +892,11 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var out = model(inputs, cache: cache)
+        logits(model(inputs, cache: cache))
+    }
+
+    private func logits(_ hidden: MLXArray) -> MLXArray {
+        var out = hidden
         if let lmHead {
             out = lmHead(out)
         } else {
@@ -870,6 +904,24 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
         out = tanh(out / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
         return out
+    }
+
+    /// MTP-aware entry point: with ``mtpEmitFlagKey`` set, the output carries the post-norm
+    /// hidden state and the shared K/V the Gemma 4 assistant attends over.
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        guard state?[mtpEmitFlagKey] ?? false else {
+            return LMOutput(logits: self(input.tokens, cache: cache))
+        }
+        let (hidden, sharedKV, sources) = model.forward(
+            input.tokens, cache: cache, emitDrafterState: true)
+        guard let sharedKV else { return LMOutput(logits: logits(hidden)) }
+        var out = LMOutput.State()
+        out[mtpLastHiddenStatesKey] = hidden
+        out[mtpSharedKVStatesKey] = sharedKV
+        out[mtpSharedKVSourceIndicesKey] = sources
+        return LMOutput(logits: logits(hidden), state: out)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -883,6 +935,10 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         var sanitized = [String: MLXArray]()
         for (key, value) in weights {
             let k = key
+            // The embedded MTP assistant (`model-mtp.safetensors`) is the drafter's, not ours.
+            if k.hasPrefix("mtp.") || k.contains(".mtp.") {
+                continue
+            }
             // Skip vision/audio/rotary weights
             if k.contains("self_attn.rotary_emb")
                 || k.contains("input_max")

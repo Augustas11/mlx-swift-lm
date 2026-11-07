@@ -91,6 +91,19 @@ extension MTPDrafterModel {
     public var requiresGreedySampling: Bool { false }
 }
 
+/// A target whose token embeddings an MTP drafter reuses as its input embeddings.
+///
+/// Gemma 4 assistants embed the bonus token with the target's table. The text-only and
+/// multimodal Gemma 4 targets live in different modules, so the drafter reaches the table
+/// through this protocol instead of a concrete class.
+public protocol MTPTargetInputEmbeddingProvider {
+    /// Unscaled token embeddings, shaped `tokens.shape + [hiddenSize]`.
+    func mtpInputEmbeddings(_ tokens: MLXArray) -> MLXArray
+
+    /// Multiplier the target applies to ``mtpInputEmbeddings(_:)`` at its own input.
+    var mtpInputEmbeddingScale: Float { get }
+}
+
 /// Target-side capability for rewinding an in-place speculative verify pass.
 ///
 /// Rollback belongs to the target/cache implementation, not to the drafter.
@@ -161,18 +174,32 @@ public struct MTPPackedDrafterAdvanceRow {
     /// The row's drafter state before this advance. It is not mutated.
     public let state: MTPDrafterState
 
+    /// Target K/V for drafters that attend over it (``MTPDrafterModel/requiresSharedTargetKV``),
+    /// keyed by layer type as ``MTPPackedVerificationRowState/sharedKV``. Each tuple has batch
+    /// size one and ends at the row's last verification input column, rejected columns
+    /// included; the drafter drops those itself.
+    public let sharedKV: [String: (MLXArray, MLXArray)]?
+
+    /// Absolute cache offset after the verification forward that produced ``sharedKV``
+    /// (``MTPPackedVerificationRowState/queryOffset``).
+    public let sharedKVOffset: Int?
+
     public init(
         targetHidden: MLXArray,
         acceptedTokens: [Int],
         finalToken: Int,
         positionDeltas: MLXArray?,
-        state: MTPDrafterState
+        state: MTPDrafterState,
+        sharedKV: [String: (MLXArray, MLXArray)]? = nil,
+        sharedKVOffset: Int? = nil
     ) {
         self.targetHidden = targetHidden
         self.acceptedTokens = acceptedTokens
         self.finalToken = finalToken
         self.positionDeltas = positionDeltas
         self.state = state
+        self.sharedKV = sharedKV
+        self.sharedKVOffset = sharedKVOffset
     }
 }
 
