@@ -64,6 +64,12 @@ public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider {
         languageModel(inputs, cache: cache)
     }
 
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        languageModel(input, cache: cache, state: state)
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = [String: MLXArray]()
         for (key, value) in weights {
@@ -89,6 +95,11 @@ public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider {
                 continue
             }
 
+            // The embedded MTP assistant belongs to the drafter.
+            if k.hasPrefix("language_model.mtp.") || k.hasPrefix("mtp.") {
+                continue
+            }
+
             // Remap language_model keys
             if k.hasPrefix("language_model") {
                 k = k.replacingOccurrences(
@@ -104,6 +115,24 @@ public class Gemma4Model: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) throws -> [any KVCache] {
         try languageModel.newCache(parameters: parameters)
     }
+}
+
+// MARK: - MTP
+
+extension Gemma4Model: MTPTargetInputEmbeddingProvider {
+    public func mtpInputEmbeddings(_ tokens: MLXArray) -> MLXArray {
+        languageModel.model.embedTokens(tokens)
+    }
+
+    public var mtpInputEmbeddingScale: Float { languageModel.model.embedScale }
+}
+
+extension Gemma4TextModel: MTPTargetInputEmbeddingProvider {
+    public func mtpInputEmbeddings(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(tokens)
+    }
+
+    public var mtpInputEmbeddingScale: Float { model.embedScale }
 }
 
 // MARK: - LoRA
