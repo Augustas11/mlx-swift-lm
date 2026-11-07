@@ -177,3 +177,31 @@ private func expectAllClose(
         #expect(continuedState.dtype == previousState.dtype)
     }
 }
+
+/// A batch mask must broadcast against the per-head segment sums: `mask` is
+/// (B, L) and `x` is (B, H, L). Before the fix the pair mask was built from
+/// the unexpanded mask, giving (B, L, L) against (B, H, L, L), which crashed
+/// any batched Mamba2 prefill with a mask (Nemotron-H continuous batching).
+@Test func testSegsumBatchMaskBroadcastsAcrossHeads() {
+    let b = 2, h = 3, l = 5
+    let x = MLXRandom.normal([b, h, l])
+    let mask = MLXArray([1, 1, 1, 1, 1, 0, 0, 1, 1, 1].map { Float($0) }, [b, l])
+
+    let masked = segsum(x, mask: mask)
+    #expect(masked.shape == [b, h, l, l])
+
+    // An all-ones mask is the same as no mask.
+    let ones = MLXArray.ones([b, l])
+    let unmasked = segsum(x)
+    let allOnes = segsum(x, mask: ones)
+    #expect(allOnes.shape == unmasked.shape)
+    #expect(MLX.arrayEqual(MLX.isInf(allOnes), MLX.isInf(unmasked)).item(Bool.self))
+    let zero = MLXArray(Float(0))
+    #expect(MLX.allClose(
+        MLX.which(MLX.isInf(unmasked), zero, allOnes),
+        MLX.which(MLX.isInf(unmasked), zero, unmasked)).item(Bool.self))
+
+    // Padded positions (row 1, columns 0 and 1) are -inf in every head.
+    let padded = masked[1, 0..., 2, 0].asArray(Float.self)
+    #expect(padded.allSatisfy { $0 == -Float.infinity })
+}
