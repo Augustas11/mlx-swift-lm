@@ -375,6 +375,9 @@ public func loadWeights(
     weights = model.sanitize(weights: weights, metadata: metadata)
 
     // quantize if needed
+    let perLayerQuantization = perLayerQuantization.map {
+        (model as? any PerLayerQuantizationSanitizing)?.sanitize(perLayerQuantization: $0) ?? $0
+    }
     if quantization != nil || perLayerQuantization != nil {
         quantize(model: model) { path, module in
             if weights["\(path).scales"] != nil {
