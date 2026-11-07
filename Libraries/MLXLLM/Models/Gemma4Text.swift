@@ -298,12 +298,18 @@ private class Gemma4Attention: Module {
         super.init()
     }
 
+    /// With `attendThroughCache`, a cache that owns attention
+    /// (``KVCacheAttentionProtocol``, e.g. a batched cache whose rows sit at different key
+    /// offsets) updates and attends itself, so each row attends only over its own keys. The
+    /// returned state then holds only this call's new K/V, so callers set it only for a
+    /// layer whose K/V no later layer and no drafter reads.
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: KVCache? = nil,
         sharedKV: Gemma4SharedKVState? = nil,
-        positionOffset: RoPEOffset? = nil
+        positionOffset: RoPEOffset? = nil,
+        attendThroughCache: Bool = false
     ) -> (MLXArray, Gemma4SharedKVState, RoPEOffset?) {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
@@ -340,7 +346,16 @@ private class Gemma4Attention: Module {
                 v = v.transposed(0, 2, 1, 3)
             }
 
-            if let quantizedCache = cache as? QuantizedKVCacheProtocol {
+            if attendThroughCache, let attentionCache = cache as? KVCacheAttentionProtocol,
+                !(cache is QuantizedKVCacheProtocol)
+            {
+                queries = queries.transposed(0, 2, 1, 3)
+                queries = applyRotaryPosition(rope, to: queries, offset: activePositionOffset)
+                let attended = attentionCache.updateAndAttend(
+                    queries: queries, keys: k, values: v, scale: scale, mask: mask ?? .none)
+                let output = attended.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+                return (oProj(output), .regular(keys: k, values: v), activePositionOffset)
+            } else if let quantizedCache = cache as? QuantizedKVCacheProtocol {
                 let (quantizedKeys, quantizedValues) = quantizedCache.updateQuantized(
                     keys: k, values: v)
                 kvState = .quantized(
@@ -606,13 +621,15 @@ private class Gemma4TextExperts: Module {
         cache: KVCache? = nil,
         perLayerInput: MLXArray? = nil,
         sharedKV: Gemma4SharedKVState? = nil,
-        positionOffset: RoPEOffset? = nil
+        positionOffset: RoPEOffset? = nil,
+        attendThroughCache: Bool = false
     ) -> (MLXArray, Gemma4SharedKVState, RoPEOffset?) {
         let residual = x
 
         let h = inputLayernorm(x)
         let (attnOut, kvPair, attnPositionOffset) = selfAttn(
-            h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset)
+            h, mask: mask, cache: cache, sharedKV: sharedKV, positionOffset: positionOffset,
+            attendThroughCache: attendThroughCache)
         // Fused: residual + RMSNorm(attnOut) * weight
         var out = _addRMSNorm(residual, attnOut, postAttentionLayernorm.weight)
 
@@ -830,6 +847,17 @@ private class Gemma4TextExperts: Module {
         var intermediates = [(kv: Gemma4SharedKVState?, positionOffset: RoPEOffset?)](
             repeating: (nil, nil), count: config.numHiddenLayers)
 
+        // Layers whose full K/V a KV-shared layer or the drafter reads attend over the
+        // returned K/V; every other layer lets a cache that owns attention attend itself.
+        var kvReadLayers = Set(previousKvs.enumerated().filter { $0.offset != $0.element }.map(\.element))
+        if emitDrafterState {
+            for layerType in ["full_attention", "sliding_attention"] {
+                if let last = layers.lastIndex(where: { $0.layerType == layerType }) {
+                    kvReadLayers.insert(previousKvs[last])
+                }
+            }
+        }
+
         for (idx, layer) in layers.enumerated() {
             let prevIdx = previousKvs[idx]
             let sharedKV = intermediates[prevIdx].kv
@@ -842,7 +870,8 @@ private class Gemma4TextExperts: Module {
                 cache: fullCache[idx],
                 perLayerInput: perLayerInputs[idx],
                 sharedKV: sharedKV,
-                positionOffset: sharedPositionOffset
+                positionOffset: sharedPositionOffset,
+                attendThroughCache: !kvReadLayers.contains(idx)
             )
             h = out
             intermediates[idx] = (kvPair, positionOffset)
