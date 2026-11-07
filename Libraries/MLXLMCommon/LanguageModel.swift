@@ -37,6 +37,19 @@ public protocol AdditionalWeightFilesProviding {
     var additionalWeightFiles: [String] { get }
 }
 
+/// A model whose checkpoint `quantization` map can name layers by checkpoint
+/// paths rather than module paths.
+///
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:)-6eqw7``
+/// looks per-layer quantization up by module path. A model whose
+/// ``BaseLanguageModel/sanitize(weights:)`` renames tensors maps the map's keys
+/// by the same rules here, so each layer gets its own bits and group size
+/// instead of the default.
+public protocol PerLayerQuantizationSanitizing {
+    func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization)
+        -> BaseConfiguration.PerLayerQuantization
+}
+
 /// Optional metadata a model wants written into converted safetensors.
 ///
 /// Model-specific metadata lets future loaders distinguish transformed MLX-native

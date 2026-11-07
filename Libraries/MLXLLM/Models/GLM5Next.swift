@@ -1486,6 +1486,15 @@ public final class GLM5NextTextModel: Module, LLMModel {
     public var loraLayers: [Module] { model.layers }
 }
 
+extension GLM5NextTextModel: PerLayerQuantizationSanitizing {
+    public func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization)
+        -> BaseConfiguration.PerLayerQuantization
+    {
+        GLM5NextWeights.sanitize(
+            perLayerQuantization: perLayerQuantization, configuration: configuration)
+    }
+}
+
 /// A sparse layer cache's latent `[B, 1, T, R]` (batched rows right-padded to
 /// the longest) and its offset (the longest row's), or `nil` while empty.
 func glm5NextSharedLatent(_ cache: KVCache) -> (MLXArray, Int)? {
@@ -1552,6 +1561,16 @@ public final class GLM5NextModel: Module, LLMModel {
     public var loraLayers: [Module] { languageModel.loraLayers }
 }
 
+extension GLM5NextModel: PerLayerQuantizationSanitizing {
+    public func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization)
+        -> BaseConfiguration.PerLayerQuantization
+    {
+        GLM5NextWeights.sanitize(
+            perLayerQuantization: perLayerQuantization,
+            configuration: languageModel.configuration, modulePrefix: "language_model.")
+    }
+}
+
 // MARK: - Weight sanitization
 
 enum GLM5NextWeights {
@@ -1604,64 +1623,52 @@ enum GLM5NextWeights {
     private static func remapNextnLayers(
         _ weights: [String: MLXArray], config: GLM5NextConfiguration
     ) -> [String: MLXArray] {
-        let fusion = [
-            "eh_proj.": "eh_proj.", "enorm.": "enorm.", "hnorm.": "hnorm.",
-            "shared_head.norm.": "norm.",
-        ]
         var result = [String: MLXArray]()
         for (key, value) in weights {
-            guard key.hasPrefix("model.layers.") else {
-                result[key] = value
-                continue
-            }
-            let rest = key.dropFirst("model.layers.".count)
-            guard let dot = rest.firstIndex(of: "."), let index = Int(rest[..<dot]) else {
-                result[key] = value
-                continue
-            }
-            guard index >= config.hiddenLayers else {
-                result[key] = value
-                continue
-            }
-            let nextn = index - config.hiddenLayers
-            guard nextn < config.numNextnPredictLayers else { continue }
-            let suffix = String(rest[rest.index(after: dot)...])
-            if suffix.hasPrefix("shared_head.head.") || suffix.hasPrefix("embed_tokens.") {
-                continue
-            }
-            if let (source, target) = fusion.first(where: { suffix.hasPrefix($0.key) }) {
-                result["mtp.\(nextn).\(target)\(suffix.dropFirst(source.count))"] = value
-            } else {
-                result["mtp.\(nextn).block.\(suffix)"] = value
+            if let mapped = nextnKey(key, config: config) {
+                result[mapped] = value
             }
         }
         return result
     }
 
+    /// `model.layers.<L + i>.<suffix>` to its `mtp.<i>.*` name, `nil` for a
+    /// dropped nextn tensor; any other key unchanged.
+    private static func nextnKey(_ key: String, config: GLM5NextConfiguration) -> String? {
+        let fusion = [
+            "eh_proj.": "eh_proj.", "enorm.": "enorm.", "hnorm.": "hnorm.",
+            "shared_head.norm.": "norm.",
+        ]
+        guard key.hasPrefix("model.layers.") else { return key }
+        let rest = key.dropFirst("model.layers.".count)
+        guard let dot = rest.firstIndex(of: "."), let index = Int(rest[..<dot]),
+            index >= config.hiddenLayers
+        else { return key }
+        let nextn = index - config.hiddenLayers
+        guard nextn < config.numNextnPredictLayers else { return nil }
+        let suffix = String(rest[rest.index(after: dot)...])
+        if suffix.hasPrefix("shared_head.head.") || suffix.hasPrefix("embed_tokens.") {
+            return nil
+        }
+        if let (source, target) = fusion.first(where: { suffix.hasPrefix($0.key) }) {
+            return "mtp.\(nextn).\(target)\(suffix.dropFirst(source.count))"
+        }
+        return "mtp.\(nextn).block.\(suffix)"
+    }
+
     /// Hugging Face names to module names: `hc_attn_*`, top-level forget-gate
     /// parameters, and per-projection short convolutions.
     private static func renameParts(_ weights: [String: MLXArray]) -> [String: MLXArray] {
-        let forgetGateParts = [
-            "A_log", "dt_bias",
-            "f_a_proj.weight", "f_a_proj.scales", "f_a_proj.biases",
-            "f_b_proj.weight", "f_b_proj.scales", "f_b_proj.biases",
-        ]
         var result = [String: MLXArray]()
         var convParts = [String: [Character: MLXArray]]()
         for (key, value) in weights {
-            var key =
-                key
-                .replacingOccurrences(of: ".hc_attn_", with: ".attn_hc.")
-                .replacingOccurrences(of: ".hc_ffn_", with: ".ffn_hc.")
+            let key = renamedPart(key)
             if let part = ["q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight"]
                 .first(where: { key.hasSuffix(".self_attn." + $0) })
             {
                 let prefix = String(key.dropLast(part.count))
                 convParts[prefix, default: [:]][part.first!] = value
                 continue
-            }
-            if let part = forgetGateParts.first(where: { key.hasSuffix(".self_attn." + $0) }) {
-                key = String(key.dropLast(part.count)) + "forget_gate." + part
             }
             result[key] = value
         }
@@ -1677,6 +1684,65 @@ enum GLM5NextWeights {
         for (key, value) in result
         where key.hasSuffix("conv1d.weight") && value.ndim == 3 && value.dim(-1) != 1 {
             result[key] = value.movedAxis(source: 2, destination: 1)
+        }
+        return result
+    }
+
+    /// `hc_attn_*` / `hc_ffn_*` and top-level forget-gate parameters to module names.
+    private static func renamedPart(_ key: String) -> String {
+        let forgetGateParts = [
+            "A_log", "dt_bias",
+            "f_a_proj.weight", "f_a_proj.scales", "f_a_proj.biases",
+            "f_b_proj.weight", "f_b_proj.scales", "f_b_proj.biases",
+        ]
+        let key =
+            key
+            .replacingOccurrences(of: ".hc_attn_", with: ".attn_hc.")
+            .replacingOccurrences(of: ".hc_ffn_", with: ".ffn_hc.")
+        if let part = forgetGateParts.first(where: { key.hasSuffix(".self_attn." + $0) }) {
+            return String(key.dropLast(part.count)) + "forget_gate." + part
+        }
+        return key
+    }
+
+    /// The text-model module paths a checkpoint's `quantization` key names, by
+    /// the tensor-name rules of `sanitize` applied to `<key>.weight`. A Hugging
+    /// Face map (`model.language_model.*`, `lm_head`, top-level forget-gate
+    /// projections, `layers.<L>` nextn, per-expert and `kv_b_proj` entries)
+    /// resolves to the modules the tensors load into; an MLX map is unchanged.
+    static func quantizationModulePaths(
+        _ key: String, configuration config: GLM5NextConfiguration
+    ) -> [String] {
+        guard let text = textKey(key + ".weight"),
+            var name = nextnKey(text, config: config).map(renamedPart)
+        else { return [] }
+        name = String(name.dropLast(".weight".count))
+        if let range = name.range(of: ".mlp.experts.") {
+            let rest = name[range.upperBound...]
+            if let dot = rest.firstIndex(of: "."), Int(rest[..<dot]) != nil {
+                let projection = rest[rest.index(after: dot)...]
+                name = String(name[..<range.lowerBound] + ".mlp.switch_mlp." + projection)
+            }
+        }
+        if name.hasSuffix(".self_attn.kv_b_proj") {
+            let prefix = String(name.dropLast("kv_b_proj".count))
+            return [prefix + "embed_q", prefix + "unembed_out"]
+        }
+        return [name]
+    }
+
+    /// `quantization` with every checkpoint key also entered under the module
+    /// paths it names. An entry already keyed by a module path wins.
+    static func sanitize(
+        perLayerQuantization: BaseConfiguration.PerLayerQuantization,
+        configuration config: GLM5NextConfiguration, modulePrefix: String = ""
+    ) -> BaseConfiguration.PerLayerQuantization {
+        var result = perLayerQuantization
+        for (key, option) in perLayerQuantization.perLayerQuantization {
+            for path in quantizationModulePaths(key, configuration: config)
+            where result.perLayerQuantization[modulePrefix + path] == nil {
+                result.perLayerQuantization[modulePrefix + path] = option
+            }
         }
         return result
     }

@@ -2638,15 +2638,11 @@ final class GLM5NextTests: XCTestCase {
         XCTAssertEqual(maxAbsDifference(source(input, cache: nil), target(input, cache: nil)), 0)
     }
 
-    /// Hugging Face layout: `model.language_model.*`, `hc_attn_*`, top-level
-    /// forget-gate tensors, per-projection convs in torch layout, per-expert
-    /// weights, `kv_b_proj`, and the nextn layer at `layers.<L>`.
-    func testSanitizeMapsHuggingFaceLayout() throws {
-        let config = try configuration(nested: true)
-        let source = GLM5NextModel(config)
-        randomize(source)
-        let reference = Dictionary(uniqueKeysWithValues: source.parameters().flattened())
-
+    /// `reference` (a float `GLM5NextModel`'s parameters) in the Hugging Face
+    /// key and tensor layout, plus a nextn head and a vision tensor that load drops.
+    private func huggingFaceLayout(
+        _ reference: [String: MLXArray], config: GLM5NextConfiguration
+    ) -> [String: MLXArray] {
         var hf = [String: MLXArray]()
         var kvB = [String: (wk: MLXArray?, wv: MLXArray?)]()
         for (key, value) in reference {
@@ -2703,6 +2699,19 @@ final class GLM5NextTests: XCTestCase {
         hf["model.language_model.layers.\(config.hiddenLayers).shared_head.head.weight"] =
             MLXArray.zeros([4, 4])
         hf["model.visual.patch_embed.proj.weight"] = MLXArray.zeros([4, 4])
+
+        return hf
+    }
+
+    /// Hugging Face layout: `model.language_model.*`, `hc_attn_*`, top-level
+    /// forget-gate tensors, per-projection convs in torch layout, per-expert
+    /// weights, `kv_b_proj`, and the nextn layer at `layers.<L>`.
+    func testSanitizeMapsHuggingFaceLayout() throws {
+        let config = try configuration(nested: true)
+        let source = GLM5NextModel(config)
+        randomize(source)
+        let reference = Dictionary(uniqueKeysWithValues: source.parameters().flattened())
+        let hf = huggingFaceLayout(reference, config: config)
 
         let target = GLM5NextModel(config)
         let sanitized = target.sanitize(weights: hf)
@@ -2777,5 +2786,153 @@ final class GLM5NextTests: XCTestCase {
 
         let input = tokens(12)
         XCTAssertEqual(maxAbsDifference(source(input, cache: nil), target(input, cache: nil)), 0)
+    }
+
+    /// A Hugging Face checkpoint whose `quantization` map is keyed by its own
+    /// layout (`model.language_model.*`, `lm_head`, top-level forget-gate
+    /// projections, `kv_b_proj`, the nextn layer at `layers.<L>`), as
+    /// Solstice-AI/GLM-5.3-Flash-UNCENSORED-mlx-oQ4e: 8-bit embedding and
+    /// lm_head, 4-bit default. Every module loads at its configured bits, and
+    /// the model matches the same checkpoint loaded with an MLX-keyed map.
+    func testLoadWeightsMapsHuggingFaceQuantizationKeys() throws {
+        let config = try configuration(nested: true)
+        let source = GLM5NextModel(config)
+        randomize(source)
+        let reference = Dictionary(uniqueKeysWithValues: source.parameters().flattened())
+        var hf = huggingFaceLayout(reference, config: config)
+        let nextn = "model.language_model.layers.\(config.hiddenLayers)."
+
+        func checkpointBits(_ path: String) -> Int {
+            if path.hasSuffix("embed_tokens") || path == "lm_head" { return 8 }
+            if path.hasSuffix("kv_b_proj") || path.hasSuffix("f_a_proj")
+                || path.hasSuffix("f_b_proj")
+            {
+                return 6
+            }
+            if path.hasSuffix("eh_proj") || path == nextn + "self_attn.o_proj" { return 5 }
+            if path.contains("shared_experts") { return 8 }
+            return 4
+        }
+        func moduleBits(_ path: String) -> Int {
+            if path == "language_model.model.embed_tokens" || path == "language_model.lm_head" {
+                return 8
+            }
+            if path.hasSuffix("embed_q") || path.hasSuffix("unembed_out")
+                || path.hasSuffix("forget_gate.f_a_proj") || path.hasSuffix("forget_gate.f_b_proj")
+            {
+                return 6
+            }
+            if path == "language_model.mtp.0.eh_proj"
+                || path == "language_model.mtp.0.block.self_attn.o_proj"
+            {
+                return 5
+            }
+            if path.contains("shared_experts") { return 8 }
+            return 4
+        }
+
+        var perLayer = [String: BaseConfiguration.QuantizationOption]()
+        for (key, value) in hf where value.ndim == 2 {
+            let quantizable = ["_proj.weight", ".wk.weight", ".wq_b.weight"].contains {
+                key.hasSuffix($0)
+            }
+            guard quantizable || key.hasSuffix("embed_tokens.weight") || key == "lm_head.weight",
+                !key.contains("visual")
+            else { continue }
+            let path = String(key.dropLast(".weight".count))
+            let bits = checkpointBits(path)
+            let (weight, scales, biases) = MLX.quantized(value, groupSize: 32, bits: bits)
+            hf[key] = weight
+            hf[path + ".scales"] = scales
+            hf[path + ".biases"] = biases
+            if bits != 4 {
+                perLayer[path] = .quantize(.init(groupSize: 32, bits: bits))
+            }
+        }
+        XCTAssertNotNil(perLayer["model.language_model.embed_tokens"])
+        XCTAssertNotNil(perLayer["lm_head"])
+        XCTAssertNotNil(perLayer["model.language_model.layers.0.self_attn.f_a_proj"])
+        XCTAssertNotNil(perLayer["model.language_model.layers.3.self_attn.kv_b_proj"])
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("glm5next-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try save(arrays: hf, url: directory.appendingPathComponent("model.safetensors"))
+
+        let target = GLM5NextModel(config)
+        try loadWeights(
+            modelDirectory: directory, model: target,
+            perLayerQuantization: .init(
+                quantization: .init(groupSize: 32, bits: 4), perLayerQuantization: perLayer))
+
+        var quantizedModules = 0
+        for (path, module) in target.leafModules().flattened() {
+            guard let quantized = module as? Quantized else { continue }
+            quantizedModules += 1
+            XCTAssertEqual(quantized.bits, moduleBits(path), path)
+            XCTAssertEqual(quantized.groupSize, 32, path)
+        }
+        XCTAssertEqual(
+            (target.languageModel.model.embedTokens as? QuantizedEmbedding)?.bits, 8)
+        XCTAssertEqual((target.languageModel.lmHead as? QuantizedLinear)?.bits, 8)
+        XCTAssertGreaterThan(quantizedModules, 40)
+
+        var mlxPerLayer = [String: BaseConfiguration.QuantizationOption]()
+        for (path, module) in target.leafModules().flattened()
+        where module is Quantized && moduleBits(path) != 4 {
+            mlxPerLayer[path] = .quantize(.init(groupSize: 32, bits: moduleBits(path)))
+        }
+        let mlxKeyed = GLM5NextModel(config)
+        try loadWeights(
+            modelDirectory: directory, model: mlxKeyed,
+            perLayerQuantization: .init(
+                quantization: .init(groupSize: 32, bits: 4), perLayerQuantization: mlxPerLayer))
+
+        let input = tokens(12)
+        let logits = target(input, cache: nil)
+        XCTAssertEqual(maxAbsDifference(logits, mlxKeyed(input, cache: nil)), 0)
+        XCTAssertTrue(isNaN(logits).any().item(Bool.self) == false)
+    }
+
+    /// A map keyed by module paths (the live artifact's `language_model.*`
+    /// layout) passes through unchanged, entry for entry.
+    func testPerLayerQuantizationKeepsMLXLayoutMap() throws {
+        let config = try configuration(nested: true)
+        let model = GLM5NextModel(config)
+        var perLayer = [String: BaseConfiguration.QuantizationOption]()
+        for (index, (path, module)) in model.leafModules().flattened().enumerated()
+        where module is Quantizable || module is MultiLinear {
+            perLayer[path] =
+                index % 3 == 0 ? .skip : .quantize(.init(groupSize: 32, bits: 4 + index % 5))
+        }
+        XCTAssertNotNil(perLayer["language_model.model.embed_tokens"])
+        XCTAssertNotNil(perLayer["language_model.mtp.0.eh_proj"])
+        let input = BaseConfiguration.PerLayerQuantization(
+            quantization: .init(groupSize: 64, bits: 4), perLayerQuantization: perLayer)
+
+        func described(_ map: BaseConfiguration.PerLayerQuantization) -> [String: String] {
+            map.perLayerQuantization.mapValues {
+                switch $0 {
+                case .skip: "skip"
+                case .quantize(let q): "\(q.bits)/\(q.groupSize)/\(q.mode)"
+                }
+            }
+        }
+        let sanitized = model.sanitize(perLayerQuantization: input)
+        XCTAssertEqual(described(sanitized), described(input))
+        XCTAssertEqual(sanitized.quantization, input.quantization)
+
+        // The text model takes `model.*` paths from either layout.
+        let text = GLM5NextTextModel(config)
+        let textMap = text.sanitize(
+            perLayerQuantization: .init(
+                quantization: nil,
+                perLayerQuantization: [
+                    "model.language_model.embed_tokens": .quantize(.init(groupSize: 64, bits: 8)),
+                    "language_model.lm_head": .quantize(.init(groupSize: 64, bits: 8)),
+                ]))
+        XCTAssertEqual(textMap.quantization(layer: "model.embed_tokens")?.bits, 8)
+        XCTAssertEqual(textMap.quantization(layer: "lm_head")?.bits, 8)
     }
 }
