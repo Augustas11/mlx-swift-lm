@@ -121,9 +121,12 @@ func ssmUpdateKernel(
 public func segsum(_ x: MLXArray, mask: MLXArray? = nil) -> MLXArray {
     let l = x.dim(-1)
     var x = x
+    // Expand once and use it in both places, as mlx-lm does: the second use
+    // needs the (B, 1, L) shape so the pair mask broadcasts against
+    // xSegsum's (B, H, L, L).
+    let mask = mask.map { MLX.expandedDimensions($0, axis: 1) }
 
-    if let mask = mask {
-        let mask = MLX.expandedDimensions(mask, axis: 1)
+    if let mask {
         x = x * mask
     }
 
