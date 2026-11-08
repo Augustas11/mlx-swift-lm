@@ -237,6 +237,7 @@ public final class EmbedderModelFactory: GenericModelFactory {
             weightFileSelection: configuration.weightFileSelection)
 
         let tokenizer = try await tokenizerTask
+        try model.validate(tokenizer: tokenizer)
 
         // Build a ModelConfiguration for the ModelContext
         let tokenizerSource: TokenizerSource? =

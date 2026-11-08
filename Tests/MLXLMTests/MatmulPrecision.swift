@@ -57,6 +57,39 @@ enum MatmulPrecision {
     /// to a few times 1e-3; 2e-2 clears that with margin while staying far below the O(1)
     /// shift a real positioning error produces.
     static let splitTolerance: Float = tolerance(float32: 1e-3, reduced: 2e-2)
+
+    /// Nil when `|actual - expected| <= atol + rtol * |expected|` elementwise, else a message
+    /// with the worst difference. `atol` applies with IEEE float32, `reducedAtol` with TF32.
+    static func mismatch(
+        _ actual: MLXArray, _ expected: MLXArray, rtol: Double, atol: Double, reducedAtol: Double
+    ) -> String? {
+        guard actual.shape == expected.shape else {
+            return "shape \(actual.shape) != \(expected.shape)"
+        }
+        let atol = tolerance(float32: atol, reduced: reducedAtol)
+        if allClose(actual, expected, rtol: rtol, atol: atol).item(Bool.self) {
+            return nil
+        }
+        let worst = abs(actual - expected).max().item(Float.self)
+        let precision = isReducedFloat32 ? "TF32" : "float32"
+        return "values differ by up to \(worst) (rtol \(rtol), atol \(atol), \(precision))"
+    }
+}
+
+/// Fail when two float32 results disagree beyond the tolerance for this machine's float32
+/// matmul precision. See ``MatmulPrecision``.
+func assertClose(
+    _ actual: MLXArray, _ expected: MLXArray, rtol: Double = 0, atol: Double,
+    reducedAtol: Double, _ message: String = "", file: StaticString = #filePath,
+    line: UInt = #line
+) {
+    if let mismatch = MatmulPrecision.mismatch(
+        actual, expected, rtol: rtol, atol: atol, reducedAtol: reducedAtol)
+    {
+        XCTFail(
+            [message, mismatch].filter { !$0.isEmpty }.joined(separator: ": "), file: file,
+            line: line)
+    }
 }
 
 final class MatmulPrecisionTests: XCTestCase {

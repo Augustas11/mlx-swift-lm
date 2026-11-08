@@ -6,6 +6,10 @@ import MLXNN
 
 /// Abstract form of a model that processes language.
 public protocol BaseLanguageModel: Module {
+    /// Check whether the loaded tokenizer meets this model's requirements.
+    /// The default implementation accepts any tokenizer.
+    func validate(tokenizer: any Tokenizer) throws
+
     /// Optionally preprocess the weights and modify / remove values as needed.
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray]
 
@@ -59,6 +63,8 @@ public protocol ModelConversionMetadataProvider {
 }
 
 extension BaseLanguageModel {
+    public func validate(tokenizer: any Tokenizer) throws {}
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         weights
     }
