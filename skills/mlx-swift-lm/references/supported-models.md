@@ -99,6 +99,7 @@ LLMRegistry.glm4_9b_4bit          // mlx-community/GLM-4-9B-0414-4bit
 | `smollm3` | SmolLM 3 |
 | `ernie4_5` | ERNIE 4.5 |
 | `lfm2`, `lfm2_moe` | LFM 2 |
+| `lfm3` | LFM 3 |
 | `exaone4` | EXAONE 4 |
 | `olmo2`, `olmo3`, `olmoe` | OLMo |
 | `falcon_h1` | Falcon H1 |
