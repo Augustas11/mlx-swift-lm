@@ -353,11 +353,13 @@ class GPTOSSTransformerBlock: Module {
     public func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: KVCache? = nil
+        cache: KVCache? = nil,
+        attentionObserver: ((MLXArray) -> Void)? = nil
     ) -> MLXArray {
         var residual = x
         var x = inputLayerNorm(x)
         x = selfAttn(x, mask: mask, cache: cache)
+        attentionObserver?(x)
         x = residual + x
 
         residual = x
@@ -368,9 +370,74 @@ class GPTOSSTransformerBlock: Module {
     }
 }
 
+/// Lab-only layer dump (#2255), off unless `MLX_LM_GPTOSS_LAYER_DUMP` names a
+/// directory. The first `MLX_LM_GPTOSS_LAYER_DUMP_FORWARDS` (default 4)
+/// forwards write float32 `.npy` files: embeddings, layer-0 attention output,
+/// each layer's output and the final norm, plus one `manifest.jsonl` line each.
+/// Writing evaluates the graph, so use it only on an uncompiled forward.
+final class GPTOSSLayerDump: @unchecked Sendable {
+    static let directoryKey = "MLX_LM_GPTOSS_LAYER_DUMP"
+    static let forwardsKey = "MLX_LM_GPTOSS_LAYER_DUMP_FORWARDS"
+
+    let directory: URL
+    let maxForwards: Int
+    private let lock = NSLock()
+    private var forwards = 0
+
+    init(directory: URL, maxForwards: Int) {
+        self.directory = directory
+        self.maxForwards = maxForwards
+    }
+
+    static func make(environment: [String: String]) -> GPTOSSLayerDump? {
+        guard let path = environment[directoryKey], !path.isEmpty else { return nil }
+        let maxForwards = environment[forwardsKey].flatMap { Int($0) }.map { max(0, $0) } ?? 4
+        return GPTOSSLayerDump(directory: URL(fileURLWithPath: path), maxForwards: maxForwards)
+    }
+
+    /// The index of the forward that starts now, or nil once the budget is spent.
+    func beginForward() -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard forwards < maxForwards else { return nil }
+        defer { forwards += 1 }
+        return forwards
+    }
+
+    func write(_ array: MLXArray, forward: Int, name: String) {
+        let url = directory.appendingPathComponent("native_f\(forward)_\(name).npy")
+        do {
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true)
+            try save(array: array.asType(.float32), url: url)
+        } catch {
+            FileHandle.standardError.write(
+                Data("gptoss_layer_dump error=\(error) path=\(url.path)\n".utf8))
+        }
+    }
+
+    func record(forward: Int, tokens: Int, offset: Int, dtype: DType) {
+        let line =
+            #"{"forward":\#(forward),"tokens":\#(tokens),"cache_offset":\#(offset),"dtype":"\#(dtype)"}"#
+            + "\n"
+        let url = directory.appendingPathComponent("manifest.jsonl")
+        lock.lock()
+        defer { lock.unlock() }
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+            try? handle.close()
+        } else {
+            try? Data(line.utf8).write(to: url)
+        }
+    }
+}
+
 public class GPTOSSModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
     @ModuleInfo(key: "norm") var norm: RMSNorm
+    var layerDump = GPTOSSLayerDump.make(environment: ProcessInfo.processInfo.environment)
     let layerTypes: [String]
     fileprivate let layers: [GPTOSSTransformerBlock]
     let windowSize: Int
@@ -412,6 +479,14 @@ public class GPTOSSModelInner: Module {
 
         let cache: [KVCache?] = cache ?? [KVCache?](repeating: nil, count: layers.count)
 
+        let dumpForward = layerDump?.beginForward()
+        if let dumpForward, let layerDump {
+            layerDump.record(
+                forward: dumpForward, tokens: x.dim(1), offset: cache.first??.offset ?? 0,
+                dtype: x.dtype)
+            layerDump.write(x, forward: dumpForward, name: "embed")
+        }
+
         let seqLen = x.dim(1)
         var fullMask: MLXFast.ScaledDotProductAttentionMaskMode?
         var slidingMask: MLXFast.ScaledDotProductAttentionMaskMode?
@@ -440,10 +515,21 @@ public class GPTOSSModelInner: Module {
                 maskMode = slidingMask!
             }
 
-            x = layer(x, mask: maskMode, cache: cache[i])
+            if let dumpForward, let layerDump {
+                x = layer(
+                    x, mask: maskMode, cache: cache[i],
+                    attentionObserver: i == 0
+                        ? { layerDump.write($0, forward: dumpForward, name: "layer00_attn") } : nil)
+                layerDump.write(x, forward: dumpForward, name: String(format: "layer%02d", i))
+            } else {
+                x = layer(x, mask: maskMode, cache: cache[i])
+            }
         }
 
         x = norm(x)
+        if let dumpForward, let layerDump {
+            layerDump.write(x, forward: dumpForward, name: "final_norm")
+        }
 
         return x
     }
