@@ -175,6 +175,7 @@ let package = Package(
             resources: [
                 .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
                 .copy("Resources/deepseek_v4_tiny"),
+                .copy("Resources/ricursive_tiny"),
             ]
         ),
         .macro(
