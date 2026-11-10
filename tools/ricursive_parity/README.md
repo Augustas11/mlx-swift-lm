@@ -41,7 +41,7 @@ Single-stream prefill and decode tok/s on the 4-bit community build at 1024, 819
 untimed warm-up and then three timed runs of 128 tokens; the median is reported.
 Both use the same formulas: prefill tok/s is prompt tokens over the time to the first
 token, and decode tok/s is the remaining tokens over the time from the first to the
-last. Each engine keeps its default prefill chunk (Swift 256, mlx-lm 2048), and the
+last. Each engine keeps its default prefill chunk (2048 in both), and the
 summary records both.
 
 mlx-lm runs `ricursive_mlx.py` from this directory through `load_model(get_model_classes=...)`,

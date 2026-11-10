@@ -92,7 +92,7 @@ final class RicursiveServingBenchTests: XCTestCase {
         let prompt = try JSONDecoder().decode(
             [Int].self, from: Data(contentsOf: URL(fileURLWithPath: promptPath)))
         let parameters = GenerateParameters(maxTokens: tokens, temperature: 0)
-        let prefillStep = parameters.prefill.stepSize ?? 256
+        let prefillStep = parameters.prefill.stepSize ?? 2048
 
         func runOnce(_ count: Int) throws -> Run {
             var parameters = parameters
