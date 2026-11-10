@@ -15,22 +15,8 @@ os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
 
 import torch
 from safetensors.torch import save_file
-from tokenizers import Tokenizer
-
+from prompts import prompt_tokens
 from ricursive_torch import RicursiveTorch, load_checkpoint
-
-
-def prompt_tokens(tokenizer_path, source_root, length):
-    tokenizer = Tokenizer.from_file(str(tokenizer_path))
-    files = sorted(Path(source_root).glob("Libraries/MLXLLM/Models/*.swift"))
-    if not files:
-        raise FileNotFoundError(f"no Swift sources under {source_root}")
-    ids, parts = [], 0
-    while len(ids) < length:
-        text = files[parts % len(files)].read_text()
-        ids += tokenizer.encode(text, add_special_tokens=False).ids
-        parts += 1
-    return ids[:length]
 
 
 def parse():

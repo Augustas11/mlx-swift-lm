@@ -13,7 +13,6 @@ DRY_RUN=0
 if [[ "${1:-}" == "--dry-run" ]]; then DRY_RUN=1; shift; fi
 WORK="${1:?usage: run_job.sh [--dry-run] <work-dir>}"
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-TOOLS="$REPO/tools/ricursive_parity"
 
 REFERENCE_REPO="ricursiveAI/Ripple-65B-Preview"
 REFERENCE_REV="da94cc013a8fda04a502f0a185083c7099ea06c1"
@@ -29,21 +28,7 @@ DTYPE="bfloat16"
 
 mkdir -p "$WORK/logs" "$WORK/done" || exit 2
 WORK="$(cd "$WORK" && pwd)"
-PY="$WORK/venv/bin/python"
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S %z') $*" | tee -a "$WORK/logs/job.log"; }
-fail() { log "FAIL $*"; exit 1; }
-
-# run <name> <command...>: runs once, marks done on success, stops the job on failure.
-run() {
-    local name="$1"; shift
-    if [[ -e "$WORK/done/$name" ]]; then log "skip $name (done)"; return 0; fi
-    log "start $name"
-    if "$@" >>"$WORK/logs/$name.log" 2>&1; then
-        touch "$WORK/done/$name"; log "done $name"
-    else
-        fail "$name: see $WORK/logs/$name.log"
-    fi
-}
+source "$REPO/tools/ricursive_parity/lib.sh"
 
 preflight() {
     command -v uv >/dev/null || { echo "uv is required"; return 1; }
@@ -60,14 +45,6 @@ preflight() {
 make_venv() {
     uv venv --python 3.12 "$WORK/venv" &&
     uv pip install --python "$PY" torch safetensors tokenizers numpy
-}
-
-# Weights and metadata only. Repository Python is never downloaded or run.
-download() {
-    local repo="$1" rev="$2" dir="$3"
-    "$WORK/venv/bin/hf" download "$repo" --revision "$rev" --local-dir "$dir" \
-        --exclude '*.py' --exclude '*.bin' --exclude '*.pth' --exclude '*.gguf' \
-        --exclude 'inference/*'
 }
 
 install_hf() { uv pip install --python "$PY" huggingface_hub; }
@@ -94,17 +71,11 @@ oracle() {
         --lengths "$LENGTHS" --steps "$STEPS" --device "$DEVICE" --dtype "$DTYPE" "$@"
 }
 
-swift_build() {
-    (cd "$REPO" && swift build --build-tests -c release -Xswiftc -enable-testing)
-}
-
 # parity <exact|report> <model-dir> <report-name>
 parity() {
-    (cd "$REPO" && env \
+    swift_test RicursivePytorchParityTests \
         RICURSIVE_PARITY_MODEL="$2" RICURSIVE_PARITY_ORACLE="$WORK/oracle" \
-        RICURSIVE_PARITY_MODE="$1" RICURSIVE_PARITY_REPORT="$WORK/$3.json" \
-        swift test --skip-build -c release -Xswiftc -enable-testing \
-        --filter 'RicursivePytorchParityTests')
+        RICURSIVE_PARITY_MODE="$1" RICURSIVE_PARITY_REPORT="$WORK/$3.json"
 }
 
 log "repo $(git -C "$REPO" rev-parse HEAD) dry_run=$DRY_RUN lengths=$LENGTHS steps=$STEPS device=$DEVICE"
