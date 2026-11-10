@@ -224,12 +224,15 @@ func glm5NextDecodeRowLength(_ x: MLXArray) -> Int {
     x.ndim >= 3 ? x.dim(-2) : 1
 }
 
-/// `linear(x)` with `glm5NextQMVBatch` when `x` carries 2...8 tokens and the
+/// `linear(x)` with `glm5NextQMVBatch` when `x` carries 1...8 tokens and the
 /// projection is a covered affine one (each weight tile read once for every
-/// token; every row bitwise equal to MLX's qmv of that token), else `linear(x)`.
+/// token), else `linear(x)`. One token takes the same kernel as several, so a
+/// row's bits never depend on how many tokens share the call. MLX's own
+/// small-M kernel is not used here: on GPUs without NAX it is `qmv_mma`, whose
+/// reduction order differs from the `qmv` order these kernels share.
 func glm5NextProject(_ linear: Linear, _ x: MLXArray) -> MLXArray {
     let tokens = x.size / x.dim(-1)
-    guard (2 ... 8).contains(tokens), let parts = glm5NextAffine(linear),
+    guard (1 ... 8).contains(tokens), let parts = glm5NextAffine(linear),
         let y = glm5NextQMVBatch(x.reshaped(tokens, x.dim(-1)), parts)
     else { return linear(x) }
     return y.reshaped(Array(x.shape.dropLast()) + [y.dim(-1)])
@@ -457,7 +460,7 @@ final class GLM5NextForgetGate: Module {
 
     /// The low-rank gate projection `[B, L, H * Dk]`, before the decay.
     func project(_ x: MLXArray) -> MLXArray {
-        fBProj(fAProj(x))
+        glm5NextProject(fBProj, glm5NextProject(fAProj, x))
     }
 
     /// Multiplicative per-channel decay `[B, L, H, Dk]` in float32.
@@ -526,7 +529,9 @@ final class GLM5NextLinearAttention: Module {
         if fusedDecode, !training, let cache, L <= 8, let y = fusedDecodeStep(x, cache: cache) {
             return y
         }
-        let mixed = concatenated([qProj(x), kProj(x), vProj(x)], axis: -1)
+        let mixed = concatenated(
+            [glm5NextProject(qProj, x), glm5NextProject(kProj, x), glm5NextProject(vProj, x)],
+            axis: -1)
 
         let convState =
             cache?[0]
@@ -547,7 +552,7 @@ final class GLM5NextLinearAttention: Module {
         let v = parts[2].reshaped(shape)
 
         let decay = forgetGate(x)
-        let beta = sigmoid(bProj(x))
+        let beta = sigmoid(glm5NextProject(bProj, x))
         let (out, state) = gatedDeltaUpdateVectorized(
             q: q, k: k, v: v, g: decay, beta: beta, state: cache?[1], useKernel: !training)
 
@@ -557,7 +562,7 @@ final class GLM5NextLinearAttention: Module {
             cache.advance(L)
         }
 
-        let gate = gBProj(gAProj(x)).reshaped(shape)
+        let gate = glm5NextProject(gBProj, glm5NextProject(gAProj, x)).reshaped(shape)
         return glm5NextProject(oProj, oNorm(out, gate: gate).reshaped(B, L, -1))
     }
 
@@ -683,8 +688,10 @@ final class GLM5NextLinearAttention: Module {
             fused = step
         } else {
             fused = glm5NextKDADecodeStep(
-                q: qProj(x), k: kProj(x), v: vProj(x),
-                aPre: forgetGate.project(x), gatePre: gBProj(gAProj(x)), bRaw: bProj(x),
+                q: glm5NextProject(qProj, x), k: glm5NextProject(kProj, x),
+                v: glm5NextProject(vProj, x), aPre: forgetGate.project(x),
+                gatePre: glm5NextProject(gBProj, glm5NextProject(gAProj, x)),
+                bRaw: glm5NextProject(bProj, x),
                 convState: convState, convWeight: self.conv1d.weight,
                 aLog: forgetGate.aLog, dtBias: forgetGate.dtBias, normWeight: oNorm.weight,
                 state: state, heads: numHeads, headDim: headDim,
@@ -743,7 +750,7 @@ final class GLM5NextIndexer: Module {
     func updatePools(_ x: MLXArray, cache: any GLM5NextLatentCache, keys: MLXArray? = nil)
         -> MLXArray?
     {
-        let keys = keys ?? kNorm(wk(x))
+        let keys = keys ?? kNorm(glm5NextProject(wk, x))
         let gates = matmul(x.asType(.float32), compressGate.asType(.float32).T).asType(keys.dtype)
         if let (readyKeys, readyGates) = cache.takeCompleteWindows(keys: keys, gates: gates) {
             cache.appendPooled(compress(keys: readyKeys, gates: readyGates))
@@ -777,7 +784,7 @@ final class GLM5NextIndexer: Module {
         let (B, L) = (x.dim(0), x.dim(1))
         if fusedDecode, !training, B == 1, L == 1, let pooledKeys,
             let fused = glm5NextDSASelect(
-                q: precomputedQ ?? wqB(qResid), weights: precomputedWeights ?? weightsProj(x),
+                q: precomputedQ ?? glm5NextProject(wqB, qResid), weights: precomputedWeights ?? glm5NextProject(weightsProj, x),
                 weightScale: pow(Float(numHeads), -0.5) * softmaxScale, pooledKeys: pooledKeys,
                 kvLength: kvLength, heads: numHeads, dim: headDim, indexTopk: indexTopk,
                 kpool: kpool, tail: alwaysSelectTail)
@@ -797,10 +804,10 @@ final class GLM5NextIndexer: Module {
                     scores: nil, poolCount: poolCount, selectK: selectK, firstPosition: start,
                     rows: L, indexTopk: indexTopk, kpool: kpool, tail: tail)
             }
-            let q = (precomputedQ ?? wqB(qResid)).reshaped(B, L, numHeads, headDim)
+            let q = (precomputedQ ?? glm5NextProject(wqB, qResid)).reshaped(B, L, numHeads, headDim)
                 .asType(.float32)
             let weights =
-                (precomputedWeights ?? weightsProj(x)).asType(.float32)
+                (precomputedWeights ?? glm5NextProject(weightsProj, x)).asType(.float32)
                 * (pow(Float(numHeads), -0.5) * softmaxScale)
             let poolT = expandedDimensions(pooledKeys.asType(.float32), axis: 1)
                 .swappedAxes(-1, -2)
@@ -837,10 +844,10 @@ final class GLM5NextIndexer: Module {
                     MLXArray(Int32(0) ..< Int32(poolCount)).reshaped(1, 1, poolCount),
                     to: [B, L, poolCount])
             } else {
-                let q = (precomputedQ ?? wqB(qResid)).reshaped(B, L, numHeads, headDim)
+                let q = (precomputedQ ?? glm5NextProject(wqB, qResid)).reshaped(B, L, numHeads, headDim)
                     .asType(.float32)
                 let weights =
-                    (precomputedWeights ?? weightsProj(x)).asType(.float32)
+                    (precomputedWeights ?? glm5NextProject(weightsProj, x)).asType(.float32)
                     * (pow(Float(numHeads), -0.5) * softmaxScale)
                 let poolT = expandedDimensions(pooledKeys.asType(.float32), axis: 1)
                     .swappedAxes(-1, -2)

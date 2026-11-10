@@ -708,13 +708,13 @@ private final class GLM5NextQMVBatchKernel: Sendable {
     }
 }
 
-/// `[V, N]` outputs of one affine projection for `x: [V, K]`, `2 <= V <= 8`,
-/// each row bitwise equal to the one-vector projection; `nil` when the shape
-/// is not covered.
+/// `[V, N]` outputs of one affine projection for `x: [V, K]`, `1 <= V <= 8`,
+/// each row with `qmv_fast` arithmetic, so a row's bits do not depend on `V`;
+/// `nil` when the shape is not covered.
 func glm5NextQMVBatch(_ x: MLXArray, _ p: GLM5NextAffine, rps: Int = 4, nsg: Int = 2)
     -> MLXArray?
 {
-    guard x.ndim == 2, (2 ... 8).contains(x.dim(0)), [.bfloat16, .float16].contains(x.dtype),
+    guard x.ndim == 2, (1 ... 8).contains(x.dim(0)), [.bfloat16, .float16].contains(x.dtype),
         p.weight.ndim == 2, p.scales.dtype == x.dtype, p.biases.dtype == x.dtype
     else { return nil }
     let (V, K) = (x.dim(0), x.dim(1))
