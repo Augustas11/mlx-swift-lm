@@ -1405,13 +1405,16 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
-    /// `glm5NextQMVBatch` (V vectors sharing each weight load) equals MLX's
-    /// one-vector quantized matmul row for row, bit for bit: 4/5/6/8 bits,
-    /// group sizes 32/64/128, N below and at least 4096 (MLX's narrow qmv on M5).
+    /// `glm5NextQMVBatch` (V vectors sharing each weight load) equals its own
+    /// one-vector call row for row, bit for bit: 4/5/6/8 bits, group sizes
+    /// 32/64/128, N below and at least 4096. Where MLX keeps a one-row product
+    /// on `qmv` (5 and 6 bits, N < 512), the one-vector call also equals MLX's.
+    /// The other shapes take `qmv_mma` in MLX on GPUs without NAX, whose
+    /// reduction order differs, so the model never mixes the two (#2265).
     func testQMVBatchMatchesOneVectorProjectionBitwise() throws {
-        for (bits, groupSize, n, k) in [
-            (4, 64, 4096, 4096), (8, 64, 2048, 4096), (5, 64, 8192, 4096), (6, 32, 1024, 2048),
-            (4, 128, 16384, 512), (8, 32, 64, 1024),
+        for (bits, groupSize, n, k, mlxOnQMV) in [
+            (4, 64, 4096, 4096, false), (8, 64, 2048, 4096, false), (5, 64, 8192, 4096, true),
+            (6, 32, 1024, 2048, true), (4, 128, 16384, 512, false), (8, 32, 64, 1024, true),
         ] {
             let p = randomAffine([n, k], bits: bits, groupSize: groupSize, seed: UInt64(300 + bits + n))
             for V in [2, 3, 4, 8] {
@@ -1419,12 +1422,66 @@ final class GLM5NextTests: XCTestCase {
                     MLXRandom.normal([V, k]).asType(.bfloat16)
                 }
                 let batched = try XCTUnwrap(glm5NextQMVBatch(x, p), "covered \(bits)b n=\(n)")
-                let rows = (0 ..< V).map { v in
-                    quantizedMatmul(
-                        x[v ..< (v + 1)], p.weight, scales: p.scales, biases: p.biases,
-                        transpose: true, groupSize: groupSize, bits: bits)
+                let rows = try (0 ..< V).map { v in
+                    try XCTUnwrap(glm5NextQMVBatch(x[v ..< (v + 1)], p), "one vector \(bits)b n=\(n)")
                 }
                 assertRowsEqual(batched, rows, "qmv batch \(bits)b gs\(groupSize) n=\(n) V=\(V)")
+                if mlxOnQMV {
+                    let mlxRows = (0 ..< V).map { v in
+                        quantizedMatmul(
+                            x[v ..< (v + 1)], p.weight, scales: p.scales, biases: p.biases,
+                            transpose: true, groupSize: groupSize, bits: bits)
+                    }
+                    assertRowsEqual(
+                        batched, mlxRows, "qmv batch vs MLX \(bits)b gs\(groupSize) n=\(n) V=\(V)")
+                }
+            }
+        }
+    }
+
+    /// `glm5NextProject` takes the same kernel for 1 token as for 2...8, so a
+    /// token's projection does not depend on how many tokens share the call,
+    /// whichever small-M kernel MLX itself would pick on this GPU (#2265).
+    func testProjectionRowsDoNotDependOnTokenCount() throws {
+        for (bits, groupSize, n, k) in [(4, 64, 4096, 4096), (8, 64, 2048, 4096)] {
+            let p = randomAffine([n, k], bits: bits, groupSize: groupSize, seed: UInt64(400 + bits))
+            let linear = QuantizedLinear(
+                weight: p.weight, bias: nil, scales: p.scales, biases: p.biases,
+                groupSize: groupSize, bits: bits)
+            let x = withRandomState(MLXRandom.RandomState(seed: 410)) {
+                MLXRandom.normal([8, 1, k]).asType(.bfloat16)
+            }
+            let alone = (0 ..< 8).map { glm5NextProject(linear, x[$0 ..< ($0 + 1)]) }
+            for V in [2, 3, 4, 8] {
+                assertRowsEqual(
+                    glm5NextProject(linear, x[0 ..< V]).reshaped(V, n),
+                    alone[0 ..< V].map { $0.reshaped(1, n) },
+                    "project \(bits)b n=\(n) V=\(V)")
+            }
+        }
+    }
+
+    /// MLX's own small-M affine product is row-invariant from 1 to 16 rows:
+    /// on GPUs without NAX that is the `qmv_mma` route of the MLX core fork
+    /// (`v0.32.4-macprovider.7`), elsewhere `qmv`. Projections the GLM kernels
+    /// do not cover take this route at every token count (#2265).
+    func testMLXSmallMQuantizedMatmulIsRowInvariant() throws {
+        for (bits, groupSize, n, k) in [
+            (4, 64, 4096, 4096), (8, 64, 2048, 4096), (4, 128, 16384, 512), (4, 32, 1024, 2048),
+        ] {
+            let p = randomAffine([n, k], bits: bits, groupSize: groupSize, seed: UInt64(500 + bits + n))
+            let x = withRandomState(MLXRandom.RandomState(seed: 510)) {
+                MLXRandom.normal([16, k]).asType(.bfloat16)
+            }
+            func mm(_ a: MLXArray) -> MLXArray {
+                quantizedMatmul(
+                    a, p.weight, scales: p.scales, biases: p.biases, transpose: true,
+                    groupSize: groupSize, bits: bits)
+            }
+            let alone = (0 ..< 16).map { mm(x[$0 ..< ($0 + 1)]) }
+            for M in [2, 3, 4, 8, 9, 16] {
+                assertRowsEqual(
+                    mm(x[0 ..< M]), Array(alone[0 ..< M]), "MLX small-M \(bits)b gs\(groupSize) n=\(n) M=\(M)")
             }
         }
     }
