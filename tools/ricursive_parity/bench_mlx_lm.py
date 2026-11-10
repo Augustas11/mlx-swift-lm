@@ -52,6 +52,7 @@ def main():
     prompt = json.loads(Path(args.prompt).read_text())
     model, _ = load_model(
         Path(args.model),
+        model_config={"model_file": None},  # config names ricursive.py; use ricursive_mlx instead
         get_model_classes=lambda config: (ricursive_mlx.Model, ricursive_mlx.ModelArgs),
     )
     with wired_limit(model, [mx.default_stream(mx.default_device())]):
