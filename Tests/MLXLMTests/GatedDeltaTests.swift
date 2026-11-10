@@ -401,4 +401,65 @@ public class GatedDeltaTests: XCTestCase {
             )
         }
     }
+
+    // MARK: - Fork: decode and verification keep the custom kernel
+
+    /// Decode steps and MTP verification blocks (at most 8 steps) stay on the
+    /// custom kernel: an unmasked row computes the same bits as an all-kept
+    /// masked row, and a block computes the same bits as one step at a time.
+    func testShortBlocksKeepTheCustomKernelRecurrence() throws {
+        for T in [1, 4, 8] {
+            let inputs = makeQwen35Inputs(T: T)
+            let (yPlain, sPlain) = gatedDeltaUpdate(
+                q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
+                aLog: inputs.aLog, dtBias: inputs.dtBias)
+            let (yMasked, sMasked) = gatedDeltaUpdate(
+                q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
+                aLog: inputs.aLog, dtBias: inputs.dtBias, mask: keepAll(inputs))
+            XCTAssertTrue(arrayEqual(yPlain, yMasked).item(Bool.self), "T=\(T) output")
+            XCTAssertTrue(arrayEqual(sPlain, sMasked).item(Bool.self), "T=\(T) state")
+
+            var state: MLXArray? = nil
+            var ys = [MLXArray]()
+            for t in 0 ..< T {
+                let (y, s) = gatedDeltaUpdate(
+                    q: inputs.q[0..., t ..< t + 1], k: inputs.k[0..., t ..< t + 1],
+                    v: inputs.v[0..., t ..< t + 1], a: inputs.a[0..., t ..< t + 1],
+                    b: inputs.b[0..., t ..< t + 1], aLog: inputs.aLog,
+                    dtBias: inputs.dtBias, state: state)
+                ys.append(y)
+                state = s
+            }
+            XCTAssertTrue(
+                arrayEqual(yPlain, concatenated(ys, axis: 1)).item(Bool.self), "T=\(T) stepwise")
+            XCTAssertTrue(arrayEqual(sPlain, state!).item(Bool.self), "T=\(T) stepwise state")
+        }
+    }
+
+    /// At Qwen3.5 head layouts the checkpointed update stays bit-identical to
+    /// two `gatedDeltaUpdate` calls split at the checkpoint, whether a half is
+    /// long enough for the MLXFast kernel or not.
+    func testCheckpointedUpdateMatchesSplitUpdateAtQwen35Layout() throws {
+        let T = 12
+        let inputs = makeQwen35Inputs(T: T)
+        for split in [3, 6, 9] {
+            let (y, checkpoint, final) = gatedDeltaUpdateCheckpointed(
+                q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
+                aLog: inputs.aLog, dtBias: inputs.dtBias, checkpointAfter: split)
+            let (y1, s1) = gatedDeltaUpdate(
+                q: inputs.q[0..., ..<split], k: inputs.k[0..., ..<split],
+                v: inputs.v[0..., ..<split], a: inputs.a[0..., ..<split],
+                b: inputs.b[0..., ..<split], aLog: inputs.aLog, dtBias: inputs.dtBias)
+            let (y2, s2) = gatedDeltaUpdate(
+                q: inputs.q[0..., split...], k: inputs.k[0..., split...],
+                v: inputs.v[0..., split...], a: inputs.a[0..., split...],
+                b: inputs.b[0..., split...], aLog: inputs.aLog, dtBias: inputs.dtBias,
+                state: s1)
+            let label = "split=\(split)"
+            XCTAssertTrue(
+                arrayEqual(y, concatenated([y1, y2], axis: 1)).item(Bool.self), label)
+            XCTAssertTrue(arrayEqual(checkpoint, s1).item(Bool.self), label)
+            XCTAssertTrue(arrayEqual(final, s2).item(Bool.self), label)
+        }
+    }
 }

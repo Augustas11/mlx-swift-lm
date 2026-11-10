@@ -360,11 +360,23 @@ func gatedDeltaOps(
 
 // MARK: - MLXFast
 
+/// Blocks of at most this many steps keep the custom kernel (see
+/// `hasFastGatedDelta`).
+let fastGatedDeltaMinSteps = 8
+
 /// Whether mlx core runs a fused kernel for these inputs, as `use_fallback`
 /// in mlx core. Otherwise it runs a per-step fallback, which is slower than
 /// `gatedDeltaKernel`.
+///
+/// Fork: only blocks longer than `fastGatedDeltaMinSteps` take it. Decode
+/// steps and MTP verification blocks stay on `gatedDeltaKernel`, which
+/// `gatedDeltaUpdateCheckpointed` matches bit for bit, so a verified block,
+/// a decoded row and a row inside a continuous batch keep one recurrence.
+/// mlx core only chunks blocks longer than 8 steps, which is where its gain
+/// is; upstream reports decode unchanged.
 private func hasFastGatedDelta(q: MLXArray, v: MLXArray, mask: MLXArray?) -> Bool {
-    guard mask == nil, q.dim(3) == 128, v.dim(3) == 128 else { return false }
+    guard mask == nil, q.dim(1) > fastGatedDeltaMinSteps, q.dim(3) == 128, v.dim(3) == 128
+    else { return false }
     switch (q.dim(2), v.dim(2)) {
     case (16, 16), (16, 32), (16, 48), (16, 64), (24, 24), (32, 32): return true
     default: return false
@@ -634,6 +646,25 @@ public func gatedDeltaUpdateCheckpointed(
         checkpointAfter > 0 && checkpointAfter < T,
         "checkpointAfter \(checkpointAfter) must split T=\(T)")
 
+    // A half long enough for the MLXFast kernel runs as its own
+    // `gatedDeltaUpdate` call, so the result stays identical to two calls
+    // split at the checkpoint.
+    let split = checkpointAfter
+    if mask == nil,
+        hasFastGatedDelta(q: q[0..., ..<split], v: v, mask: nil)
+            || hasFastGatedDelta(q: q[0..., split...], v: v, mask: nil)
+    {
+        let (prefix, mid) = gatedDeltaUpdate(
+            q: q[0..., ..<split], k: k[0..., ..<split], v: v[0..., ..<split],
+            a: a[0..., ..<split], b: b[0..., ..<split], aLog: aLog, dtBias: dtBias,
+            state: state, useKernel: useKernel)
+        let (suffix, final) = gatedDeltaUpdate(
+            q: q[0..., split...], k: k[0..., split...], v: v[0..., split...],
+            a: a[0..., split...], b: b[0..., split...], aLog: aLog, dtBias: dtBias,
+            state: mid, useKernel: useKernel)
+        return (concatenated([prefix, suffix], axis: 1), mid, final)
+    }
+
     var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
     if state.dtype != .float32 {
         state = state.asType(.float32)
@@ -644,7 +675,6 @@ public func gatedDeltaUpdateCheckpointed(
         ? GatedDeltaKernelManager.shared.kernelCheckpoint
         : GatedDeltaKernelManager.shared.kernelMaskedCheckpoint
     guard useKernel, Dk % 32 == 0, let kernel = selected else {
-        let split = checkpointAfter
         let (prefix, mid) = gatedDeltaOps(
             q: q[0..., ..<split], k: k[0..., ..<split], v: v[0..., ..<split],
             g: g[0..., ..<split], beta: beta[0..., ..<split], state: state,
