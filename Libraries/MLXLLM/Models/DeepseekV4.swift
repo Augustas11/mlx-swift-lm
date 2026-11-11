@@ -699,7 +699,17 @@ final class DeepseekV4MoEGate: Module {
     }
 
     func callAsFunction(_ x: MLXArray, inputIDs: MLXArray) -> (MLXArray, MLXArray) {
-        let logits = matmul(x.asType(.float32), weight.asType(.float32).T)
+        route(matmul(x.asType(.float32), weight.asType(.float32).T), inputIDs: inputIDs)
+    }
+
+    /// Routes up to eight decode rows at once. Each row's logits use the
+    /// one-row gemv order, so a row routes the same at any batch size.
+    func routeRows(_ x: MLXArray, inputIDs: MLXArray) -> (MLXArray, MLXArray)? {
+        guard let logits = deepseekV4RouterLogits(x, weight: weight) else { return nil }
+        return route(logits, inputIDs: inputIDs)
+    }
+
+    private func route(_ logits: MLXArray, inputIDs: MLXArray) -> (MLXArray, MLXArray) {
         let scores = score(logits)
         let indices: MLXArray
         if let tid2eid {
@@ -784,6 +794,7 @@ final class DeepseekV4MoE: Module {
     /// packed attention and expert projections still share their weight reads.
     func packedGate(_ x: MLXArray, inputIDs: MLXArray) -> (MLXArray, MLXArray) {
         guard (2 ... 8).contains(x.dim(0)) else { return gate(x, inputIDs: inputIDs) }
+        if let routed = gate.routeRows(x, inputIDs: inputIDs) { return routed }
         let rows = (0 ..< x.dim(0)).map { row in
             gate(x[row ..< (row + 1)], inputIDs: inputIDs[row ..< (row + 1)])
         }

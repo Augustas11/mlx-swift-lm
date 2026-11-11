@@ -240,6 +240,30 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
+    /// Batched router logits match each row's one-row gemv bit for bit, so a
+    /// decode row routes the same alone and in a batch of up to eight.
+    func testRouterLogitsKernelMatchesOneRowGemvBits() throws {
+        try Device.withDefaultDevice(.gpu) {
+            MLXRandom.seed(2114)
+            func bits(_ a: MLXArray) -> [UInt32] { a.asArray(Float.self).map(\.bitPattern) }
+            for weightType in [DType.float32, .bfloat16] {
+                let weight = (0.02 * MLXRandom.normal([256, 4096])).asType(weightType)
+                for rows in [1, 2, 3, 4, 8] {
+                    let x = (3 * MLXRandom.normal([rows, 1, 4096])).asType(.bfloat16)
+                    let kernel = try XCTUnwrap(deepseekV4RouterLogits(x, weight: weight))
+                    XCTAssertEqual(kernel.shape, [rows, 1, 256])
+                    for row in 0 ..< rows {
+                        let reference = matmul(
+                            x[row ..< (row + 1)].asType(.float32), weight.asType(.float32).T)
+                        XCTAssertEqual(
+                            bits(kernel[row ..< (row + 1)]), bits(reference),
+                            "\(weightType) rows \(rows) row \(row)")
+                    }
+                }
+            }
+        }
+    }
+
     /// The rotation kernel replays the float32 graph bit for bit for shared
     /// and per-row positions, both directions, compressed frequency scales
     /// and the attention, indexer and output shapes.

@@ -422,3 +422,73 @@ func deepseekV4RMSNormKernel(_ x: MLXArray, weight: MLXArray, eps: Float) -> MLX
 func deepseekV4QueryHeadNormKernel(_ q: MLXArray, eps: Float) -> MLXArray? {
     deepseekV4NormKernel(q, weight: nil, eps: eps, mode: 1)
 }
+
+/// `matmul(x.float32, weight.float32.T)` for `x: [R, K]` and `weight: [N, K]`,
+/// each row in MLX's fp32 gemv order for one vector at `K >= 16 * N`
+/// (`gemv_bm1_bn8_sm1_sn32_tm4_tn4`): eight simdgroups split K in 1024-wide
+/// blocks, a shuffle-down ladder per simdgroup, then simdgroups 1...7 added
+/// to simdgroup 0 in order. A row's logits do not depend on R.
+private let deepseekV4RouterLogitsSource = """
+    const uint lane = thread_index_in_simdgroup;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint row = threadgroup_position_in_grid.y;
+    const int out_row = int(threadgroup_position_in_grid.x) * 4;
+    threadgroup float tgp[8 * 8];
+    const device W* mat = w + size_t(out_row) * K;
+    const device T* vec = x + size_t(row) * K;
+    float result[4] = {0, 0, 0, 0};
+    int bn = (32 * int(sg) + int(lane)) * 4;
+    for (int i = 0; i < K / 1024; ++i) {
+      float v_coeff[4];
+      for (int tn = 0; tn < 4; tn++) { v_coeff[tn] = static_cast<float>(vec[bn + tn]); }
+      int mat_offset = 0;
+      for (int tm = 0; tm < 4; tm++) {
+        float inter[4];
+        for (int tn = 0; tn < 4; tn++) { inter[tn] = static_cast<float>(mat[mat_offset + bn + tn]); }
+        for (int tn = 0; tn < 4; tn++) { result[tm] += inter[tn] * v_coeff[tn]; }
+        mat_offset += K;
+      }
+      bn += 1024;
+    }
+    for (int tm = 0; tm < 4; tm++) {
+      for (ushort sn = 16; sn >= 1; sn >>= 1) {
+        result[tm] += simd_shuffle_down(result[tm], sn);
+      }
+    }
+    if (lane == 0) {
+      for (int tm = 0; tm < 4; tm++) { tgp[sg * 8 + tm] = result[tm]; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0 && lane == 0) {
+      for (int sgn = 1; sgn < 8; sgn++) {
+        for (int tm = 0; tm < 4; tm++) { result[tm] += tgp[sgn * 8 + tm]; }
+      }
+      for (int tm = 0; tm < 4; tm++) { out[size_t(row) * N + out_row + tm] = result[tm]; }
+    }
+    """
+
+private final class DeepseekV4RouterKernels: Sendable {
+    static let shared = DeepseekV4RouterKernels()
+    let logits = MLXFast.metalKernel(
+        name: "deepseek_v4_router_logits", inputNames: ["x", "w"], outputNames: ["out"],
+        source: deepseekV4RouterLogitsSource)
+}
+
+/// Router logits `[..., N]` for each row of `x: [..., K]` with one-vector
+/// gemv arithmetic, or `nil` outside the replayed configuration.
+func deepseekV4RouterLogits(_ x: MLXArray, weight: MLXArray) -> MLXArray? {
+    let K = x.dim(-1)
+    guard Device.defaultDevice().deviceType == .gpu, weight.ndim == 2,
+        weight.dim(1) == K,
+        [.bfloat16, .float16, .float32].contains(x.dtype),
+        [.bfloat16, .float16, .float32].contains(weight.dtype),
+        K % 1024 == 0, K >= 16 * weight.dim(0), weight.dim(0) % 4 == 0,
+        weight.dim(0) < 4096, K > 64
+    else { return nil }
+    let N = weight.dim(0)
+    let rows = x.size / K
+    return DeepseekV4RouterKernels.shared.logits(
+        [x, weight], template: [("T", x.dtype), ("W", weight.dtype), ("K", K), ("N", N)],
+        grid: (256 * (N / 4), rows, 1), threadGroup: (256, 1, 1),
+        outputShapes: [Array(x.shape.dropLast()) + [N]], outputDTypes: [.float32])[0]
+}
