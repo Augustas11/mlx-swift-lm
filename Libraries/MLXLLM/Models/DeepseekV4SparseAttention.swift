@@ -57,13 +57,106 @@ func deepseekV4SparseAttention(
     for row in 0 ..< B {
         var queries = [MLXArray]()
         for position in 0 ..< L {
-            queries.append(deepseekV4GraphAttention(
-                contiguous(q[row ..< (row + 1), 0..., position ..< (position + 1), 0...]),
-                keys: contiguous(keys[row ..< (row + 1), position ..< (position + 1), 0..., 0...]),
-                valid: contiguous(valid[row ..< (row + 1), position ..< (position + 1), 0...]),
-                sink: sink, scale: scale))
+            let rowQ = contiguous(q[row ..< (row + 1), 0..., position ..< (position + 1), 0...])
+            let rowKeys = contiguous(keys[row ..< (row + 1), position ..< (position + 1), 0..., 0...])
+            let rowValid = contiguous(valid[row ..< (row + 1), position ..< (position + 1), 0...])
+            queries.append(
+                deepseekV4QueryAttention(
+                    rowQ, keys: rowKeys, valid: rowValid, sink: sink, scale: scale)
+                    ?? deepseekV4GraphAttention(
+                        rowQ, keys: rowKeys, valid: rowValid, sink: sink, scale: scale))
         }
         rows.append(queries.count == 1 ? queries[0] : concatenated(queries, axis: 2))
     }
     return rows.count == 1 ? rows[0] : concatenated(rows, axis: 0)
+}
+
+/// Everything in `deepseekV4GraphAttention` between its two matmuls for one
+/// query, in one kernel: scaled and masked scores, 64-key block maxima, the
+/// running maximum, block weights and their sequential sums, the rescale,
+/// the sequential normalizer with the sink, and the bf16-rounded rescaled
+/// value weights. Each threadgroup owns one head. Products are rounded
+/// before any add, as in the separate graph ops.
+private let deepseekV4AttentionWeightsSource = """
+    const uint h = threadgroup_position_in_grid.y;
+    const uint t = thread_position_in_threadgroup.x;
+    const int K = sizes[0];
+    const int nb = (K + 63) / 64;
+    threadgroup float run[64];
+    threadgroup float rescale[64];
+    threadgroup float product[64];
+    threadgroup float safe_peak;
+    const device float* s = raw + size_t(h) * K;
+    const float sc = scale[0];
+    const float ninf = -INFINITY;
+    if (t < uint(nb)) {
+      float m = ninf;
+      for (int j = int(t) * 64; j < min(K, int(t) * 64 + 64); ++j) {
+        float v = valid[j] ? metal::fma(s[j], sc, 0.0f) : ninf;
+        m = metal::max(m, v);
+      }
+      run[t] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t == 0) {
+      for (int b = 1; b < nb; ++b) { run[b] = metal::max(run[b - 1], run[b]); }
+      float p = run[nb - 1];
+      safe_peak = p == ninf ? 0.0f : p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t < uint(nb)) {
+      const float r = run[t];
+      const float safe = r == ninf ? 0.0f : r;
+      const float scale_b = metal::precise::exp(r - safe_peak);
+      float total = 0.0f;
+      for (int j = int(t) * 64; j < int(t) * 64 + 64; ++j) {
+        float w = 0.0f;
+        if (j < K) {
+          float v = valid[j] ? metal::fma(s[j], sc, 0.0f) : ninf;
+          w = metal::precise::exp(v - safe);
+          weights[size_t(h) * K + j] =
+              metal::fma(static_cast<float>(static_cast<bfloat16_t>(w)), scale_b, 0.0f);
+        }
+        total = w + total;
+      }
+      rescale[t] = scale_b;
+      product[t] = metal::fma(total, scale_b, 0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t == 0) {
+      float total = 0.0f;
+      for (int b = 0; b < nb; ++b) { total = product[b] + total; }
+      normalizer[h] = total + metal::precise::exp(static_cast<float>(sink[h]) - safe_peak);
+    }
+    """
+
+private final class DeepseekV4AttentionKernels: Sendable {
+    static let shared = DeepseekV4AttentionKernels()
+    let weights = MLXFast.metalKernel(
+        name: "deepseek_v4_attention_weights",
+        inputNames: ["raw", "valid", "sink", "scale", "sizes"],
+        outputNames: ["weights", "normalizer"], source: deepseekV4AttentionWeightsSource)
+}
+
+/// `deepseekV4GraphAttention` for one query (`q: [1, H, 1, D]`, keys
+/// `[1, 1, K, D]`, validity `[1, 1, K]`) with the same two matmuls and the
+/// softmax steps between them fused, or `nil` outside the replayed shapes.
+/// At most 64 blocks keep both block-axis sums on MLX's sequential
+/// small-row reduction.
+func deepseekV4QueryAttention(
+    _ q: MLXArray, keys: MLXArray, valid: MLXArray, sink: MLXArray, scale: Float
+) -> MLXArray? {
+    let (H, D, K) = (q.dim(1), q.dim(3), keys.dim(2))
+    guard Device.defaultDevice().deviceType == .gpu, q.ndim == 4, q.dim(0) == 1, q.dim(2) == 1,
+        keys.shape == [1, 1, K, D], valid.shape == [1, 1, K], valid.dtype == .bool,
+        (1 ... 4096).contains(K), sink.size == H,
+        [DType.float32, .float16, .bfloat16].contains(sink.dtype)
+    else { return nil }
+    let keys32 = keys.asType(.float32)
+    let raw = matmul(q.transposed(0, 2, 1, 3).asType(.float32), keys32.swappedAxes(-1, -2))
+    let fused = DeepseekV4AttentionKernels.shared.weights(
+        [raw, valid, sink, MLXArray([scale]), MLXArray([Int32(K)])],
+        grid: (64, H, 1), threadGroup: (64, 1, 1),
+        outputShapes: [[1, 1, H, K], [1, 1, H, 1]], outputDTypes: [.float32, .float32])
+    return (matmul(fused[0], keys32) / fused[1]).transposed(0, 2, 1, 3)
 }
