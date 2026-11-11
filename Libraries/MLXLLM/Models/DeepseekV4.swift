@@ -300,6 +300,12 @@ private func deepseekV4FinfoMin(_ dtype: DType) -> Float {
 /// DeepSeek multiplies the learned weight before rounding back to the activation dtype.
 final class DeepseekV4RMSNorm: RMSNorm {
     override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if let fused = deepseekV4RMSNormKernel(x, weight: weight, eps: eps) { return fused }
+        return graph(x)
+    }
+
+    /// The op graph the GPU kernel replays; the CPU and fallback path.
+    func graph(_ x: MLXArray) -> MLXArray {
         let value = x.asType(.float32)
         let inverse = rsqrt(square(value).mean(axis: -1, keepDims: true) + eps)
         return (value * inverse * weight.asType(.float32)).asType(x.dtype)
@@ -308,6 +314,11 @@ final class DeepseekV4RMSNorm: RMSNorm {
 
 /// The reference rounds the inverse RMS to the query dtype before multiplying.
 func deepseekV4QueryHeadNorm(_ q: MLXArray, eps: Float) -> MLXArray {
+    if let fused = deepseekV4QueryHeadNormKernel(q, eps: eps) { return fused }
+    return deepseekV4QueryHeadNormGraph(q, eps: eps)
+}
+
+func deepseekV4QueryHeadNormGraph(_ q: MLXArray, eps: Float) -> MLXArray {
     let inverse = rsqrt(square(q.asType(.float32)).mean(axis: -1, keepDims: true) + eps)
     return q * inverse.asType(q.dtype)
 }
@@ -316,6 +327,7 @@ func deepseekV4QueryHeadNorm(_ q: MLXArray, eps: Float) -> MLXArray {
 func deepseekV4HCExpand(
     _ x: MLXArray, _ residual: MLXArray, _ post: MLXArray, _ comb: MLXArray
 ) -> MLXArray {
+    if let fused = deepseekV4HCExpandKernel(x, residual, post, comb) { return fused }
     let expanded = expandedDimensions(post, axis: -1)
         * expandedDimensions(x.asType(.float32), axis: 2)
     let products = expandedDimensions(comb, axis: -1)
@@ -473,7 +485,7 @@ private func deepseekV4PackedLinearF32(_ layer: Linear, _ x: MLXArray) -> MLXArr
 final class DeepseekV4RoPE {
     let dims: Int
     let freqScale: Int
-    private let inverseFrequencies: MLXArray
+    let inverseFrequencies: MLXArray
     private let legacyFloat32Wavelengths: MLXArray
 
     init(dims: Int, base: Float, scaling: DeepseekV4Configuration.RopeScaling?, freqScale: Int = 1) {
@@ -532,6 +544,17 @@ final class DeepseekV4RoPE {
     }
 
     private func rotate(_ x: MLXArray, positions: MLXArray, inverse: Bool) -> MLXArray {
+        if let fused = deepseekV4RoPERotate(
+            x, positions: positions, inverseFrequencies: inverseFrequencies, dims: dims,
+            inverse: inverse)
+        {
+            return fused
+        }
+        return graphRotate(x, positions: positions, inverse: inverse)
+    }
+
+    /// The op graph `deepseekV4RoPERotate` replays; the CPU and fallback path.
+    func graphRotate(_ x: MLXArray, positions: MLXArray, inverse: Bool) -> MLXArray {
         let length = x.dim(-2)
         let prefix = x.dim(-1) - dims
         let positionShape =

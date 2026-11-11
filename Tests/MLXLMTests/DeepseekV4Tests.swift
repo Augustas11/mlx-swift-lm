@@ -148,6 +148,140 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
+    /// The GPU kernels replay the canonical per-token graph bit for bit, at
+    /// every row and position count the decode and verification paths use.
+    func testHyperConnectionKernelsReplayCanonicalGraphBits() throws {
+        try Device.withDefaultDevice(.gpu) {
+            let width = 4096
+            MLXRandom.seed(2111)
+            let weight = (1 + 0.1 * MLXRandom.normal([width])).asType(.bfloat16)
+            let norm = DeepseekV4RMSNorm(dimensions: width, eps: 1e-6)
+            norm.update(parameters: ModuleParameters.unflattened(["weight": weight]))
+            norm.train(false)
+            let connection = GLM5NextHyperConnection(
+                hcMult: 4, sinkhornIterations: 20, hcEps: 1e-6, normEps: 1e-6,
+                hiddenSize: width, normWeightInFloat32: true, normalizeMixAfterProjection: true)
+            connection.update(parameters: ModuleParameters.unflattened([
+                "fn": 0.02 * MLXRandom.normal([24, 4 * width]),
+                "base": MLXRandom.normal([24]),
+                "scale": MLXRandom.uniform(low: 0.5, high: 2, [3]),
+            ]))
+            connection.train(false)
+            func bits(_ a: MLXArray) -> [UInt32] {
+                a.asType(.float32).asArray(Float.self).map(\.bitPattern)
+            }
+            for (rows, length) in [(1, 1), (4, 1), (1, 8), (3, 2)] {
+                for trial in 0 ..< 4 {
+                    let input = (Float(1 + trial) * MLXRandom.normal([rows, length, 4, width]))
+                        .asType(.bfloat16)
+                    var normalized = [MLXArray]()
+                    var post = [MLXArray]()
+                    var comb = [MLXArray]()
+                    for row in 0 ..< rows {
+                        for position in 0 ..< length {
+                            let (collapsed, p, c) = connection(
+                                input[row ..< (row + 1), position ..< (position + 1), 0..., 0...])
+                            normalized.append(norm(collapsed))
+                            post.append(p)
+                            comb.append(c)
+                        }
+                    }
+                    let fused = try XCTUnwrap(
+                        deepseekV4HCBranchInput(
+                            input, fn: connection.fn, scale: connection.scale,
+                            base: connection.base, normWeight: weight, sinkhornIterations: 20,
+                            mixEps: 1e-6, hcEps: 1e-6, normEps: 1e-6))
+                    XCTAssertEqual(
+                        bits(fused.0), bits(concatenated(normalized, axis: 1)),
+                        "normalized rows \(rows) length \(length) trial \(trial)")
+                    XCTAssertEqual(bits(fused.1), bits(concatenated(post, axis: 1)))
+                    XCTAssertEqual(bits(fused.2), bits(concatenated(comb, axis: 1)))
+                }
+            }
+
+            for (rows, length) in [(1, 1), (4, 1), (1, 37)] {
+                let x = (4 * MLXRandom.normal([rows, length, width])).asType(.bfloat16)
+                let residual = (4 * MLXRandom.normal([rows, length, 4, width])).asType(.bfloat16)
+                let post = 2 * MLXRandom.uniform(low: 0.0, high: 1.0, [rows, length, 4])
+                let comb = MLXRandom.uniform(low: 0.0, high: 1.0, [rows, length, 4, 4])
+                let expanded = expandedDimensions(post, axis: -1)
+                    * expandedDimensions(x.asType(.float32), axis: 2)
+                let products = expandedDimensions(comb, axis: -1)
+                    * expandedDimensions(residual.asType(.float32), axis: -2)
+                let graph = (expanded + products.sum(axis: 2)).asType(x.dtype)
+                let kernel = try XCTUnwrap(deepseekV4HCExpandKernel(x, residual, post, comb))
+                XCTAssertEqual(bits(kernel), bits(graph), "expand rows \(rows) length \(length)")
+            }
+        }
+    }
+
+    /// The norm kernels replay both float32 RMSNorm graphs bit for bit across
+    /// widths and row counts on either side of MLX's simple-reduce threshold.
+    func testRMSNormKernelsReplayGraphBits() throws {
+        try Device.withDefaultDevice(.gpu) {
+            MLXRandom.seed(2113)
+            func bits(_ a: MLXArray) -> [UInt32] {
+                a.asType(.float32).asArray(Float.self).map(\.bitPattern)
+            }
+            for shape in [[1, 1, 1024], [1, 1, 512], [4, 1, 512], [1, 1, 64, 512],
+                [3, 2, 64, 512], [1, 37, 4096], [1, 3, 128], [2, 40, 1024]]
+            {
+                let width = shape.last!
+                let x = (5 * MLXRandom.normal(shape)).asType(.bfloat16)
+                let weight = (1 + 0.2 * MLXRandom.normal([width])).asType(.bfloat16)
+                let norm = DeepseekV4RMSNorm(dimensions: width, eps: 1e-6)
+                norm.update(parameters: ModuleParameters.unflattened(["weight": weight]))
+                let kernel = try XCTUnwrap(deepseekV4RMSNormKernel(x, weight: weight, eps: 1e-6))
+                XCTAssertEqual(bits(kernel), bits(norm.graph(x)), "norm \(shape)")
+                let head = try XCTUnwrap(deepseekV4QueryHeadNormKernel(x, eps: 1e-6))
+                XCTAssertEqual(
+                    bits(head), bits(deepseekV4QueryHeadNormGraph(x, eps: 1e-6)), "head \(shape)")
+            }
+        }
+    }
+
+    /// The rotation kernel replays the float32 graph bit for bit for shared
+    /// and per-row positions, both directions, compressed frequency scales
+    /// and the attention, indexer and output shapes.
+    func testRoPEKernelReplaysGraphBits() throws {
+        try Device.withDefaultDevice(.gpu) {
+            MLXRandom.seed(2112)
+            let scaling = try JSONDecoder().decode(
+                DeepseekV4Configuration.RopeScaling.self,
+                from: Data(#"{"type":"yarn","factor":16,"original_max_position_embeddings":65536,"beta_fast":32,"beta_slow":1}"#.utf8))
+            func bits(_ a: MLXArray) -> [UInt32] {
+                a.asType(.float32).asArray(Float.self).map(\.bitPattern)
+            }
+            for (freqScale, ropeScaling) in [(1, nil), (4, scaling), (128, scaling)]
+                as [(Int, DeepseekV4Configuration.RopeScaling?)]
+            {
+                let rope = DeepseekV4RoPE(
+                    dims: 64, base: 160000, scaling: ropeScaling, freqScale: freqScale)
+                for shape in [[1, 64, 1, 512], [4, 64, 1, 512], [1, 1, 7, 512], [3, 1, 2, 128]] {
+                    let x = (3 * MLXRandom.normal(shape)).asType(.bfloat16)
+                    let length = shape[2]
+                    let shared = (MLXArray.arange(length, dtype: .int32) + Int32(1_000_003))
+                        * Int32(freqScale)
+                    let perRow = (expandedDimensions(
+                        MLXArray((0 ..< shape[0]).map { Int32(31 * $0 + 70_001) }), axis: -1)
+                        + MLXArray.arange(length, dtype: .int32)) * Int32(freqScale)
+                    for positions in [shared, perRow] {
+                        for inverse in [false, true] {
+                            let kernel = try XCTUnwrap(deepseekV4RoPERotate(
+                                x, positions: positions,
+                                inverseFrequencies: rope.inverseFrequencies, dims: 64,
+                                inverse: inverse))
+                            XCTAssertEqual(
+                                bits(kernel),
+                                bits(rope.graphRotate(x, positions: positions, inverse: inverse)),
+                                "scale \(freqScale) shape \(shape) inverse \(inverse)")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private struct Oracle: Decodable {
         struct Case: Decodable {
             let indexer: String
