@@ -649,10 +649,99 @@ final class DeepseekV4Tests: XCTestCase {
     /// The decode kernels select and attend for a row with the same bits
     /// alone and beside other rows, and match the graph selection and
     /// attention (distinct scores) to float32 tolerance.
+    /// Float32 matmuls run on steel GEMM unless the GPU has neural
+    /// accelerators (MLX's `is_nax_available`), where they run as TF32
+    /// unless `MLX_ENABLE_TF32=0`.
+    func deepseekV4FloatMatmulsOnSteel() -> Bool {
+        if ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"] == "0" { return true }
+        let arch = GPU.deviceInfo().architecture
+        guard let g = arch.range(of: "applegpu_g") else { return true }
+        let rest = arch[g.upperBound...]
+        let gen = Int(rest.prefix(while: \.isNumber)) ?? 0
+        let devc = arch.last ?? "g"
+        guard #available(macOS 26.2, *) else { return true }
+        return gen < (devc == "p" ? 18 : 17)
+    }
+
+    /// V4-Flash attention shapes (64 heads of 512) across the products'
+    /// k orders: split-K and one-pass scores, one-pass values with an
+    /// unaligned last tile first, and split-K values.
+    func testDecodeAttentionReplaysGraphAtModelShapes() throws {
+        try Device.withDefaultDevice(.gpu) {
+            MLXRandom.seed(2117)
+            let (H, D, window) = (64, 512, 128)
+            func bits(_ a: MLXArray) -> [UInt32] { a.asType(.float32).asArray(Float.self).map(\.bitPattern) }
+            for (validWindow, P) in [(128, 0), (128, 8), (5, 3), (128, 256), (128, 392), (128, 512)] {
+                let q = (MLXRandom.normal([1, H, 1, D]) * 0.5).asType(.bfloat16)
+                let win = MLXRandom.normal([1, 1, 128, D]).asType(.bfloat16)
+                let pool = MLXRandom.normal([1, max(P, 1), D]).asType(.bfloat16)
+                let sink = MLXRandom.normal([H])
+                let row = DeepseekV4DecodeRow(
+                    window: win, start: 17, base: 128 - validWindow, validWindow: validWindow,
+                    pool: P > 0 ? pool : nil, listed: P, visible: P)
+                let one = try XCTUnwrap(deepseekV4DecodeAttention(
+                    q: q, rows: [row], topk: nil, sink: sink, scale: 0.044, window: window))
+                var keyRows = [MLXArray]()
+                var valid = [Bool]()
+                for j in 0 ..< window {
+                    if j < validWindow {
+                        keyRows.append(win[0, 0, (17 + 128 - validWindow + j) % 128]); valid.append(true)
+                    } else {
+                        keyRows.append(MLXArray.zeros([D], dtype: .bfloat16)); valid.append(false)
+                    }
+                }
+                for i in 0 ..< P { keyRows.append(pool[0, i]); valid.append(true) }
+                let graph = deepseekV4GraphAttention(
+                    q, keys: stacked(keyRows).reshaped(1, 1, keyRows.count, D),
+                    valid: MLXArray(valid).reshaped(1, 1, valid.count), sink: sink, scale: 0.044)
+                if deepseekV4FloatMatmulsOnSteel() {
+                    XCTAssertEqual(bits(graph), bits(one), "window \(validWindow) pool \(P)")
+                } else {
+                    XCTAssertLessThan(abs(graph - one).max().item(Float.self), 2e-2, "window \(validWindow) pool \(P)")
+                }
+            }
+        }
+    }
+
+    /// The indexer scores at V4-Flash shapes (64 heads of 128) are the
+    /// graph's: steel GEMM dot products and col_reduce_looped head sums.
+    func testDecodeSelectReplaysGraphScoresAtModelShapes() throws {
+        try Device.withDefaultDevice(.gpu) {
+            MLXRandom.seed(2118)
+            let (Hi, Dk) = (64, 128)
+            for P in [2, 20, 40, 100, 128, 129, 256, 777] {
+                let q = MLXRandom.normal([1, Hi, 1, Dk]).asType(.bfloat16)
+                let w = MLXRandom.normal([1, 1, Hi]) * 0.02
+                let pool = MLXRandom.normal([1, P, Dk]).asType(.bfloat16)
+                let keys = try XCTUnwrap(deepseekV4DecodeSelectKeys(q: q, weights: w, pools: [pool]))
+                let kernel: [UInt32] = keys.asArray(UInt64.self).map { key in
+                    let ordered = ~UInt32(truncatingIfNeeded: key >> 32)
+                    return (ordered & 0x8000_0000) != 0 ? ordered & 0x7fff_ffff : ~ordered
+                }
+                var scores = maximum(matmul(
+                    q.asType(.float32),
+                    expandedDimensions(pool, axis: 1).swappedAxes(-1, -2).asType(.float32)), 0)
+                scores = (scores * expandedDimensions(w.swappedAxes(-1, -2), axis: -1)).sum(axis: 1)
+                let graph = scores.asArray(Float.self).map(\.bitPattern)
+                if deepseekV4FloatMatmulsOnSteel() {
+                    XCTAssertEqual(kernel, graph, "pool \(P)")
+                } else {
+                    let a = kernel.map { Float(bitPattern: $0) }
+                    let g = graph.map { Float(bitPattern: $0) }
+                    XCTAssertLessThan(zip(a, g).map { abs($0 - $1) }.max()!, 1e-2, "pool \(P)")
+                }
+                let picked = try XCTUnwrap(deepseekV4DecodeSelect(q: q, weights: w, pools: [pool], topK: 512))
+                XCTAssertEqual(picked.dim(1), min(512, P))
+            }
+        }
+    }
+
     func testDecodeKernelsAreRowInvariantAndMatchTheGraph() throws {
         try Device.withDefaultDevice(.gpu) {
             MLXRandom.seed(2116)
-            let (H, D, Hi, Dk, topK, window) = (8, 128, 4, 64, 16, 128)
+            // 16 heads keep both graph products on steel GEMM (smaller head
+            // counts take the wide gemv route).
+            let (H, D, Hi, Dk, topK, window) = (16, 128, 16, 64, 16, 128)
             let poolCounts = [0, 5, 16, 40, 3, 70, 17, 1]
             let windowCounts = [1, 40, 128, 128, 77, 128, 128, 2]
             let offsets = [0, 39, 300, 520, 76, 900, 200, 1]
@@ -720,8 +809,12 @@ final class DeepseekV4Tests: XCTestCase {
                     let graph = deepseekV4GraphAttention(
                         q[b ..< b + 1], keys: stacked(keyRows).reshaped(1, 1, keyRows.count, D),
                         valid: MLXArray(valid).reshaped(1, 1, valid.count), sink: sink, scale: 0.088)
-                    XCTAssertLessThan(
-                        abs(graph - one).max().item(Float.self), 2e-2, "graph row \(b) indexed=\(topk != nil)")
+                    if deepseekV4FloatMatmulsOnSteel() {
+                        XCTAssertEqual(bits(graph), bits(one), "graph row \(b) indexed=\(topk != nil)")
+                    } else {
+                        XCTAssertLessThan(
+                            abs(graph - one).max().item(Float.self), 2e-2, "graph row \(b) indexed=\(topk != nil)")
+                    }
                 }
             }
         }
