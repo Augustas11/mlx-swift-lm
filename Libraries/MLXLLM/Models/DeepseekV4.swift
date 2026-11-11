@@ -1135,10 +1135,21 @@ final class DeepseekV4Indexer: Module {
         let poolCount = pooled.dim(1)
         guard poolCount > 0 else { return nil }
 
-        var q = deepseekV4Project(wqB, qResidual).reshaped(B, L, heads, headDim).transposed(0, 2, 1, 3)
-        q = rope(q, offset: offset)
-        let weights = deepseekV4LinearF32(weightsProj, x) * (scale * pow(Float(heads), -0.5))
-        return selectProjected(q, weights: weights, pooled: pooled, cache: cache, offset: offset)
+        return selectProjected(
+            query(qResidual, rope: rope, offset: offset, B: B, L: L), weights: scaledWeights(x),
+            pooled: pooled, cache: cache, offset: offset)
+    }
+
+    /// Rotated index queries `[B, H, L, Dk]` for the tokens at `offset ..< offset + L`.
+    func query(_ qResidual: MLXArray, rope: DeepseekV4RoPE, offset: Int, B: Int, L: Int) -> MLXArray {
+        rope(
+            deepseekV4Project(wqB, qResidual).reshaped(B, L, heads, headDim).transposed(0, 2, 1, 3),
+            offset: offset)
+    }
+
+    /// Float32 head weights with the reference's scale and heads**-0.5.
+    func scaledWeights(_ x: MLXArray) -> MLXArray {
+        deepseekV4LinearF32(weightsProj, x) * (scale * pow(Float(heads), -0.5))
     }
 
     /// Selection sees only this position's committed pool prefix. Projections
@@ -1493,7 +1504,39 @@ final class DeepseekV4Attention: Module {
         var attended = [MLXArray]()
         var prefixes = rowLengths.map { _ in [KVCache]() }
         var packed = 0
-        for row in rowLengths.indices {
+        // One position per row: advance every row's state, then select and
+        // attend for all rows in the row-invariant decode kernels.
+        if M > 1, rowLengths.allSatisfy({ $0 == 1 }) {
+            var advancedRows = [Advanced]()
+            for row in 0 ..< M {
+                let range = row ..< (row + 1)
+                advancedRows.append(advance(
+                    x[range], kv: kv[range], qResidual: qResidual[range], cache: layerCaches[row],
+                    offset: offsets[row],
+                    poolProjection: projectedPool.map { (kv: $0.kv[range], gate: $0.gate[range]) },
+                    indexProjection: projectedIndex.map {
+                        (kv: $0.kv[range], gate: $0.gate[range], q: $0.q[range], weights: $0.weights[range])
+                    }))
+                if capturePrefixes { prefixes[row].append(caches[row].copy()) }
+            }
+            if let decoded = decodeAttention(
+                q: q, advanced: advancedRows, caches: layerCaches, offsets: offsets)
+            {
+                attended = [decoded]
+            } else {
+                attended = (0 ..< M).map { row in
+                    let range = row ..< (row + 1)
+                    return decodeAttention(
+                        q: q[range], advanced: [advancedRows[row]], caches: [layerCaches[row]],
+                        offsets: [offsets[row]])
+                        ?? graphAttend(
+                            q: q[range], advanced: advancedRows[row], cache: layerCaches[row],
+                            offset: offsets[row], B: 1, L: 1)
+                }
+            }
+            packed = M
+        }
+        for row in rowLengths.indices where packed < M {
             for _ in 0 ..< rowLengths[row] {
                 let range = packed ..< (packed + 1)
                 let part = attend(
@@ -1572,27 +1615,32 @@ final class DeepseekV4Attention: Module {
     /// Bytes of gathered float32 keys one prompt tile may hold.
     var keyWorkspaceBytes = 512 << 20
 
-    /// The reference attention for the queries at `offset ..< offset + L`:
-    /// each query's key list is its window list followed by its compressed
-    /// list (every visible entry of a ratio-128 pool in order; the indexer's
-    /// top-k in descending score order on ratio-4 layers), as `sparse_attn`
-    /// receives them.
-    private func attend(
-        _ x: MLXArray, q: MLXArray, kv: MLXArray, qResidual: MLXArray, mask: MLXArray?,
-        cache: DeepseekV4LayerCache, offset: Int,
+    /// Window storage, pools and the indexer's inputs after one call has
+    /// advanced a layer cache.
+    struct Advanced {
+        let updated: MLXArray
+        let pooled: MLXArray?
+        let indexPool: MLXArray?
+        let indexQuery: MLXArray?
+        let indexWeights: MLXArray?
+    }
+
+    /// Advance the window, the pool and the index pool of `cache` by the
+    /// tokens at `offset ..< offset + L`. Projections may be shared with other
+    /// positions; state advances only here.
+    func advance(
+        _ x: MLXArray, kv: MLXArray, qResidual: MLXArray, cache: DeepseekV4LayerCache, offset: Int,
         poolProjection: (kv: MLXArray, gate: MLXArray)? = nil,
         indexProjection: (kv: MLXArray, gate: MLXArray, q: MLXArray, weights: MLXArray)? = nil
-    ) -> MLXArray {
+    ) -> Advanced {
         let (B, L) = (x.dim(0), x.dim(1))
         let (updated, _) = cache.local.update(
             keys: kv, values: MLXArray.zeros([kv.dim(0), 1, L, 0], dtype: kv.dtype))
-        let local = L == 1 ? Self.temporal(updated, cache: cache.local) : updated
-        let first = offset + L - local.dim(2)
-
-        // [B, L, C] compressed indices and validity, or nil without a pool.
-        var list: (indices: MLXArray, valid: MLXArray, pooled: MLXArray)?
+        var pooled: MLXArray?
+        var indexPool: MLXArray?
+        var indexQuery: MLXArray?
+        var indexWeights: MLXArray?
         if let compressor, let poolCache = cache.pool {
-            let pooled: MLXArray
             if let projected = poolProjection {
                 pooled = compressor.appendProjected(
                     kv: projected.kv, gate: projected.gate, dtype: x.dtype,
@@ -1600,20 +1648,137 @@ final class DeepseekV4Attention: Module {
             } else {
                 pooled = compressor(x, cache: poolCache, offset: offset)
             }
+            if let indexer, let indexCache = cache.indexPool {
+                if let projected = indexProjection {
+                    indexPool = indexer.compressor.appendProjected(
+                        kv: projected.kv, gate: projected.gate, dtype: x.dtype,
+                        cache: indexCache, offset: offset)
+                    indexQuery = projected.q
+                    indexWeights = projected.weights
+                } else {
+                    indexPool = indexer.compressor(x, cache: indexCache, offset: offset)
+                    if indexPool!.dim(1) > 0 {
+                        indexQuery = indexer.query(qResidual, rope: rope, offset: offset, B: B, L: L)
+                        indexWeights = indexer.scaledWeights(x)
+                    }
+                }
+            }
+        }
+        return Advanced(
+            updated: updated, pooled: pooled, indexPool: indexPool, indexQuery: indexQuery,
+            indexWeights: indexWeights)
+    }
+
+    /// One query's row for the decode kernels, or `nil` if its window storage
+    /// does not hold the whole window list.
+    func decodeRow(_ advanced: Advanced, cache: DeepseekV4LayerCache, offset: Int, listed: Int)
+        -> DeepseekV4DecodeRow?
+    {
+        let storage = advanced.updated
+        let S = storage.dim(2)
+        var (start, count) = (0, S)
+        let meta = cache.local.metaState
+        if meta.count >= 7, let idx = Int(meta[4]), Int(meta[0]) == 0, idx < S {
+            if meta[6] == "true" { start = idx } else { count = idx }
+        }
+        let validWindow = min(offset + 1, window)
+        guard count >= validWindow else { return nil }
+        return DeepseekV4DecodeRow(
+            window: storage, start: start, base: count - validWindow, validWindow: validWindow,
+            pool: advanced.pooled, listed: listed,
+            visible: ratio > 0 ? (offset + 1) / ratio : 0)
+    }
+
+    /// Kernel decode for one query per row over advanced caches, or `nil`
+    /// when a row falls outside the kernels' configuration. A row computes
+    /// the same bits alone and beside other rows.
+    func decodeAttention(
+        q: MLXArray, advanced: [Advanced], caches: [DeepseekV4LayerCache], offsets: [Int]
+    ) -> MLXArray? {
+        guard Device.defaultDevice().deviceType == .gpu else { return nil }
+        if let indexer, indexer.block > 0, indexer.keep > 0 { return nil }
+        var topk: MLXArray?
+        var listed = advanced.map { _ in 0 }
+        if let indexer {
+            let selecting = advanced.indices.filter { (advanced[$0].indexPool?.dim(1) ?? 0) > 0 }
+            if !selecting.isEmpty {
+                guard selecting.allSatisfy({ advanced[$0].indexQuery != nil }),
+                    let selected = deepseekV4DecodeSelect(
+                        q: concatenated(advanced.map {
+                            $0.indexQuery ?? MLXArray.zeros(
+                                advanced[selecting[0]].indexQuery!.shape,
+                                dtype: advanced[selecting[0]].indexQuery!.dtype)
+                        }, axis: 0),
+                        weights: concatenated(advanced.map {
+                            $0.indexWeights ?? MLXArray.zeros(
+                                advanced[selecting[0]].indexWeights!.shape, dtype: .float32)
+                        }, axis: 0),
+                        pools: advanced.map { $0.indexPool! }, topK: indexer.topK)
+                else { return nil }
+                topk = selected
+                for row in selecting {
+                    listed[row] = min(indexer.topK, advanced[row].indexPool!.dim(1))
+                }
+            }
+        } else if compressor != nil {
+            listed = advanced.map { $0.pooled?.dim(1) ?? 0 }
+        }
+        var rows = [DeepseekV4DecodeRow]()
+        for i in advanced.indices {
+            guard let row = decodeRow(advanced[i], cache: caches[i], offset: offsets[i], listed: listed[i])
+            else { return nil }
+            rows.append(row)
+        }
+        return deepseekV4DecodeAttention(
+            q: q, rows: rows, topk: topk, sink: attnSink, scale: scale, window: window
+        )?.asType(q.dtype)
+    }
+
+    /// The reference attention for the queries at `offset ..< offset + L`:
+    /// each query's key list is its window list followed by its compressed
+    /// list (every visible entry of a ratio-128 pool in order; the indexer's
+    /// top-k in descending score order on ratio-4 layers), as `sparse_attn`
+    /// receives them. One query of one row runs on the decode kernels, which
+    /// batched decode shares.
+    private func attend(
+        _ x: MLXArray, q: MLXArray, kv: MLXArray, qResidual: MLXArray, mask: MLXArray?,
+        cache: DeepseekV4LayerCache, offset: Int,
+        poolProjection: (kv: MLXArray, gate: MLXArray)? = nil,
+        indexProjection: (kv: MLXArray, gate: MLXArray, q: MLXArray, weights: MLXArray)? = nil
+    ) -> MLXArray {
+        let advanced = advance(
+            x, kv: kv, qResidual: qResidual, cache: cache, offset: offset,
+            poolProjection: poolProjection, indexProjection: indexProjection)
+        if x.dim(0) == 1, x.dim(1) == 1,
+            let decoded = decodeAttention(q: q, advanced: [advanced], caches: [cache], offsets: [offset])
+        {
+            return decoded
+        }
+        return graphAttend(q: q, advanced: advanced, cache: cache, offset: offset, B: x.dim(0), L: x.dim(1))
+    }
+
+    /// The graph attention over an advanced cache (prefill, CPU and shapes
+    /// outside the decode kernels).
+    func graphAttend(
+        q: MLXArray, advanced: Advanced, cache: DeepseekV4LayerCache, offset: Int, B: Int, L: Int
+    ) -> MLXArray {
+        let updated = advanced.updated
+        let local = L == 1 ? Self.temporal(updated, cache: cache.local) : updated
+        let first = offset + L - local.dim(2)
+
+        // [B, L, C] compressed indices and validity, or nil without a pool.
+        var list: (indices: MLXArray, valid: MLXArray, pooled: MLXArray)?
+        if compressor != nil, let pooled = advanced.pooled {
             let visible = MLXArray((offset ..< (offset + L)).map { Int32(($0 + 1) / ratio) })
                 .reshaped(1, L, 1)
             if let indexer, let indexCache = cache.indexPool {
-                let topk: MLXArray?
-                if let projected = indexProjection {
-                    let indexPool = indexer.compressor.appendProjected(
-                        kv: projected.kv, gate: projected.gate, dtype: x.dtype,
-                        cache: indexCache, offset: offset)
+                var topk: MLXArray?
+                if let indexPool = advanced.indexPool, indexPool.dim(1) > 0,
+                    let indexQuery = advanced.indexQuery, let indexWeights = advanced.indexWeights
+                {
                     topk = indexer.selectProjected(
-                        projected.q, weights: projected.weights, pooled: indexPool,
+                        indexQuery, weights: indexWeights, pooled: indexPool,
                         cache: indexCache, offset: offset)
-                } else {
-                    topk = indexer(
-                        x, qResidual: qResidual, rope: rope, cache: indexCache, offset: offset)
                 }
                 if let topk {
                     let topk = topk.asType(.int32)

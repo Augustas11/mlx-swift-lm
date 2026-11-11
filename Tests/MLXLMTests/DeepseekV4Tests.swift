@@ -616,6 +616,117 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
+    /// On the GPU, one-position decode runs on the row-invariant decode
+    /// kernels for serial and batched rows alike: batched greedy tokens equal
+    /// each row's serial run at 1, 2, 4 and 8 rows, across early, full and
+    /// wrapped windows and growing ratio-4 and ratio-128 pools.
+    func testGPUContinuousBatchGreedyParityAtOneTwoFourEightRows() throws {
+        try Device.withDefaultDevice(.gpu) {
+            let lengths = [3, 6, 31, 64, 127, 128, 131, 137]
+            let prompts = lengths.enumerated().map { row, count in
+                (0 ..< count).map { ($0 * 7 + row * 11 + 2) % 128 }
+            }
+            let model = try loadTiny(indexBlock: 0, indexKeep: 2)
+            let count = 24
+            let serial = try prompts.map { try servingGreedy(model, prompt: $0, count: count) }
+            for rows in [1, 2, 4, 8] {
+                let prepared = try prompts.prefix(rows).map { try prefetchedRow(model, prompt: $0) }
+                let caches = prepared.map { $0.cache }
+                var inputs = prepared.map { $0.firstToken }
+                var tokens = inputs.map { [Int($0)] }
+                for _ in 1 ..< count {
+                    let logits = model.decodeBatch(MLXArray(inputs).reshaped(rows, 1), rowCaches: caches)
+                    let next = argMax(logits, axis: -1).asArray(Int32.self)
+                    for row in 0 ..< rows { tokens[row].append(Int(next[row])) }
+                    inputs = next
+                    eval(caches.flatMap { $0 })
+                }
+                XCTAssertEqual(tokens, Array(serial.prefix(rows)), "rows=\(rows)")
+            }
+        }
+    }
+
+    /// The decode kernels select and attend for a row with the same bits
+    /// alone and beside other rows, and match the graph selection and
+    /// attention (distinct scores) to float32 tolerance.
+    func testDecodeKernelsAreRowInvariantAndMatchTheGraph() throws {
+        try Device.withDefaultDevice(.gpu) {
+            MLXRandom.seed(2116)
+            let (H, D, Hi, Dk, topK, window) = (8, 128, 4, 64, 16, 128)
+            let poolCounts = [0, 5, 16, 40, 3, 70, 17, 1]
+            let windowCounts = [1, 40, 128, 128, 77, 128, 128, 2]
+            let offsets = [0, 39, 300, 520, 76, 900, 200, 1]
+            let q = (MLXRandom.normal([8, H, 1, D])).asType(.bfloat16)
+            let iq = MLXRandom.normal([8, Hi, 1, Dk]).asType(.bfloat16)
+            let iw = MLXRandom.uniform(low: 0.1, high: 1.0, [8, 1, Hi])
+            let sink = MLXRandom.normal([H])
+            let pools = poolCounts.map { (MLXRandom.normal([1, max($0, 0), D])).asType(.bfloat16) }
+            let indexPools = poolCounts.map { (MLXRandom.normal([1, $0, Dk])).asType(.bfloat16) }
+            let windows = windowCounts.map { (MLXRandom.normal([1, 1, $0, D])).asType(.bfloat16) }
+            func bits(_ a: MLXArray) -> [UInt32] { a.asType(.float32).asArray(Float.self).map(\.bitPattern) }
+            func rows(_ range: Range<Int>, topk: MLXArray?) -> [DeepseekV4DecodeRow] {
+                range.map { b in
+                    DeepseekV4DecodeRow(
+                        window: windows[b], start: windowCounts[b] == 128 ? 37 : 0, base: 0,
+                        validWindow: windowCounts[b], pool: pools[b],
+                        listed: topk == nil ? poolCounts[b] : min(topK, poolCounts[b]),
+                        visible: (offsets[b] + 1) / 4)
+                }
+            }
+            let allSelected = try XCTUnwrap(deepseekV4DecodeSelect(
+                q: iq, weights: iw, pools: indexPools, topK: topK))
+            for b in 0 ..< 8 where poolCounts[b] > 0 {
+                let single = try XCTUnwrap(deepseekV4DecodeSelect(
+                    q: iq[b ..< b + 1], weights: iw[b ..< b + 1], pools: [indexPools[b]], topK: topK))
+                let k = min(topK, poolCounts[b])
+                XCTAssertEqual(single[0, ..<k].asArray(Int32.self), allSelected[b, ..<k].asArray(Int32.self))
+                // Same set and order as the graph's exact selection on distinct scores.
+                var scores = maximum(matmul(
+                    iq[b ..< b + 1].asType(.float32),
+                    expandedDimensions(indexPools[b], axis: 1).swappedAxes(-1, -2).asType(.float32)), 0)
+                scores = (scores * expandedDimensions(iw[b ..< b + 1].swappedAxes(-1, -2), axis: -1))
+                    .sum(axis: 1)
+                let graph = argSort(-scores, axis: -1)[.ellipsis, ..<k].asType(.int32)
+                XCTAssertEqual(graph.flattened().asArray(Int32.self), single[0, ..<k].asArray(Int32.self), "row \(b)")
+            }
+            for topk in [nil, allSelected] as [MLXArray?] {
+                let all = try XCTUnwrap(deepseekV4DecodeAttention(
+                    q: q, rows: rows(0 ..< 8, topk: topk), topk: topk, sink: sink, scale: 0.088,
+                    window: window))
+                for b in 0 ..< 8 {
+                    let one = try XCTUnwrap(deepseekV4DecodeAttention(
+                        q: q[b ..< b + 1], rows: rows(b ..< b + 1, topk: topk),
+                        topk: topk.map { $0[b ..< b + 1] }, sink: sink, scale: 0.088, window: window))
+                    XCTAssertEqual(bits(one), bits(all[b ..< b + 1]), "row \(b) indexed=\(topk != nil)")
+                    // Graph oracle over the same key list.
+                    let row = rows(b ..< b + 1, topk: topk)[0]
+                    var keyRows = [MLXArray]()
+                    var valid = [Bool]()
+                    for j in 0 ..< window {
+                        if j < row.validWindow {
+                            keyRows.append(windows[b][0, 0, (row.start + j) % windowCounts[b]])
+                            valid.append(true)
+                        } else {
+                            keyRows.append(MLXArray.zeros([D], dtype: .bfloat16)); valid.append(false)
+                        }
+                    }
+                    let picks = topk.map { $0[b].asArray(Int32.self) }
+                    for i in 0 ..< row.listed {
+                        let idx = picks.map { Int($0[i]) } ?? i
+                        let ok = idx < poolCounts[b] && idx < row.visible
+                        keyRows.append(ok ? pools[b][0, idx] : MLXArray.zeros([D], dtype: .bfloat16))
+                        valid.append(ok)
+                    }
+                    let graph = deepseekV4GraphAttention(
+                        q[b ..< b + 1], keys: stacked(keyRows).reshaped(1, 1, keyRows.count, D),
+                        valid: MLXArray(valid).reshaped(1, 1, valid.count), sink: sink, scale: 0.088)
+                    XCTAssertLessThan(
+                        abs(graph - one).max().item(Float.self), 2e-2, "graph row \(b) indexed=\(topk != nil)")
+                }
+            }
+        }
+    }
+
     func testContinuousBatchLongContextGreedyParityAtOneTwoFourEightRows() throws {
         try Device.withDefaultDevice(.cpu) {
             let prompts = [31, 32, 33, 127, 128, 129, 131, 137].enumerated().map { row, count in
