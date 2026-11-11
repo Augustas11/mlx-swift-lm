@@ -434,8 +434,8 @@ private let deepseekV4RouterLogitsSource = """
     const uint row = threadgroup_position_in_grid.y;
     const int out_row = int(threadgroup_position_in_grid.x) * 4;
     threadgroup float tgp[8 * 8];
-    const device W* mat = w + size_t(out_row) * K;
-    const device T* vec = x + size_t(row) * K;
+    auto mat = w + size_t(out_row) * K;
+    auto vec = x + size_t(row) * K;
     float result[4] = {0, 0, 0, 0};
     int bn = (32 * int(sg) + int(lane)) * 4;
     for (int i = 0; i < K / 1024; ++i) {

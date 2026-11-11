@@ -86,8 +86,8 @@ private let deepseekV4AttentionWeightsSource = """
     threadgroup float rescale[64];
     threadgroup float product[64];
     threadgroup float safe_peak;
-    const device float* s = raw + size_t(h) * K;
-    const float sc = scale[0];
+    auto s = raw + size_t(h) * K;
+    const float sc = as_type<float>(sizes[1]);
     const float ninf = -INFINITY;
     if (t < uint(nb)) {
       float m = ninf;
@@ -134,7 +134,7 @@ private final class DeepseekV4AttentionKernels: Sendable {
     static let shared = DeepseekV4AttentionKernels()
     let weights = MLXFast.metalKernel(
         name: "deepseek_v4_attention_weights",
-        inputNames: ["raw", "valid", "sink", "scale", "sizes"],
+        inputNames: ["raw", "valid", "sink", "sizes"],
         outputNames: ["weights", "normalizer"], source: deepseekV4AttentionWeightsSource)
 }
 
@@ -149,13 +149,15 @@ func deepseekV4QueryAttention(
     let (H, D, K) = (q.dim(1), q.dim(3), keys.dim(2))
     guard Device.defaultDevice().deviceType == .gpu, q.ndim == 4, q.dim(0) == 1, q.dim(2) == 1,
         keys.shape == [1, 1, K, D], valid.shape == [1, 1, K], valid.dtype == .bool,
-        (1 ... 4096).contains(K), sink.size == H,
+        (1 ... 4096).contains(K), H > 1, sink.size == H,
         [DType.float32, .float16, .bfloat16].contains(sink.dtype)
     else { return nil }
     let keys32 = keys.asType(.float32)
     let raw = matmul(q.transposed(0, 2, 1, 3).asType(.float32), keys32.swappedAxes(-1, -2))
     let fused = DeepseekV4AttentionKernels.shared.weights(
-        [raw, valid, sink, MLXArray([scale]), MLXArray([Int32(K)])],
+        // `sizes` is [K, scale bits]: a one-element input would bind as a
+        // constant scalar rather than a buffer.
+        [raw, valid, sink, MLXArray([Int32(K), Int32(bitPattern: scale.bitPattern)])],
         grid: (64, H, 1), threadGroup: (64, 1, 1),
         outputShapes: [[1, 1, H, K], [1, 1, H, 1]], outputDTypes: [.float32, .float32])
     return (matmul(fused[0], keys32) / fused[1]).transposed(0, 2, 1, 3)
