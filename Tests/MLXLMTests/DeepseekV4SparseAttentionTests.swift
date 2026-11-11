@@ -94,6 +94,36 @@ final class DeepseekV4SparseAttentionTests: XCTestCase {
         }
     }
 
+    /// The fused per-query softmax replays the graph between its matmuls bit
+    /// for bit at the production head geometry: tails, holes, empty leading
+    /// blocks, an empty list, and lists past the indexer's top-k.
+    func testQueryAttentionReplaysGraphBits() throws {
+        try requireGPU()
+        MLXRandom.seed(2115)
+        let (H, D) = (64, 512)
+        let sink = MLXRandom.normal([H])
+        func bits(_ a: MLXArray) -> [UInt32] { a.asArray(Float.self).map(\.bitPattern) }
+        for K in [1, 63, 64, 65, 130, 200, 511, 640, 1200, 4096] {
+            let q = (2 * MLXRandom.normal([1, H, 1, D])).asType(.bfloat16)
+            let keys = (2 * MLXRandom.normal([1, 1, K, D])).asType(.bfloat16)
+            let patterns: [[Bool]] = [
+                Array(repeating: true, count: K),
+                (0 ..< K).map { $0 % 7 != 3 },
+                (0 ..< K).map { $0 >= min(K - 1, 70) },
+                Array(repeating: false, count: K),
+            ]
+            for (index, pattern) in patterns.enumerated() {
+                let valid = MLXArray(pattern).reshaped(1, 1, K)
+                let fused = try XCTUnwrap(
+                    deepseekV4QueryAttention(q, keys: keys, valid: valid, sink: sink, scale: 0.044))
+                let graph = deepseekV4GraphAttention(
+                    q, keys: keys, valid: valid, sink: sink, scale: 0.044)
+                XCTAssertEqual(fused.shape, graph.shape)
+                XCTAssertEqual(bits(fused), bits(graph), "K=\(K) pattern \(index)")
+            }
+        }
+    }
+
     /// A new block maximum must rescale the float32 accumulator AFTER the
     /// previous block's bf16 weights have been consumed.
     func testRunningMaximumAndBF16Rounding() throws {
