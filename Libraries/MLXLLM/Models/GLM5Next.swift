@@ -164,6 +164,14 @@ final class GLM5NextHyperConnection: Module {
     /// model's decode kernels for one sequence, the op path otherwise.
     func normalizedBranchInput(_ x: MLXArray, norm: RMSNorm) -> (MLXArray, MLXArray, MLXArray) {
         if usesCanonicalDeepseekHC, (1 ... 8).contains(x.dim(1)) {
+            // The GPU kernels replay this per-token graph for every token at once.
+            if let fused = deepseekV4HCBranchInput(
+                x, fn: fn, scale: scale, base: base, normWeight: norm.weight,
+                sinkhornIterations: sinkhornIterations, mixEps: normEps, hcEps: hcEps,
+                normEps: norm.eps)
+            {
+                return fused
+            }
             // Each decode/verification token keeps ordinary M1 graph arithmetic.
             // Batched GEMM and fused coefficients can cross bf16 rounding ties.
             var normalizedRows = [MLXArray]()
