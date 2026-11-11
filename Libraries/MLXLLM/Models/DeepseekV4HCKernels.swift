@@ -314,6 +314,7 @@ func deepseekV4HCExpandKernel(
 ) -> MLXArray? {
     guard Device.defaultDevice().deviceType == .gpu, x.dtype == .bfloat16,
         residual.dtype == x.dtype, residual.ndim == 4, residual.dim(2) == 4,
+        residual.dim(3) >= 64,
         x.shape == [residual.dim(0), residual.dim(1), residual.dim(3)],
         post.dtype == .float32, post.shape == Array(residual.shape.dropLast()),
         comb.dtype == .float32, comb.shape == Array(residual.shape.dropLast()) + [4]

@@ -202,8 +202,8 @@ final class DeepseekV4Tests: XCTestCase {
             for (rows, length) in [(1, 1), (4, 1), (1, 37)] {
                 let x = (4 * MLXRandom.normal([rows, length, width])).asType(.bfloat16)
                 let residual = (4 * MLXRandom.normal([rows, length, 4, width])).asType(.bfloat16)
-                let post = 2 * MLXRandom.uniform([rows, length, 4])
-                let comb = MLXRandom.uniform([rows, length, 4, 4])
+                let post = 2 * MLXRandom.uniform(low: 0.0, high: 1.0, [rows, length, 4])
+                let comb = MLXRandom.uniform(low: 0.0, high: 1.0, [rows, length, 4, 4])
                 let expanded = expandedDimensions(post, axis: -1)
                     * expandedDimensions(x.asType(.float32), axis: 2)
                 let products = expandedDimensions(comb, axis: -1)
