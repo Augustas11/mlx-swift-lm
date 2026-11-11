@@ -351,16 +351,54 @@ final class MiniMaxM3Tests: XCTestCase {
 
     /// The one-launch norm is bitwise MLX's cast, float32 rms_norm, cast
     /// chain, on single-row and looped row lengths, with and without tails.
+    /// Seeded, over several draws: a rounding difference flips only a few
+    /// float16 outputs per draw, so one unseeded draw can miss it (#2284).
+    ///
+    /// The reference is MLX's own `rms_looped` kernel, so the bitwise claim
+    /// holds against a metallib built as MLX builds it, with
+    /// `-fno-fast-math`: upstream CMake, and the `mlx.metallib` the provider
+    /// ships beside its binary. MLX loads a colocated `mlx.metallib` first.
+    /// Without one, an Xcode or SwiftPM test build uses the bundle's
+    /// `default.metallib`, which Xcode compiles with fast math, and MLX's
+    /// float32 `rms_looped` then rounds rows past 4096 differently at every
+    /// threadgroup size (the fused kernel is JIT-compiled in safe mode either
+    /// way). There the check falls back to the tolerances MLX's own
+    /// `test_fast.py` `test_rms_norm` uses for the fast kernel.
     func testFusedNormMatchesMLXChain() throws {
+        let releaseMetallib = Bundle(for: Self.self).executableURL.map {
+            FileManager.default.fileExists(
+                atPath: $0.deletingLastPathComponent().appendingPathComponent("mlx.metallib").path)
+        } ?? false
+        let mlxTolerance: [DType: Float] = [.float16: 1e-3, .bfloat16: 1e-2]
+        let shapes = [[3, 7, 128], [2, 6144], [5, 100], [1, 4100], [2368, 128], [4, 4096], [16, 6144]]
         for dtype in [DType.bfloat16, .float16] {
-            for shape in [[3, 7, 128], [2, 6144], [5, 100], [1, 4100], [2368, 128], [4, 4096]] {
-                let x = (3 * MLXRandom.normal(shape)).asType(dtype)
-                let w = 1 + 0.1 * MLXRandom.normal([shape.last!])
-                let expected = MLXFast.rmsNorm(x, weight: w, eps: 1e-6).asType(dtype)
-                let actual = try XCTUnwrap(miniMaxM3RMSNorm(x, scale: w, eps: 1e-6))
-                XCTAssertEqual(actual.dtype, dtype)
-                XCTAssertTrue(
-                    arrayEqual(actual, expected).item(Bool.self), "\(dtype) \(shape)")
+            for shape in shapes {
+                for seed in UInt64(0) ..< 8 {
+                    let (x, w) = withRandomState(MLXRandom.RandomState(seed: seed)) {
+                        (
+                            (3 * MLXRandom.normal(shape)).asType(dtype),
+                            1 + 0.1 * MLXRandom.normal([shape.last!])
+                        )
+                    }
+                    let expected = MLXFast.rmsNorm(x, weight: w, eps: 1e-6).asType(dtype)
+                    let actual = try XCTUnwrap(miniMaxM3RMSNorm(x, scale: w, eps: 1e-6))
+                    XCTAssertEqual(actual.dtype, dtype)
+                    if releaseMetallib {
+                        XCTAssertTrue(
+                            arrayEqual(actual, expected).item(Bool.self),
+                            "\(dtype) \(shape) seed \(seed)")
+                    } else {
+                        // MLX's absolute tolerances are for outputs below 2;
+                        // these rows reach about 5, so scale them by |expected|
+                        // past 1. Each still covers one ULP of the dtype.
+                        let e = expected.asType(.float32)
+                        let excess =
+                            abs(actual.asType(.float32) - e)
+                            - mlxTolerance[dtype]! * maximum(abs(e), 1)
+                        XCTAssertLessThan(
+                            excess.max().item(Float.self), 0, "\(dtype) \(shape) seed \(seed)")
+                    }
+                }
             }
         }
     }
