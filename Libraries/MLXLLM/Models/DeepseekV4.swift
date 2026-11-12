@@ -2010,6 +2010,30 @@ struct DeepseekV4LayerCache {
     }
 }
 
+/// A DeepSeek V4 prompt forward paused at a layer boundary. It holds the
+/// residual stream, the shared local mask and the row's caches; layers past
+/// `nextLayer` have not written their caches yet.
+public final class DeepseekV4LayeredPrefill {
+    let inputs: MLXArray
+    let caches: [KVCache]
+    let emitMTPState: Bool
+    let mask: MLXArray?
+    let layerCount: Int
+    var h: MLXArray
+    var captured = [Int: MLXArray]()
+    public fileprivate(set) var nextLayer = 0
+    public var isComplete: Bool { nextLayer == layerCount }
+    public var tokenCount: Int { inputs.dim(1) }
+
+    fileprivate init(model: DeepseekV4Model, inputs: MLXArray, caches: [KVCache], emitMTPState: Bool) {
+        self.inputs = inputs
+        self.caches = caches
+        self.emitMTPState = emitMTPState
+        self.layerCount = model.layers.count
+        (h, mask) = model.startPrefill(inputs, caches: caches)
+    }
+}
+
 public final class DeepseekV4Model: Module, LLMModel {
     public let vocabularySize: Int
     public var hasMTPWeights: Bool { !mtp.isEmpty }
@@ -2067,31 +2091,82 @@ public final class DeepseekV4Model: Module, LLMModel {
     private func forward(
         _ inputs: MLXArray, cache: [KVCache]?, emitMTPState: Bool, lastLogitsOnly: Bool = false
     ) -> LMOutput {
-        let caches = try! cache ?? newCache(parameters: nil)
-        let layerCaches = zip(caches, layers).map {
-            DeepseekV4LayerCache($0, ratio: $1.attn.ratio)
-        }
-        let L = inputs.dim(1)
+        let prefill = DeepseekV4LayeredPrefill(
+            model: self, inputs: inputs, caches: try! cache ?? newCache(parameters: nil),
+            emitMTPState: emitMTPState)
+        runLayers(prefill, count: layers.count)
+        return headOutput(prefill.h, captured: prefill.captured, emitMTPState: emitMTPState,
+                    lastLogitsOnly: lastLogitsOnly)
+    }
 
+    fileprivate func startPrefill(_ inputs: MLXArray, caches: [KVCache]) -> (h: MLXArray, mask: MLXArray?) {
+        let L = inputs.dim(1)
         var h = embed(inputs)
         h = repeated(expandedDimensions(h, axis: 2), count: configuration.hcMult, axis: 2)
 
         // One local mask for every layer, from layer 0's window before any update.
         var mask: MLXArray?
         if L > 1,
-            case .array(let array) = layerCaches[0].local.makeMask(
-                n: L, windowSize: configuration.slidingWindow, returnArray: true)
+            case .array(let array) = DeepseekV4LayerCache(caches[0], ratio: layers[0].attn.ratio)
+                .local.makeMask(n: L, windowSize: configuration.slidingWindow, returnArray: true)
         {
             mask = array
         }
+        return (h, mask)
+    }
 
-        var captured = [Int: MLXArray]()
-        for (index, item) in zip(layers, layerCaches).enumerated() {
-            h = item.0(h, mask: mask, cache: item.1, inputIDs: inputs)
-            if emitMTPState, configuration.dsparkTargetLayerIDs.contains(index) {
-                captured[index] = h.mean(axis: 2)
+    /// Run up to `count` further layers. Each layer reads `h` and writes only
+    /// its own cache, so the graph is the same whether or not a caller
+    /// evaluates between calls.
+    private func runLayers(_ prefill: DeepseekV4LayeredPrefill, count: Int) {
+        let end = min(layers.count, prefill.nextLayer + max(0, count))
+        while prefill.nextLayer < end {
+            let index = prefill.nextLayer
+            prefill.h = layers[index](
+                prefill.h, mask: prefill.mask,
+                cache: DeepseekV4LayerCache(prefill.caches[index], ratio: layers[index].attn.ratio),
+                inputIDs: prefill.inputs)
+            if prefill.emitMTPState, configuration.dsparkTargetLayerIDs.contains(index) {
+                prefill.captured[index] = prefill.h.mean(axis: 2)
             }
+            prefill.nextLayer += 1
         }
+    }
+
+    /// Start a serving prefill that a caller can pause between layers, for
+    /// example to decode other rows. Evaluating at a layer boundary does not
+    /// change any operation or its inputs, so `finishLayeredPrefill` returns
+    /// exactly what `prefillLastOutput` returns for the same tokens and cache.
+    public func beginLayeredPrefill(
+        _ input: LMInput.Text, cache: [KVCache], state: LMOutput.State?
+    ) -> DeepseekV4LayeredPrefill {
+        precondition(cache.count == layers.count)
+        return DeepseekV4LayeredPrefill(
+            model: self, inputs: input.tokens, caches: cache,
+            emitMTPState: state?[mtpEmitFlagKey] ?? false)
+    }
+
+    /// Run and evaluate up to `count` more layers. Returns true once every
+    /// layer has run.
+    @discardableResult
+    public func advanceLayeredPrefill(_ prefill: DeepseekV4LayeredPrefill, layers count: Int) -> Bool {
+        let first = prefill.nextLayer
+        runLayers(prefill, count: count)
+        eval([prefill.h] + prefill.captured.values
+            + prefill.caches[first ..< prefill.nextLayer].flatMap(\.state))
+        return prefill.isComplete
+    }
+
+    /// The last-position output of a completed layered prefill.
+    public func finishLayeredPrefill(_ prefill: DeepseekV4LayeredPrefill) -> LMOutput {
+        precondition(prefill.isComplete, "DeepSeek V4 layered prefill has layers left")
+        return headOutput(prefill.h, captured: prefill.captured, emitMTPState: prefill.emitMTPState,
+                    lastLogitsOnly: true)
+    }
+
+    private func headOutput(
+        _ h: MLXArray, captured: [Int: MLXArray], emitMTPState: Bool, lastLogitsOnly: Bool
+    ) -> LMOutput {
         // CPU GEMM and GEMV have different reduction orders. Preserve its
         // reference logits; the serving memory reduction targets GPU prefill.
         let trimHead = lastLogitsOnly && Device.defaultDevice().deviceType == .gpu

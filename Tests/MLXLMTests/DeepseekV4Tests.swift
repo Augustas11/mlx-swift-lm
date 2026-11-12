@@ -514,6 +514,33 @@ final class DeepseekV4Tests: XCTestCase {
         }
     }
 
+    func testLayeredPrefillMatchesPrefillLastOutputBits() throws {
+        let model = try loadTiny(indexBlock: 0, indexKeep: 0)
+        func bits(_ a: MLXArray) -> [UInt32] { a.asType(.float32).asArray(Float.self).map(\.bitPattern) }
+        let first = MLXArray((0 ..< 96).map { Int32($0 % model.vocabularySize) }).reshaped(1, 96)
+        let second = MLXArray((0 ..< 40).map { Int32(($0 * 7 + 3) % model.vocabularySize) }).reshaped(1, 40)
+        for layersPerStep in [1, 2, model.layers.count] {
+            let referenceCache = try model.newCache(parameters: nil)
+            let layeredCache = try model.newCache(parameters: nil)
+            for (index, chunk) in [first, second].enumerated() {
+                let expected = model.prefillLastOutput(.init(tokens: chunk), cache: referenceCache, state: nil)
+                eval([expected.logits] + referenceCache.flatMap(\.state))
+                let prefill = model.beginLayeredPrefill(.init(tokens: chunk), cache: layeredCache, state: nil)
+                var steps = 0
+                while !model.advanceLayeredPrefill(prefill, layers: layersPerStep) { steps += 1 }
+                XCTAssertEqual(steps + 1, (model.layers.count + layersPerStep - 1) / layersPerStep)
+                let actual = model.finishLayeredPrefill(prefill)
+                XCTAssertEqual(bits(actual.logits), bits(expected.logits), "chunk \(index), \(layersPerStep) layers per step")
+                for (a, b) in zip(layeredCache, referenceCache) {
+                    XCTAssertEqual(a.offset, b.offset)
+                    for (x, y) in zip(a.state, b.state) { XCTAssertEqual(bits(x), bits(y)) }
+                }
+            }
+            let token = MLXArray([Int32(5)]).reshaped(1, 1)
+            XCTAssertEqual(bits(model(token, cache: layeredCache)), bits(model(token, cache: referenceCache)))
+        }
+    }
+
     func testPoolCacheCompletesWindowsAcrossChunksAndDecode() throws {
         try Device.withDefaultDevice(.cpu) {
             let cache = DeepseekV4PoolCache(ratio: 4)
