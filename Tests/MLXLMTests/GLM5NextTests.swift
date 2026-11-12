@@ -229,12 +229,21 @@ final class GLM5NextTests: XCTestCase {
 
     /// Token-by-token decode must reproduce the full-prefill logits. With
     /// `index_topk` 8 over 40 tokens the indexer's selection is live.
+    ///
+    /// Where float32 matmuls run as TF32 (NAX GPUs), prefill scores the
+    /// indexer with a TF32 GEMM and decode with a float32 GEMV, so a near tie
+    /// at the top-k cut selects different tokens and moves the logits by
+    /// O(1). There `index_topk` covers the whole prompt and the bound comes
+    /// from TF32's rounding error; with IEEE float32 the selection is live
+    /// and the bound is 1e-3.
     func testIncrementalDecodeMatchesPrefill() throws {
-        let model = GLM5NextTextModel(try configuration(indexTopk: 8))
+        let reduced = MatmulPrecision.isReducedFloat32
+        let model = GLM5NextTextModel(try configuration(indexTopk: reduced ? 40 : 8))
         randomize(model)
         let input = tokens(40)
 
-        let prefill = model(input, cache: try model.newCache(parameters: nil))
+        let hidden = model.model(input, cache: try model.newCache(parameters: nil))
+        let prefill = model.logits(hidden)
         eval(prefill)
 
         let cache = try model.newCache(parameters: nil)
@@ -244,7 +253,25 @@ final class GLM5NextTests: XCTestCase {
             eval(step)
             maxDifference = max(maxDifference, maxAbsDifference(step[0, 0], prefill[0, t]))
         }
-        XCTAssertLessThan(maxDifference, 1e-3, "decode diverged from prefill")
+
+        var bound: Float = 1e-3
+        if reduced {
+            // TF32 keeps 10 mantissa bits (unit roundoff u = 2^-11). A dot
+            // product over K terms of rounded operands carries a rounding
+            // error of about sqrt(K) * u * sum|a_i * b_i| (Higham and Mary's
+            // probabilistic analysis). Each of the L layers adds one such
+            // relative error to the residual stream and the head one more, so
+            // the logits move by at most (L + 1) * sqrt(K) * u * S, with
+            // K = hidden_size and S = max_j sum_i |W_ji * h_i| the head's
+            // absolute-product scale on this prompt.
+            let head = try XCTUnwrap(model.lmHead).weight
+            let scale = matmul(abs(hidden.reshaped(-1, head.dim(1))), abs(head).T).max()
+                .item(Float.self)
+            let k = Float(head.dim(1))
+            let layers = Float(model.model.layers.count)
+            bound = (layers + 1) * k.squareRoot() / 2048 * scale
+        }
+        XCTAssertLessThan(maxDifference, bound, "decode diverged from prefill (bound \(bound))")
     }
 
     /// Prefill split into chunks (pool windows straddle chunk boundaries) must
@@ -975,7 +1002,9 @@ final class GLM5NextTests: XCTestCase {
         }
         let gemm = try prefill(true)
         let perHead = try prefill(false)
-        XCTAssertLessThan(maxAbsDifference(gemm, perHead), 1e-3)
+        // The two routes reach the attention scores through different GEMM
+        // shapes, so TF32 on NAX GPUs separates them by a few 1e-3.
+        XCTAssertLessThan(maxAbsDifference(gemm, perHead), MatmulPrecision.splitTolerance)
     }
 
     /// End to end: decode logits with the fused KDA step equal the op path's.
@@ -1461,28 +1490,64 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
-    /// MLX's own small-M affine product is row-invariant from 1 to 16 rows:
-    /// on GPUs without NAX that is the `qmv_mma` route of the MLX core fork
-    /// (`v0.32.4-macprovider.7`), elsewhere `qmv`. Projections the GLM kernels
-    /// do not cover take this route at every token count (#2265).
+    /// MLX's own small-M affine product is row-invariant from 1 row up to the
+    /// most rows the provider puts in one forward: on GPUs without NAX that is
+    /// the `qmv_mma` route of the MLX core fork (`v0.32.4-macprovider.7`),
+    /// elsewhere `qmv`. At core's `get_qmv_batch_limit` the product moves to
+    /// `qmm`, which sums K in another order, so the provider caps every
+    /// continuously batched decode and MTP verify forward one row below it
+    /// (macprovider `ContinuousBatchDecodeRouteBound.maxDecodeRowsPerForward`,
+    /// 12 on gen 17 and 11 on Ultra). Projections the GLM kernels do not cover
+    /// take this route at every token count (#2265).
     func testMLXSmallMQuantizedMatmulIsRowInvariant() throws {
+        // Core reads MLX_METAL_GPU_ARCH ahead of the device's own name.
+        let architecture = ProcessInfo.processInfo.environment["MLX_METAL_GPU_ARCH"]
+            .flatMap { $0.isEmpty ? nil : $0 } ?? GPU.deviceInfo().architecture
         for (bits, groupSize, n, k) in [
             (4, 64, 4096, 4096), (8, 64, 2048, 4096), (4, 128, 16384, 512), (4, 32, 1024, 2048),
         ] {
+            let bound = Self.qmvBatchLimit(inputDims: k, outputDims: n, architecture: architecture) - 1
             let p = randomAffine([n, k], bits: bits, groupSize: groupSize, seed: UInt64(500 + bits + n))
             let x = withRandomState(MLXRandom.RandomState(seed: 510)) {
-                MLXRandom.normal([16, k]).asType(.bfloat16)
+                MLXRandom.normal([bound, k]).asType(.bfloat16)
             }
             func mm(_ a: MLXArray) -> MLXArray {
                 quantizedMatmul(
                     a, p.weight, scales: p.scales, biases: p.biases, transpose: true,
                     groupSize: groupSize, bits: bits)
             }
-            let alone = (0 ..< 16).map { mm(x[$0 ..< ($0 + 1)]) }
-            for M in [2, 3, 4, 8, 9, 16] {
+            let alone = (0 ..< bound).map { mm(x[$0 ..< ($0 + 1)]) }
+            for M in Set([2, 3, 4, 8, 9, 12, 16, bound]).filter({ $0 <= bound }).sorted() {
                 assertRowsEqual(
-                    mm(x[0 ..< M]), Array(alone[0 ..< M]), "MLX small-M \(bits)b gs\(groupSize) n=\(n) M=\(M)")
+                    mm(x[0 ..< M]), Array(alone[0 ..< M]),
+                    "MLX small-M \(bits)b gs\(groupSize) n=\(n) M=\(M) bound=\(bound) \(architecture)")
             }
+        }
+    }
+
+    /// Core `get_qmv_batch_limit` for transposed quantized weights: the first
+    /// row count that leaves `qmv` for `qmm`. `architecture` is the Metal
+    /// architecture name (`applegpu_g17s`), as core reads it.
+    private static func qmvBatchLimit(inputDims: Int, outputDims: Int, architecture: String) -> Int {
+        let bytes = Array(architecture.utf8)
+        func digit(_ index: Int) -> Int {
+            guard index >= 0, index < bytes.count else { return 0 }
+            let value = Int(bytes[index]) - 48
+            return (0 ..< 10).contains(value) ? value : 0
+        }
+        let generation = bytes.count >= 3 ? digit(bytes.count - 3) * 10 + digit(bytes.count - 2) : 0
+        let isUltra = bytes.last == UInt8(ascii: "d")
+        let small = inputDims <= 2048 && outputDims <= 2048
+        let medium = inputDims <= 4096 && outputDims <= 4096
+        if generation >= 17 && !isUltra {
+            return small ? 33 : (medium ? 25 : 13)
+        } else if generation >= 15 && !isUltra {
+            return small ? 13 : (medium ? 15 : 13)
+        } else if generation >= 13 {
+            let large = generation == 13 && bytes.last == UInt8(ascii: "s") ? 7 : 6
+            return isUltra ? (small ? 32 : (medium ? 18 : 12)) : (small ? 14 : (medium ? 10 : large))
+        } else {
+            return isUltra ? (small ? 32 : (medium ? 18 : 12)) : (small ? 18 : (medium ? 12 : 10))
         }
     }
 
