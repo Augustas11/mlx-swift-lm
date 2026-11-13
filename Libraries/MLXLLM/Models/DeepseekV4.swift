@@ -899,153 +899,234 @@ final class DeepseekV4MoE: Module {
         return (combined.reshaped(x.shape) + sharedExperts(x).asType(.float32)).asType(x.dtype)
     }
 
-    /// Prefill with a fixed number of launches per projection instead of one
-    /// graph per expert, bit-identical to `quantizedPrefillReference`.
+    /// Prefill with few launches per projection instead of one graph per
+    /// expert, bit-identical to `quantizedPrefillReference`.
     ///
-    /// Routes are laid out expert by expert (experts in ascending row count,
-    /// then id; an expert's routes in slot order), so every expert's rows are
-    /// contiguous and each projection route, which depends only on the row
-    /// count, covers a contiguous run. Each run is one launch: the wide kernel
-    /// per distinct row count, and (with `deepseekV4PrefillGroupedGatherQMM`)
-    /// one sorted gather for the split-K and plain runs. Every row takes the
-    /// arithmetic its expert takes in the reference, and SwiGLU is
-    /// elementwise. The reference's scatter-add gives each token
-    /// `0 + o_1 + ... + o_k` in float32 over its experts in ascending id;
-    /// the combine below adds the same values in the same order.
+    /// The active experts are cut into consecutive batches in ascending id,
+    /// each at most `deepseekV4PrefillBatchRows` routed rows (an expert is
+    /// never split), so the gathered input, float32 gate/up and output of one
+    /// batch are alive at a time instead of the whole chunk's. Within a batch,
+    /// routes are laid out expert by expert (ascending row count, then id; an
+    /// expert's routes in slot order), so every expert's rows are contiguous
+    /// and each projection route, which depends only on the row count, covers
+    /// a contiguous run. Wide-route experts with the same row count share one
+    /// launch; `.plain` and `.splitK` runs share one sorted gather each (with
+    /// `deepseekV4PrefillGroupedGatherQMM`). Single-row (`.vector`) experts,
+    /// and runs whose gather MLX would not take, stay one launch per expert.
+    /// An expert's row count, and so its route, does not depend on batching.
+    /// Every row takes the arithmetic its expert takes in the reference, and
+    /// SwiGLU is elementwise.
+    ///
+    /// Combine order: the reference starts each token at float32 +0 and
+    /// scatter-adds its experts' outputs in ascending expert id, giving
+    /// `((0 + o_e1) + o_e2) + ...` with e1 < e2 < ... . Batches cover
+    /// disjoint ascending id ranges and are added in batch order, and inside
+    /// a batch the token's j-th add is its j-th smallest expert id there, so
+    /// across all batches each token receives exactly the same float32 adds,
+    /// one at a time, in the same ascending-id order, into the same +0 start.
+    /// A token with no expert in a batch, or past its last one there, gets no
+    /// add at all (a scatter-add over only the tokens that have one), never
+    /// an extra `+ 0`.
+    ///
+    /// Off the M3 Ultra (and without `deepseekV4ReferencePrefillOnAnyGPU`) no
+    /// projection can group, so this runs `quantizedPrefillReference` itself.
     func quantizedPrefill(_ x: MLXArray, indices: MLXArray, weights: MLXArray) -> MLXArray? {
         guard let (gateProjection, upProjection, downProjection) = prefillProjections(x)
         else { return nil }
+        func groups(_ projection: QuantizedSwitchLinear) -> Bool {
+            let parts = projection.quantizedParts
+            return projection.groupSize == 32 && projection.bits == 4 && parts.biases == nil
+                && deepseekV4ReferencePrefillAvailable(
+                    k: parts.weight.dim(-1) * 8, weight: parts.weight, scales: parts.scales,
+                    dtype: x.dtype)
+        }
+        let grouped = (
+            gate: groups(gateProjection), up: groups(upProjection), down: groups(downProjection))
+        guard grouped.gate || grouped.up || grouped.down else {
+            return quantizedPrefillReference(x, indices: indices, weights: weights)
+        }
         let tokens = x.size / x.dim(-1)
         let k = indices.dim(-1)
         let expertCount = gateProjection.quantizedParts.weight.dim(0)
         let routed = indices.asType(.int32).asArray(Int32.self)
         guard routed.count == tokens * k else { return nil }
 
-        var counts = [Int](repeating: 0, count: expertCount)
-        for expert in routed { counts[Int(expert)] += 1 }
-        let active = (0 ..< expertCount).filter { counts[$0] > 0 }
-            .sorted { (counts[$0], $0) < (counts[$1], $1) }
-        var start = [Int](repeating: 0, count: expertCount)
-        var total = 0
-        for expert in active {
-            start[expert] = total
-            total += counts[expert]
-        }
-        var next = start
-        var order = [Int32](repeating: 0, count: routed.count)
-        var position = [Int32](repeating: 0, count: routed.count)
+        var assignments = [[Int32]](repeating: [], count: expertCount)
         for (slot, expert) in routed.enumerated() {
-            let row = next[Int(expert)]
-            next[Int(expert)] += 1
-            order[row] = Int32(slot)
-            position[slot] = Int32(row)
+            assignments[Int(expert)].append(Int32(slot))
         }
-        // combineRows[j][token]: the token's j-th row in ascending expert id
-        // (then slot), the order the reference scatter-adds them.
-        var combineRows = [[Int32]](repeating: [Int32](repeating: 0, count: tokens), count: k)
-        for token in 0 ..< tokens {
-            let slots = (token * k ..< (token + 1) * k)
-                .sorted { (routed[$0], $0) < (routed[$1], $1) }
-            for (j, slot) in slots.enumerated() {
-                combineRows[j][token] = position[slot]
-            }
+        let counts = assignments.map(\.count)
+        let batches = deepseekV4PrefillExpertBatches(
+            counts: counts, budget: deepseekV4PrefillBatchRows)
+        var batchOf = [Int](repeating: -1, count: expertCount)
+        for (b, batch) in batches.enumerated() {
+            for expert in batch { batchOf[expert] = b }
+        }
+        // Each token's slots in ascending expert id (then slot): the order
+        // the reference scatter-adds them.
+        let tokenSlots = (0 ..< tokens).map { token in
+            (token * k ..< (token + 1) * k).sorted { (routed[$0], $0) < (routed[$1], $1) }
         }
 
         let gather = deepseekV4PrefillGroupedGatherQMM
-        func project(_ projection: QuantizedSwitchLinear, _ input: MLXArray) -> MLXArray {
-            let parts = projection.quantizedParts
-            let (width, outputs) = (input.dim(1), parts.weight.dim(1))
-            let grouped = projection.groupSize == 32 && projection.bits == 4
-                && parts.biases == nil
-                && deepseekV4ReferencePrefillAvailable(
-                    k: width, weight: parts.weight, scales: parts.scales, dtype: input.dtype)
-            func rows(_ run: ArraySlice<Int>) -> MLXArray {
-                let first = start[run.first!]
-                return input[first ..< (first + run.reduce(0) { $0 + counts[$1] })]
-            }
-            func perExpert(_ run: ArraySlice<Int>) -> [MLXArray] {
-                run.map { expert in
-                    let first = start[expert]
-                    return projectExpert(
-                        projection, input[first ..< (first + counts[expert])], expert: expert)
+        let flat = x.reshaped(tokens, x.dim(-1))
+        let routeWeightsFlat = weights.flattened()
+        let hiddenSize = downProjection.quantizedParts.weight.dim(1)
+        var combined = MLXArray.zeros([tokens, hiddenSize], dtype: .float32)
+        var start = [Int](repeating: 0, count: expertCount)
+        var position = [Int32](repeating: 0, count: routed.count)
+
+        for (b, batch) in batches.enumerated() {
+            let active = batch.sorted { (counts[$0], $0) < (counts[$1], $1) }
+            var order = [Int32]()
+            order.reserveCapacity(active.reduce(0) { $0 + counts[$1] })
+            for expert in active {
+                start[expert] = order.count
+                for slot in assignments[expert] {
+                    position[Int(slot)] = Int32(order.count)
+                    order.append(slot)
                 }
             }
-            var pieces = [MLXArray]()
-            var i = active.startIndex
-            while i < active.endIndex {
-                guard grouped else {
-                    pieces += perExpert(active[i ... i])
-                    i += 1
-                    continue
+
+            func project(
+                _ projection: QuantizedSwitchLinear, _ input: MLXArray, grouped: Bool
+            ) -> MLXArray {
+                let parts = projection.quantizedParts
+                let (width, outputs) = (input.dim(1), parts.weight.dim(1))
+                func rows(_ run: ArraySlice<Int>) -> MLXArray {
+                    let first = start[run.first!]
+                    return input[first ..< (first + run.reduce(0) { $0 + counts[$1] })]
                 }
-                let m = counts[active[i]]
-                let route = deepseekV4ReferencePrefillRoute(m: m, k: width, n: outputs)
-                var j = i + 1
-                while j < active.endIndex {
-                    let other = counts[active[j]]
-                    guard deepseekV4ReferencePrefillRoute(m: other, k: width, n: outputs) == route,
-                        route != .wide || other == m
-                    else { break }
+                func perExpert(_ run: ArraySlice<Int>) -> [MLXArray] {
+                    run.map { expert in
+                        let first = start[expert]
+                        return projectExpert(
+                            projection, input[first ..< (first + counts[expert])], expert: expert)
+                    }
+                }
+                var pieces = [MLXArray]()
+                var i = active.startIndex
+                while i < active.endIndex {
+                    guard grouped else {
+                        pieces += perExpert(active[i ... i])
+                        i += 1
+                        continue
+                    }
+                    let m = counts[active[i]]
+                    let route = deepseekV4ReferencePrefillRoute(m: m, k: width, n: outputs)
+                    var j = i + 1
+                    while j < active.endIndex {
+                        let other = counts[active[j]]
+                        guard deepseekV4ReferencePrefillRoute(m: other, k: width, n: outputs) == route,
+                            route != .wide || other == m
+                        else { break }
+                        j += 1
+                    }
+                    let run = active[i ..< j]
+                    switch route {
+                    case .wide:
+                        pieces.append(deepseekV4ReferencePrefillGroupedWide(
+                            rows(run), weight: parts.weight, scales: parts.scales,
+                            experts: run.map { Int32($0) }, m: m))
+                    case .plain where gather:
+                        if let out = deepseekV4PrefillGatherPlain(
+                            rows(run), weight: parts.weight, scales: parts.scales,
+                            experts: run.map { Int32($0) }, counts: run.map { counts[$0] })
+                        {
+                            pieces.append(out)
+                        } else {
+                            pieces += perExpert(run)
+                        }
+                    case .splitK(let splits) where gather:
+                        if let out = deepseekV4PrefillGatherSplitK(
+                            rows(run), weight: parts.weight, scales: parts.scales,
+                            experts: run.map { Int32($0) }, counts: run.map { counts[$0] },
+                            splits: splits)
+                        {
+                            pieces.append(out)
+                        } else {
+                            pieces += perExpert(run)
+                        }
+                    default:
+                        pieces += perExpert(run)
+                    }
+                    i = j
+                }
+                return pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0)
+            }
+
+            let routes = MLXArray(order)
+            let input = flat[routes.floorDivide(Int32(k))]
+            let routeWeights = routeWeightsFlat[routes]
+            var gate = project(gateProjection, input, grouped: grouped.gate).asType(.float32)
+            var up = project(upProjection, input, grouped: grouped.up).asType(.float32)
+            if swigluLimit > 0 {
+                gate = minimum(gate, swigluLimit)
+                up = clip(up, min: -swigluLimit, max: swigluLimit)
+            }
+            let hidden = (expandedDimensions(routeWeights, axis: -1)
+                * ((gate * sigmoid(gate)) * up)).asType(x.dtype)
+            let output = project(downProjection, hidden, grouped: grouped.down).asType(.float32)
+
+            // levels[j]: (token, row) of each token's j-th expert in this
+            // batch, tokens ascending.
+            var levels = [(tokens: [Int32], rows: [Int32])]()
+            for token in 0 ..< tokens {
+                var j = 0
+                for slot in tokenSlots[token] where batchOf[Int(routed[slot])] == b {
+                    if levels.count == j { levels.append(([], [])) }
+                    levels[j].tokens.append(Int32(token))
+                    levels[j].rows.append(position[slot])
                     j += 1
                 }
-                let run = active[i ..< j]
-                switch route {
-                case .wide:
-                    pieces.append(deepseekV4ReferencePrefillGroupedWide(
-                        rows(run), weight: parts.weight, scales: parts.scales,
-                        experts: run.map { Int32($0) }, m: m))
-                case .plain where gather:
-                    if let out = deepseekV4PrefillGatherPlain(
-                        rows(run), weight: parts.weight, scales: parts.scales,
-                        experts: run.map { Int32($0) }, counts: run.map { counts[$0] })
-                    {
-                        pieces.append(out)
-                    } else {
-                        pieces += perExpert(run)
-                    }
-                case .splitK(let splits) where gather:
-                    if let out = deepseekV4PrefillGatherSplitK(
-                        rows(run), weight: parts.weight, scales: parts.scales,
-                        experts: run.map { Int32($0) }, counts: run.map { counts[$0] },
-                        splits: splits)
-                    {
-                        pieces.append(out)
-                    } else {
-                        pieces += perExpert(run)
-                    }
-                default:
-                    pieces += perExpert(run)
-                }
-                i = j
             }
-            return pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0)
-        }
-
-        let flat = x.reshaped(tokens, x.dim(-1))
-        let routes = MLXArray(order)
-        let input = flat[routes.floorDivide(Int32(k))]
-        let routeWeights = weights.flattened()[routes]
-        var gate = project(gateProjection, input).asType(.float32)
-        var up = project(upProjection, input).asType(.float32)
-        if swigluLimit > 0 {
-            gate = minimum(gate, swigluLimit)
-            up = clip(up, min: -swigluLimit, max: swigluLimit)
-        }
-        let hidden = (expandedDimensions(routeWeights, axis: -1)
-            * ((gate * sigmoid(gate)) * up)).asType(x.dtype)
-        let output = project(downProjection, hidden).asType(.float32)
-        var combined = MLXArray.zeros([tokens, output.dim(-1)], dtype: .float32)
-        for rows in combineRows {
-            combined = combined + output[MLXArray(rows)]
+            for level in levels {
+                let values = output[MLXArray(level.rows)]
+                if level.tokens.count == tokens {
+                    // Every token, in order: the same single add per element.
+                    combined = combined + values
+                } else {
+                    combined = combined.at[MLXArray(level.tokens)].add(values)
+                }
+            }
         }
         return (combined.reshaped(x.shape) + sharedExperts(x).asType(.float32)).asType(x.dtype)
     }
+}
+
+/// Routed-row budget of one `quantizedPrefill` batch. 49,152 is one 8K-token
+/// chunk at k = 6, so that chunk stays a single batch, while the 32K serving
+/// chunk (196,608 rows) runs in about four batches and keeps about a quarter
+/// of the whole-chunk intermediates alive. Tests lower it to force splits.
+nonisolated(unsafe) var deepseekV4PrefillBatchRows = 49_152
+
+/// The active experts (`counts[e] > 0`) in ascending id, cut into
+/// consecutive batches of at most `budget` rows. An expert is never split; one
+/// with more than `budget` rows is a batch of its own.
+func deepseekV4PrefillExpertBatches(counts: [Int], budget: Int) -> [[Int]] {
+    var batches = [[Int]]()
+    var current = [Int]()
+    var rows = 0
+    for (expert, count) in counts.enumerated() where count > 0 {
+        if !current.isEmpty && rows + count > budget {
+            batches.append(current)
+            current = []
+            rows = 0
+        }
+        current.append(expert)
+        rows += count
+    }
+    if !current.isEmpty { batches.append(current) }
+    return batches
 }
 
 /// Evaluates prefill tiles one ahead. `submit` starts a tile on the GPU, then
 /// waits for the tile before it, so the CPU builds the next tile while the GPU
 /// runs this one. At most two tiles are in flight. No operation or input
 /// changes, so results are bit-identical to evaluating each tile in turn.
+/// Because two tiles are in flight, the tile workspace is bounded at twice
+/// the per-tile budget (`scoreWorkspaceBytes` / `keyWorkspaceBytes`, 512 MiB):
+/// 2 x 512 MiB, not 512 MiB.
 struct DeepseekV4TilePipeline {
     private var pending: MLXArray?
 

@@ -156,7 +156,7 @@ final class DeepseekV4GroupedPrefillTests: XCTestCase {
     }
 
     /// Grouped prefill vs the per-expert reference loop, bit for bit, at
-    /// 9, 64, 1024 and 8192 tokens, with the gather flag off and on. On the
+    /// 9, 64, 1024, 8192 and 32768 (the serving chunk, several batches) tokens, with the gather flag off and on. On the
     /// M3 Ultra this is the serving arithmetic. Elsewhere it runs twice: as
     /// served there (per-expert `quantizedMM`: layout, SwiGLU and combine
     /// order), and with the reference kernels forced on (grouped wide
@@ -180,7 +180,7 @@ final class DeepseekV4GroupedPrefillTests: XCTestCase {
     private func checkGroupedPrefill(
         _ moe: DeepseekV4MoE, config: DeepseekV4Configuration, k: Int, label: String
     ) throws {
-        for (n, tokens) in [9, 64, 1024, 8192].enumerated() {
+        for (n, tokens) in [9, 64, 1024, 8192, 32768].enumerated() {
             let routed = makeRouting(
                 tokens: tokens, experts: config.nRoutedExperts, k: k, seed: UInt64(17 + n))
             let indices = MLXArray(routed).reshaped(1, tokens, k)
@@ -210,7 +210,8 @@ final class DeepseekV4GroupedPrefillTests: XCTestCase {
         }
     }
 
-    /// One grouped wide launch per row count vs the per-expert wide kernel,
+    /// One grouped wide launch for several experts of one row count vs the
+    /// per-expert wide kernel,
     /// for both V4-Flash projection shapes and every wide row count. Off the
     /// M3 Ultra the kernels are forced on and compared on this GPU.
     func testGroupedWideMatchesPerExpertWide() throws {
@@ -247,7 +248,7 @@ final class DeepseekV4GroupedPrefillTests: XCTestCase {
     /// on the M3 Ultra and reported elsewhere.
     func testGatherMatchesPerExpertQuantizedMM() throws {
         guard Device.defaultDevice().deviceType == .gpu else { throw XCTSkip("GPU only") }
-        let rowCounts = [32, 33, 64, 100, 200, 512]
+        let rowCounts = [32, 33, 64, 65, 100, 128, 129, 200, 512, 1024, 2048, 4096]
         let architecture = GPU.deviceInfo().architecture
         var failures = [String]()
         for (n, k) in [(2048, 4096), (4096, 2048)] {
@@ -309,6 +310,128 @@ final class DeepseekV4GroupedPrefillTests: XCTestCase {
         } else {
             print("gather-vs-qmm arch=\(architecture) not asserted off the M3 Ultra; "
                 + "\(failures.count) row groups differ")
+        }
+    }
+
+    /// Grouped vs reference for one input, both gather settings, bitwise.
+    private func assertMatchesReference(
+        _ moe: DeepseekV4MoE, x: MLXArray, indices: MLXArray, weights: MLXArray, label: String
+    ) throws {
+        let reference = try XCTUnwrap(
+            moe.quantizedPrefillReference(x, indices: indices, weights: weights))
+        for gather in [false, true] {
+            deepseekV4PrefillGroupedGatherQMM = gather
+            let grouped = try XCTUnwrap(moe.quantizedPrefill(x, indices: indices, weights: weights))
+            let different = mismatches(grouped, reference)
+            print("grouped-prefill \(label) gather=\(gather) mismatches=\(different)/\(reference.size)")
+            XCTAssertEqual(different, 0, "\(label) gather=\(gather)")
+        }
+    }
+
+    /// A small tests-only batch budget splits the experts into many batches
+    /// (some experts alone, larger than the budget): each token's float32
+    /// combine chain must still match the reference bit for bit.
+    func testBatchedPrefillMatchesReferenceBitwise() throws {
+        guard Device.defaultDevice().deviceType == .gpu else { throw XCTSkip("GPU only") }
+        let (moe, config) = try makeMoE(seed: 2306)
+        let k = config.numExpertsPerTok
+        let saved = (
+            deepseekV4PrefillGroupedGatherQMM, deepseekV4ReferencePrefillOnAnyGPU,
+            deepseekV4PrefillBatchRows
+        )
+        defer {
+            deepseekV4PrefillGroupedGatherQMM = saved.0
+            deepseekV4ReferencePrefillOnAnyGPU = saved.1
+            deepseekV4PrefillBatchRows = saved.2
+        }
+        deepseekV4ReferencePrefillOnAnyGPU = true
+        let tokens = 1024
+        let routed = makeRouting(tokens: tokens, experts: config.nRoutedExperts, k: k, seed: 41)
+        var counts = [Int](repeating: 0, count: config.nRoutedExperts)
+        for e in routed { counts[Int(e)] += 1 }
+        let x = MLXRandom.normal([1, tokens, config.hiddenSize]).asType(.bfloat16)
+        let weights = MLXRandom.uniform(low: 0.05, high: 1.0, [1, tokens, k])
+        eval(x, weights)
+        for budget in [1500, 150] {
+            deepseekV4PrefillBatchRows = budget
+            let batches = deepseekV4PrefillExpertBatches(counts: counts, budget: budget)
+            XCTAssertGreaterThanOrEqual(batches.count, 3, "budget=\(budget)")
+            XCTAssertEqual(batches.flatMap { $0 }, counts.indices.filter { counts[$0] > 0 })
+            print("grouped-prefill budget=\(budget) batches=\(batches.count)")
+            try assertMatchesReference(
+                moe, x: x, indices: MLXArray(routed).reshaped(1, tokens, k), weights: weights,
+                label: "budget=\(budget)")
+        }
+    }
+
+    /// Packed verify input `[4, 5, H]` (20 tokens over four rows) vs the
+    /// reference, bitwise, as served here and with the kernels forced on.
+    func testPackedRowsPrefillMatchesReferenceBitwise() throws {
+        guard Device.defaultDevice().deviceType == .gpu else { throw XCTSkip("GPU only") }
+        let (moe, config) = try makeMoE(seed: 2307)
+        let k = config.numExpertsPerTok
+        let saved = (deepseekV4PrefillGroupedGatherQMM, deepseekV4ReferencePrefillOnAnyGPU)
+        defer {
+            deepseekV4PrefillGroupedGatherQMM = saved.0
+            deepseekV4ReferencePrefillOnAnyGPU = saved.1
+        }
+        let routed = makeRouting(tokens: 20, experts: config.nRoutedExperts, k: k, seed: 43)
+        let x = MLXRandom.normal([4, 5, config.hiddenSize]).asType(.bfloat16)
+        let weights = MLXRandom.uniform(low: 0.05, high: 1.0, [4, 5, k])
+        eval(x, weights)
+        for forced in isUltra ? [false] : [false, true] {
+            deepseekV4ReferencePrefillOnAnyGPU = forced
+            try assertMatchesReference(
+                moe, x: x, indices: MLXArray(routed).reshaped(4, 5, k), weights: weights,
+                label: "packed[4,5] forced=\(forced)")
+        }
+    }
+
+    /// Runs built to reach the sorted gathers must take them (non-nil), so
+    /// the grouped tests cannot pass through the per-expert fallback alone.
+    /// Each gathered row is checked bitwise against the per-expert reference
+    /// projection; asserted on the M3 Ultra, reported elsewhere.
+    func testGatherPathsTaken() throws {
+        guard Device.defaultDevice().deviceType == .gpu else { throw XCTSkip("GPU only") }
+        let saved = deepseekV4ReferencePrefillOnAnyGPU
+        defer { deepseekV4ReferencePrefillOnAnyGPU = saved }
+        deepseekV4ReferencePrefillOnAnyGPU = true
+        let (n, k) = (2048, 4096)
+        let (weight, scales) = randomMXFP4(experts: 256, n: n, k: k)
+        // .plain: > 256 rows per expert; >= 4 rows per stacked expert overall.
+        // .splitK: 40 and 50 rows; experts given out of id order.
+        for (experts, counts) in [([200, 7, 31], [300, 400, 500]), ([90, 12], [40, 50])] {
+            let total = counts.reduce(0, +)
+            let x = MLXRandom.normal([total, k]).asType(.bfloat16)
+            let route = deepseekV4ReferencePrefillRoute(m: counts[0], k: k, n: n)
+            XCTAssertTrue(counts.allSatisfy {
+                deepseekV4ReferencePrefillRoute(m: $0, k: k, n: n) == route
+            })
+            let gathered: MLXArray?
+            switch route {
+            case .plain:
+                gathered = deepseekV4PrefillGatherPlain(
+                    x, weight: weight, scales: scales, experts: experts.map { Int32($0) },
+                    counts: counts)
+            case .splitK(let splits):
+                gathered = deepseekV4PrefillGatherSplitK(
+                    x, weight: weight, scales: scales, experts: experts.map { Int32($0) },
+                    counts: counts, splits: splits)
+            default:
+                XCTFail("route \(route) for counts \(counts)")
+                continue
+            }
+            let output = try XCTUnwrap(gathered, "gather declined for \(route)")
+            var parts = [MLXArray]()
+            var start = 0
+            for (e, m) in zip(experts, counts) {
+                parts.append(try XCTUnwrap(deepseekV4ReferencePrefillQMM(
+                    x[start ..< (start + m)], weight: weight[e], scales: scales[e])))
+                start += m
+            }
+            let different = mismatches(output, concatenated(parts, axis: 0))
+            print("gather-taken route=\(route) counts=\(counts) mismatches=\(different)")
+            if isUltra { XCTAssertEqual(different, 0, "route=\(route)") }
         }
     }
 }
