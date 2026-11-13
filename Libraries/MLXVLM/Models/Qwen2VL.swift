@@ -139,7 +139,8 @@ private enum Language {
 
         public func callAsFunction(
             _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
-            positionIds: MLXArray? = nil
+            positionIds: MLXArray? = nil,
+            ropeOffset: Int? = nil
         ) -> MLXArray {
             let (B, L) = (x.dim(0), x.dim(1))
 
@@ -161,8 +162,10 @@ private enum Language {
                 queries = (queries * cos) + (QwenVL.rotateHalf(queries) * sin)
                 keys = (keys * cos) + (QwenVL.rotateHalf(keys) * sin)
             } else {
-                // Simple sequential RoPE (no-image / text-only path)
-                let offset = cache?.offset ?? 0
+                // Text, and post-vision decode whose three M-RoPE axes share one
+                // position. `ropeOffset` is that position; otherwise it is the
+                // cache offset.
+                let offset = ropeOffset ?? cache?.offset ?? 0
                 queries = rotaryEmbedding(queries, offset: offset)
                 keys = rotaryEmbedding(keys, offset: offset)
             }
@@ -218,10 +221,13 @@ private enum Language {
 
         public func callAsFunction(
             _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
-            positionIds: MLXArray? = nil
+            positionIds: MLXArray? = nil,
+            ropeOffset: Int? = nil
         ) -> MLXArray {
             // #239: Qwen25VL.swift Qwen25VLDecoderLayer.callAsFunction (:208) — thread positionIds
-            var r = attention(inputLayerNorm(x), mask: mask, cache: cache, positionIds: positionIds)
+            var r = attention(
+                inputLayerNorm(x), mask: mask, cache: cache, positionIds: positionIds,
+                ropeOffset: ropeOffset)
             let h = x + r
             r = mlp(postAttentionLayerNorm(h))
             let out = h + r
@@ -251,7 +257,8 @@ private enum Language {
 
         public func callAsFunction(
             _ inputs: MLXArray?, cache: [KVCache]? = nil, inputEmbedding: MLXArray? = nil,
-            positionIds: MLXArray? = nil
+            positionIds: MLXArray? = nil,
+            ropeOffset: Int? = nil
         ) -> MLXArray {
             var h: MLXArray
             if let inputEmbedding {
@@ -266,7 +273,8 @@ private enum Language {
 
             // #239: Qwen25VL.swift Qwen25Model.callAsFunction (:240) — thread positionIds
             for (i, layer) in layers.enumerated() {
-                h = layer(h, mask: mask, cache: cache?[i], positionIds: positionIds)
+                h = layer(
+                    h, mask: mask, cache: cache?[i], positionIds: positionIds, ropeOffset: ropeOffset)
             }
 
             return norm(h)
@@ -278,6 +286,10 @@ private enum Language {
         @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
         var kvHeads: [Int]
+        /// Non-traditional RoPE matches `mropeCosSin` when the three axes share
+        /// one position. Traditional RoPE does not, so that decode stays on the
+        /// position-id path.
+        private let fusedRopeDecode: Bool
 
         public init(_ args: Qwen2VLConfiguration.TextConfiguration) {
             self.model = Qwen2Model(args)
@@ -287,6 +299,7 @@ private enum Language {
             }
 
             self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
+            self.fusedRopeDecode = !args.ropeTraditional
         }
 
         public func callAsFunction(
@@ -303,6 +316,9 @@ private enum Language {
             }
 
             // Decode steps: reconstruct positions from ropeDeltas + cache offset.
+            // One shared delta is ordinary RoPE at that position. `mropeCosSin`
+            // rebuilds the same cos/sin in every layer on every token.
+            var ropeOffset: Int?
             if effectivePositionIds == nil, let ropeDeltas = state[ropeDeltasKey],
                 let cache, let input = inputs ?? inputEmbedding
             {
@@ -310,25 +326,30 @@ private enum Language {
                 let seqLength = input.dim(1)
                 let lastCacheOffset = cache.last?.offset ?? 0
 
-                var delta = MLXArray(lastCacheOffset).asType(.int32) + ropeDeltas.asType(.int32)
+                if fusedRopeDecode, ropeDeltas.size == 1 {
+                    let delta = ropeDeltas.asType(.int32).item(Int.self)
+                    ropeOffset = lastCacheOffset + delta
+                } else {
+                    var delta = MLXArray(lastCacheOffset).asType(.int32) + ropeDeltas.asType(.int32)
 
-                var base = MLXArray(0 ..< seqLength).asType(.int32)
-                base = base[.newAxis, 0...]
-                base = broadcast(base, to: [batch, seqLength])
+                    var base = MLXArray(0 ..< seqLength).asType(.int32)
+                    base = base[.newAxis, 0...]
+                    base = broadcast(base, to: [batch, seqLength])
 
-                if delta.dim(0) == 1 && batch > 1 {
-                    delta = repeated(delta, count: batch, axis: 0)
+                    if delta.dim(0) == 1 && batch > 1 {
+                        delta = repeated(delta, count: batch, axis: 0)
+                    }
+
+                    base = base + delta
+
+                    effectivePositionIds = base[.newAxis, 0..., 0...]
+                    effectivePositionIds = broadcast(effectivePositionIds!, to: [3, batch, seqLength])
                 }
-
-                base = base + delta
-
-                effectivePositionIds = base[.newAxis, 0..., 0...]
-                effectivePositionIds = broadcast(effectivePositionIds!, to: [3, batch, seqLength])
             }
 
             var out = model(
                 inputs, cache: cache, inputEmbedding: inputEmbedding,
-                positionIds: effectivePositionIds)
+                positionIds: effectivePositionIds, ropeOffset: ropeOffset)
             if let lmHead {
                 out = lmHead(out)
             } else {

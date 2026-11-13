@@ -179,6 +179,51 @@ final class Qwen25VLContinuationTests: XCTestCase {
         try continuation.assertWindowedTextPrefill(makeTinyQwen2VL())
     }
 
+    /// Post-vision decode uses fused RoPE at cacheOffset + delta. That must
+    /// match the one-token continuation, which still applies M-RoPE position ids.
+    func testQwen2VLImageTokenDecodeMatchesPositionIds() throws {
+        let model = try makeTinyQwen2VL()
+        try withRandomState(MLXRandom.RandomState(seed: 5)) {
+            let image = continuation.image()
+            let prefix = concatenated(
+                [
+                    continuation.textTokens(10), continuation.imageRun(),
+                    continuation.textTokens(8, seed: 5),
+                ], axis: 1)
+            let next = continuation.textTokens(1, seed: 9)
+
+            let cacheM = try model.newCache(parameters: nil)
+            let prepared = try model.prepare(
+                LMInput(text: .init(tokens: prefix), image: image),
+                cache: cacheM, state: nil, prefill: PrefillParameters())
+            guard case .logits(let prefixOut) = prepared else {
+                XCTFail("expected logits")
+                return
+            }
+            let continued = try model.prepare(
+                LMInput(text: .init(tokens: next)),
+                cache: cacheM, state: prefixOut.state, prefill: PrefillParameters())
+            guard case .logits(let positionOut) = continued else {
+                XCTFail("expected logits")
+                return
+            }
+
+            let cacheF = try model.newCache(parameters: nil)
+            _ = try model.prepare(
+                LMInput(text: .init(tokens: prefix), image: image),
+                cache: cacheF, state: nil, prefill: PrefillParameters())
+            let fused = try model.tokenOnlyForward(next, cache: cacheF)
+
+            let positionLogits = positionOut.logits[0..., -1, 0...]
+            let fusedLogits = fused[0..., -1, 0...]
+            eval(positionLogits, fusedLogits)
+            let diff = abs(positionLogits - fusedLogits).max().item(Float.self)
+            XCTAssertLessThanOrEqual(
+                diff, MatmulPrecision.splitTolerance,
+                "fused post-vision decode diverged from M-RoPE position ids by \(diff)")
+        }
+    }
+
     /// macprovider #2201: a token-only forward (text prompt, no image) trapped in
     /// the `LanguageModel` default. It must run and match the text-input forward
     /// for a prefill and the decode step after it.
