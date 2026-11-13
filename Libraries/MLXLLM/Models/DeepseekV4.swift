@@ -861,7 +861,12 @@ final class DeepseekV4MoE: Module {
                 biases: parts.biases.map { $0[expert] }, transpose: true,
                 groupSize: projection.groupSize, bits: projection.bits, mode: projection.mode)
         }
+        // Start each group of experts on the GPU while the CPU builds the
+        // next group. The expert order and every operation are unchanged.
+        var built = 0
         for (expert, slots) in assignments.enumerated() where !slots.isEmpty {
+            if built > 0, built % 16 == 0 { asyncEval(combined) }
+            built += 1
             let routes = MLXArray(slots)
             let rows = routes.floorDivide(Int32(k))
             let input = flat[rows]
@@ -877,6 +882,20 @@ final class DeepseekV4MoE: Module {
             combined = combined.at[rows].add(output)
         }
         return (combined.reshaped(x.shape) + sharedExperts(x).asType(.float32)).asType(x.dtype)
+    }
+}
+
+/// Evaluates prefill tiles one ahead. `submit` starts a tile on the GPU, then
+/// waits for the tile before it, so the CPU builds the next tile while the GPU
+/// runs this one. At most two tiles are in flight. No operation or input
+/// changes, so results are bit-identical to evaluating each tile in turn.
+struct DeepseekV4TilePipeline {
+    private var pending: MLXArray?
+
+    mutating func submit(_ part: MLXArray) {
+        asyncEval(part)
+        if let pending { eval(pending) }
+        pending = part
     }
 }
 
@@ -1196,12 +1215,13 @@ final class DeepseekV4Indexer: Module {
         let tile = max(1, scoreWorkspaceBytes / max(1, B * heads * poolCount * 4))
         guard L > tile else { return exactTopK(q, weights, poolMask) }
         var parts = [MLXArray]()
+        var pipeline = DeepseekV4TilePipeline()
         for start in stride(from: 0, to: L, by: tile) {
             let end = min(start + tile, L)
             let part = exactTopK(
                 q[0..., 0..., start ..< end], weights[0..., start ..< end],
                 poolMask.map { $0[start ..< end] })
-            eval(part)
+            pipeline.submit(part)
             parts.append(part)
         }
         return concatenated(parts, axis: 1)
@@ -1270,6 +1290,7 @@ final class DeepseekV4Indexer: Module {
         let within = MLXArray.arange(block, dtype: .int32)
         let tile = 512
         var parts = [MLXArray]()
+        var pipeline = DeepseekV4TilePipeline()
         for start in stride(from: 0, to: L, by: tile) {
             let end = min(start + tile, L)
             let n = end - start
@@ -1284,7 +1305,7 @@ final class DeepseekV4Indexer: Module {
             var score = (fine * expandedDimensions(wk[0..., start ..< end], axis: -1)).sum(axis: 2)
             score = MLX.where(
                 positions .< expandedDimensions(visible[0..., start ..< end], axis: -1), score, masked)
-            if tile < L { eval(score) }
+            if tile < L { pipeline.submit(score) }
             parts.append(score)
         }
         let fineScore = parts.count == 1 ? parts[0] : concatenated(parts, axis: 1)
@@ -1795,6 +1816,7 @@ final class DeepseekV4Attention: Module {
         let K = window + (list?.indices.dim(2) ?? 0)
         let tile = max(1, min(L, keyWorkspaceBytes / max(1, B * K * headDim * 4)))
         var parts = [MLXArray]()
+        var pipeline = DeepseekV4TilePipeline()
         for start in stride(from: 0, to: L, by: tile) {
             let end = min(start + tile, L)
             let n = end - start
@@ -1820,7 +1842,7 @@ final class DeepseekV4Attention: Module {
                 q[0..., 0..., start ..< end], keys: stacked(keys, axis: 0),
                 valid: stacked(valid, axis: 0), allowDecode: L <= 8
             ).asType(q.dtype)
-            if tile < L { eval(part) }
+            if tile < L { pipeline.submit(part) }
             parts.append(part)
         }
         return parts.count == 1 ? parts[0] : concatenated(parts, axis: 2)
