@@ -61,11 +61,13 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        // macprovider: mlx-swift 0.32.3-macprovider.19. Core d66d6762c sends
-        // qualifying small-M affine products of 1 to 16 rows (more where the
-        // qmm route starts later) to the per-row qmv kernel, so a
-        // continuously batched row matches its serial result and one row
-        // decodes on upstream's kernel; qmv_mma is no longer dispatched.
+        // macprovider: mlx-swift 0.32.3-macprovider.20. Core 087663073 sends 1
+        // and 2 rows of a qualifying small-M affine product to qmv_mma1, a
+        // single-row kernel with qmv_mma's exact reduction order, and 3 rows up
+        // to the qmm route (at least 16) to qmv_mma. The two kernels give the
+        // same bits for a row by construction (checked on M5 and M3 Ultra GPUs,
+        // not on M1, M2 or M4), so a continuously batched row matches its
+        // serial result.
         // Core 26ac61533 sends small-M affine products whose K is not a
         // multiple of 128 (gpt-oss, K = 2880) to qmv_wide for every row count
         // on gen 15 and 16 GPUs, one row included; other shapes and gen 17
@@ -73,7 +75,7 @@ let package = Package(
         // qmm_splitk stays off. The core also
         // erases a freed compiled function from every thread's cache and keeps
         // every internal op on the caller's stream.
-        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "f3da859cd6f35bdaff2267b2b1ded2d58cba2cc8"),
+        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "c51c98a33198ddc9e8f507f55dfbc04f87dd273d"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
