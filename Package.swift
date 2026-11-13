@@ -61,9 +61,16 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        // macprovider: mlx-swift 0.32.3-macprovider.18. Core 565070fe4 routes
-        // qualifying small-M affine products through qmv_mma for every row
-        // count, so a continuously batched row matches its serial result.
+        // macprovider: mlx-swift 0.32.3-macprovider.21. Core 1828e2f80 sends 1
+        // and 2 rows of a qualifying small-M affine product to qmv_mma1, a
+        // single-row kernel with qmv_mma's exact reduction order, and 3 rows up
+        // to the qmm route (at least 16) to qmv_mma. The two kernels give the
+        // same bits for a row by construction (checked on M5 and M3 Ultra GPUs,
+        // not on M1, M2 or M4), so a continuously batched row matches its
+        // serial result. A process may set MLX_METAL_SMALL_M_ROW_INVARIANT=0
+        // before its first quantized product to skip that window and take
+        // the per-row qmv / qmm route (faster at one row, no batch
+        // invariance); the default keeps the window.
         // Core 26ac61533 sends small-M affine products whose K is not a
         // multiple of 128 (gpt-oss, K = 2880) to qmv_wide for every row count
         // on gen 15 and 16 GPUs, one row included; other shapes and gen 17
@@ -71,7 +78,7 @@ let package = Package(
         // qmm_splitk stays off. The core also
         // erases a freed compiled function from every thread's cache and keeps
         // every internal op on the caller's stream.
-        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "8f0ac45bc7483b59b1776a8405fa13944e559e06"),
+        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "477b8362667b370c9ac7323223ffddc93dc87557"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
