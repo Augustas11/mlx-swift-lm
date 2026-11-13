@@ -216,10 +216,11 @@ func deepseekV4ReferencePrefillGroupedWide(
 
 /// Serve the `.plain` and `.splitK` routes of a whole run of experts with
 /// MLX's sorted gather_qmm_rhs instead of one `quantizedMM` per expert (and
-/// per K slice). Off until the gather is proven bit-identical to per-expert
-/// `quantizedMM` on the serving GPU
-/// (`DeepseekV4GroupedPrefillTests.testGatherMatchesPerExpertQuantizedMM`).
-nonisolated(unsafe) var deepseekV4PrefillGroupedGatherQMM = false
+/// per K slice). On: the M3 Ultra (applegpu_g15d) run of
+/// `DeepseekV4GroupedPrefillTests` showed it bit-identical to per-expert
+/// `quantizedMM` at 9, 64, 1K and 8K tokens. Setting it false restores the
+/// per-expert products inside the grouped path.
+nonisolated(unsafe) var deepseekV4PrefillGroupedGatherQMM = true
 
 /// MLX takes gather_qmm_rhs only for one-row batches, at least 16 rows and
 /// at least four rows per stacked expert; anything else would be qmv.
