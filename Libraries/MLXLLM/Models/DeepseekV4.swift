@@ -1127,6 +1127,16 @@ func deepseekV4PrefillExpertBatches(counts: [Int], budget: Int) -> [[Int]] {
 /// Because two tiles are in flight, the tile workspace is bounded at twice
 /// the per-tile budget (`scoreWorkspaceBytes` / `keyWorkspaceBytes`, 512 MiB):
 /// 2 x 512 MiB, not 512 MiB.
+///
+/// `deepseekV4PrefillShouldPause` / `deepseekV4PrefillPause` let a continuous
+/// batch run other rows' decode between tiles without changing this forward.
+/// `shouldPause` is asked once per tile and, when false, the pipeline is the
+/// one above. When true, the in-flight tile is evaluated first (same ops, just
+/// not left queued), then `pause` runs. The hooks are cleared around `pause`
+/// so a decode forward cannot re-enter them. Nil hooks are the default.
+public nonisolated(unsafe) var deepseekV4PrefillShouldPause: (@Sendable () -> Bool)?
+public nonisolated(unsafe) var deepseekV4PrefillPause: (@Sendable () -> Void)?
+
 struct DeepseekV4TilePipeline {
     private var pending: MLXArray?
 
@@ -1134,6 +1144,15 @@ struct DeepseekV4TilePipeline {
         asyncEval(part)
         if let pending { eval(pending) }
         pending = part
+        guard let shouldPause = deepseekV4PrefillShouldPause, shouldPause() else { return }
+        let pause = deepseekV4PrefillPause
+        deepseekV4PrefillShouldPause = nil
+        deepseekV4PrefillPause = nil
+        eval(part)
+        pending = nil
+        pause?()
+        deepseekV4PrefillPause = pause
+        deepseekV4PrefillShouldPause = shouldPause
     }
 }
 
