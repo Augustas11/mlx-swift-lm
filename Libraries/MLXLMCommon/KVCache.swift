@@ -224,6 +224,8 @@ open class BaseKVCache: KVCache {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
 
+    public init() {}
+
     /// RoPE offset for this cache. `open` so subclasses can return a non-scalar
     /// offset (e.g. a batched cache's per-row `.batch(...)`).
     open var ropeOffset: RoPEOffset { .scalar(offset) }
