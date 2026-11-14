@@ -35,6 +35,16 @@ public protocol MiniMaxM3BatchedSparseCache: KVCache {
     /// rows), or `nil` when every column of every row is valid. A padded
     /// column attends nothing and writes no cache.
     var rowLengths: [Int]? { get }
+
+    /// Speculative verification: each row's valid columns attend as
+    /// consecutive one-token steps (cache update, block selection and
+    /// attention per column), exactly as ordinary decode of those tokens.
+    /// Projections, norms and experts still run on every column at once.
+    var attendsColumnwise: Bool { get }
+}
+
+extension MiniMaxM3BatchedSparseCache {
+    public var attendsColumnwise: Bool { false }
 }
 
 /// `MiniMaxM3BatchedSparseCache` over existing per-sequence caches. The rows

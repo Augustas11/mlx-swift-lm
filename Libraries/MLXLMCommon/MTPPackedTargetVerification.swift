@@ -368,6 +368,25 @@ public struct MTPPackedVerificationRowState {
 
     /// Row-sliced target position deltas, when the model emitted them.
     public let positionDeltas: MLXArray?
+
+    /// A row state built by a scheduler from the facade's per-row output,
+    /// for drafters that read only target hidden states (DSpark-style
+    /// context drafters keep their own context K/V and need no shared K/V).
+    public init(
+        lastHidden: MLXArray,
+        sharedKV: [String: (MLXArray, MLXArray)] = [:],
+        sharedKVSourceIndices: [String: Int] = [:],
+        sharedKVOffsets: [String: Int] = [:],
+        queryOffset: Int,
+        positionDeltas: MLXArray? = nil
+    ) {
+        self.lastHidden = lastHidden
+        self.sharedKV = sharedKV
+        self.sharedKVSourceIndices = sharedKVSourceIndices
+        self.sharedKVOffsets = sharedKVOffsets
+        self.queryOffset = queryOffset
+        self.positionDeltas = positionDeltas
+    }
 }
 
 /// Validation failures from ``verifyMTPPackedTargets(model:tokens:rowMaps:cache:)``.

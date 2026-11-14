@@ -1317,11 +1317,29 @@ final class MiniMaxM3Attention: Module {
                 if B == 1 && n == L { return a }
                 return n == L ? a[index ..< (index + 1)] : a[index ..< (index + 1), ..<n]
             }
-            // A lone forward of the row: no mask for one token, causal past it.
-            let out = attend(
-                q: row(q), k: row(k), v: row(v), indexK: indexKeys.map(row),
-                indexQ: selecting[index] ? indexQueries.map(row) : nil,
-                mask: n == 1 ? .none : .causal, cache: rowCache)
+            let out: MLXArray
+            if batch.attendsColumnwise && n > 1 {
+                // Verification: column j attends as the one-token decode of
+                // that token would, against the cache its predecessors wrote.
+                var columns = [MLXArray]()
+                for j in 0 ..< n {
+                    func column(_ a: MLXArray) -> MLXArray { a[index ..< (index + 1), j ..< (j + 1)] }
+                    let columnSelecting = rowCache.offset + 1 > blockSize * topkBlocks
+                    columns.append(
+                        attend(
+                            q: column(q), k: column(k), v: column(v),
+                            indexK: indexKeys.map(column),
+                            indexQ: columnSelecting ? indexQueries.map(column) : nil,
+                            mask: .none, cache: rowCache))
+                }
+                out = concatenated(columns, axis: 1)
+            } else {
+                // A lone forward of the row: no mask for one token, causal past it.
+                out = attend(
+                    q: row(q), k: row(k), v: row(v), indexK: indexKeys.map(row),
+                    indexQ: selecting[index] ? indexQueries.map(row) : nil,
+                    mask: n == 1 ? .none : .causal, cache: rowCache)
+            }
             if n < L {
                 // Padded columns attend nothing and wrote no cache.
                 let padding = MLXArray.zeros([1, L - n, out.dim(2)], dtype: out.dtype)
@@ -1515,6 +1533,24 @@ public final class MiniMaxM3ModelInner: Module {
         }
         return norm(h)
     }
+
+    /// The same forward, also returning the residual stream after each layer
+    /// in `layerIDs` (in that order). The last layer's capture is its raw
+    /// residual output, before the final norm, as the DSpark drafter was
+    /// trained on (SGLang/vLLM capture the updated residual there too).
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?, capturing layerIDs: [Int])
+        -> (normalized: MLXArray, captured: [MLXArray])
+    {
+        var h = embedTokens(inputs)
+        let mask = createAttentionMask(h: h, cache: cache?.first)
+        var captured = [Int: MLXArray]()
+        let wanted = Set(layerIDs)
+        for (i, layer) in layers.enumerated() {
+            h = layer(h, mask: mask, cache: cache?[i])
+            if wanted.contains(i) { captured[i] = h }
+        }
+        return (norm(h), layerIDs.map { captured[$0]! })
+    }
 }
 
 /// `minimax_m3` checkpoints: `model.*` and `lm_head.*`.
@@ -1536,12 +1572,37 @@ public final class MiniMaxM3TextModel: Module, LLMModel {
         super.init()
     }
 
+    /// Target layers whose residual outputs a paired DSpark drafter reads
+    /// (`dspark_target_layer_ids` of the drafter checkpoint). Empty: the
+    /// model emits no drafter state.
+    public var dsparkTargetLayerIDs: [Int] = []
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let out = model(inputs, cache: cache)
+        logits(model(inputs, cache: cache))
+    }
+
+    func logits(_ normalized: MLXArray) -> MLXArray {
         if let lmHead {
-            return lmHead(out)
+            return lmHead(normalized)
         }
-        return model.embedTokens.asLinear(out)
+        return model.embedTokens.asLinear(normalized)
+    }
+
+    /// With `mtpEmitFlagKey` set and DSpark target layers configured, the
+    /// concatenated residual outputs of those layers
+    /// (`mtpLastHiddenStatesKey`, `[B, L, layers x hidden]`). The logits are
+    /// the ordinary forward's: capturing reads the residual stream only.
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        guard state?[mtpEmitFlagKey] ?? false, !dsparkTargetLayerIDs.isEmpty else {
+            return LMOutput(logits: self(input.tokens, cache: cache))
+        }
+        let (normalized, captured) = model(
+            input.tokens, cache: cache, capturing: dsparkTargetLayerIDs)
+        var outState = state ?? LMOutput.State()
+        outState[mtpLastHiddenStatesKey] = concatenated(captured, axis: -1)
+        return LMOutput(logits: logits(normalized), state: outState)
     }
 
     /// Cache every Gemma norm's `1 + weight` and fuse each layer's gate and
@@ -1595,6 +1656,18 @@ public final class MiniMaxM3Model: Module, LLMModel {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)
+    }
+
+    /// See ``MiniMaxM3TextModel/dsparkTargetLayerIDs``.
+    public var dsparkTargetLayerIDs: [Int] {
+        get { languageModel.dsparkTargetLayerIDs }
+        set { languageModel.dsparkTargetLayerIDs = newValue }
+    }
+
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        languageModel(input, cache: cache, state: state)
     }
 
     public func prepare() throws {
