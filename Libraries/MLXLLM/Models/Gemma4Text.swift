@@ -355,6 +355,21 @@ private class Gemma4Attention: Module {
                     queries: queries, keys: k, values: v, scale: scale, mask: mask ?? .none)
                 let output = attended.transposed(0, 2, 1, 3).reshaped(B, L, -1)
                 return (oProj(output), .regular(keys: k, values: v), activePositionOffset)
+            } else if let attentionCache = cache as? KVCacheAttentionReturningStateProtocol,
+                !(cache is QuantizedKVCacheProtocol)
+            {
+                // A layer whose K/V a later layer or the drafter reads still
+                // attends through the cache, so it takes the same attention
+                // route as every other layer, and hands on the full K/V.
+                queries = queries.transposed(0, 2, 1, 3)
+                queries = applyRotaryPosition(rope, to: queries, offset: activePositionOffset)
+                let attended = attentionCache.updateAndAttendReturningState(
+                    queries: queries, keys: k, values: v, scale: scale, mask: mask ?? .none)
+                let output = attended.output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+                return (
+                    oProj(output), .regular(keys: attended.keys, values: attended.values),
+                    activePositionOffset
+                )
             } else if let quantizedCache = cache as? QuantizedKVCacheProtocol {
                 let (quantizedKeys, quantizedValues) = quantizedCache.updateQuantized(
                     keys: k, values: v)
