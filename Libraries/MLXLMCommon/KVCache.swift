@@ -219,6 +219,20 @@ public protocol KVCacheSinkAttentionProtocol: KVCacheAttentionProtocol {
     ) -> MLXArray
 }
 
+/// A ``KVCacheAttentionProtocol`` cache that can also return the K/V a plain
+/// `update(keys:values:)` would have returned. A layer whose K/V a later layer
+/// or an MTP drafter reads uses it to attend through the cache like every
+/// other layer while still handing that K/V on.
+public protocol KVCacheAttentionReturningStateProtocol: KVCacheAttentionProtocol {
+    func updateAndAttendReturningState(
+        queries: MLXArray,
+        keys: MLXArray,
+        values: MLXArray,
+        scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> (output: MLXArray, keys: MLXArray, values: MLXArray)
+}
+
 /// Base cache implementation providing default behaviors
 open class BaseKVCache: KVCache {
     public var offset: Int = 0
