@@ -78,7 +78,7 @@ let package = Package(
         // qmm_splitk stays off. The core also
         // erases a freed compiled function from every thread's cache and keeps
         // every internal op on the caller's stream.
-        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "a7d6fa39c427b93fda68c851348ff2bbd9aeea1a"),
+        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "7fbcada97b58ddafab567121da63b959b8d092e3"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
