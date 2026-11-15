@@ -1629,16 +1629,35 @@ public final class MiniMaxM3TextModel: Module, LLMModel, AdditionalWeightFilesPr
             weights = weights.filter { !$0.key.hasPrefix("lm_head.") }
         }
         // The direction file's one tensor lands on every ablated layer. A
-        // missing tensor leaves those keys unset, which the loader rejects.
+        // missing, colliding or invalid tensor leaves those keys unset (still
+        // NaN), which the loader's `verify: .all` rejects.
         if let ablation = configuration.refusalAblation,
-            let direction = weights.removeValue(forKey: ablation.directionKey)
+            !refusalDirectionKeyCollides(ablation.directionKey),
+            let direction = weights.removeValue(forKey: ablation.directionKey),
+            let direction = validRefusalDirection(direction)
         {
-            let direction = direction.asType(.float32)
             for layer in 0 ..< configuration.hiddenLayers where ablation.covers(layer: layer) {
                 weights["model.layers.\(layer).refusal_direction"] = direction
             }
         }
         return weights
+    }
+
+    /// Whether `key` names one of the model's own parameters: a direction
+    /// stored there would replace (or be replaced by) a base weight.
+    func refusalDirectionKeyCollides(_ key: String) -> Bool {
+        parameters().flattened().contains { $0.0 == key }
+    }
+
+    /// `direction` as float32 when it is a finite `[hidden_size]` unit
+    /// vector (|norm - 1| <= 1e-3), else `nil`.
+    func validRefusalDirection(_ direction: MLXArray) -> MLXArray? {
+        guard direction.shape == [configuration.hiddenSize] else { return nil }
+        let direction = direction.asType(.float32)
+        let finite = all(isFinite(direction)).item(Bool.self)
+        let norm = sqrt((direction * direction).sum()).item(Float.self)
+        guard finite, abs(norm - 1) <= 1e-3 else { return nil }
+        return direction
     }
 
     public var loraLayers: [Module] { model.layers }
@@ -1673,7 +1692,21 @@ public final class MiniMaxM3Model: Module, LLMModel, AdditionalWeightFilesProvid
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var text = [String: MLXArray]()
-        let directionKey = languageModel.configuration.refusalAblation?.directionKey
+        // A direction key that names a base weight (in either key spelling)
+        // is not treated as the direction; the text model then finds no
+        // direction and the ablated layers fail the load.
+        var directionKey = languageModel.configuration.refusalAblation?.directionKey
+        if let key = directionKey {
+            var normalized = key
+            if normalized.hasPrefix("model.language_model.") {
+                normalized = "language_model." + normalized.dropFirst("model.language_model.".count)
+            }
+            if parameters().flattened().contains(where: { $0.0 == normalized })
+                || languageModel.refusalDirectionKeyCollides(key)
+            {
+                directionKey = nil
+            }
+        }
         for (key, value) in weights {
             if key == directionKey {
                 text[key] = value
@@ -2048,8 +2081,9 @@ extension MiniMaxM3Configuration: ModelConfigurationValidating {
                 throw fail(
                     "MiniMax M3 refusal_ablation.layers must be [lo, hi] with 0 <= lo <= hi < \(hiddenLayers), got \(ablation.layers)")
             }
-            guard ablation.alpha.isFinite else {
-                throw fail("MiniMax M3 refusal_ablation.alpha must be finite")
+            guard ablation.alpha.isFinite, ablation.alpha > 0, ablation.alpha <= 4 else {
+                throw fail(
+                    "MiniMax M3 refusal_ablation.alpha must be finite with 0 < alpha <= 4, got \(ablation.alpha)")
             }
             let file = ablation.directionFile
             guard file.hasSuffix(".safetensors"), !file.contains("/"), !file.hasPrefix(".") else {

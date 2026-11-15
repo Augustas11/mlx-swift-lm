@@ -1119,11 +1119,23 @@ final class MiniMaxM3Tests: XCTestCase {
             #"{"layers": [0, 1], "alpha": 1.5, "direction_file": "../x.safetensors"}"#,
             #"{"layers": [0, 1], "alpha": 1.5, "direction_file": "direction.npy"}"#,
             #"{"layers": [0, 1], "alpha": 1.5, "direction_key": ""}"#,
+            #"{"layers": [0, 1], "alpha": 0}"#,
+            #"{"layers": [0, 1], "alpha": -1}"#,
+            #"{"layers": [0, 1], "alpha": 5}"#,
+            #"{"layers": [0, 1], "alpha": 4.0001}"#,
         ] {
             let config = try ablatedConfiguration(ablation)
             XCTAssertThrowsError(try config.validateModelConfiguration(), ablation)
         }
         XCTAssertThrowsError(try ablatedConfiguration(#"{"layers": [0, 1]}"#), "alpha required")
+        // JSON has no NaN literal; the decoded value is what validation sees.
+        var nan = try ablatedConfiguration()
+        nan.refusalAblation?.alpha = .nan
+        XCTAssertThrowsError(try nan.validateModelConfiguration(), "alpha NaN")
+        var infinite = try ablatedConfiguration()
+        infinite.refusalAblation?.alpha = .infinity
+        XCTAssertThrowsError(try infinite.validateModelConfiguration(), "alpha inf")
+        try ablatedConfiguration(#"{"layers": [0, 1], "alpha": 4}"#).validateModelConfiguration()
     }
 
     /// The direction loads from its own file onto every ablated layer (text
@@ -1167,6 +1179,18 @@ final class MiniMaxM3Tests: XCTestCase {
             try save(arrays: ["other": unitDirection()], url: file)
             XCTAssertThrowsError(try load(), "wrong direction key, nested \(nested)")
 
+            var withNaN = unitDirection().asArray(Float.self)
+            withNaN[3] = .nan
+            for (name, bad) in [
+                ("zero", MLXArray.zeros([64])),
+                ("norm 2", 2 * unitDirection()),
+                ("shape [1, 64]", unitDirection().reshaped(1, 64)),
+                ("NaN entry", MLXArray(withNaN)),
+            ] {
+                try save(arrays: ["refusal_direction": bad], url: file)
+                XCTAssertThrowsError(try load(), "\(name) direction, nested \(nested)")
+            }
+
             let r = unitDirection()
             try save(arrays: ["refusal_direction": r], url: file)
             for (index, layer) in try load().model.layers.enumerated() {
@@ -1179,5 +1203,98 @@ final class MiniMaxM3Tests: XCTestCase {
                 }
             }
         }
+    }
+
+    /// A direction key naming a base weight is never taken as the direction:
+    /// the base weight stays and the ablated layers fail the load.
+    func testRefusalDirectionKeyCollidingWithBaseWeightFailsLoad() throws {
+        let cases: [(nested: Bool, key: String)] = [
+            (false, "model.norm.weight"),
+            (false, "model.layers.0.refusal_direction"),
+            (true, "language_model.model.norm.weight"),
+            (true, "model.language_model.model.norm.weight"),
+            (true, "model.norm.weight"),
+        ]
+        for (nested, key) in cases {
+            let directory = URL(filePath: NSTemporaryDirectory())
+                .appending(component: "minimax-m3-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let plain: Module =
+                nested
+                ? MiniMaxM3Model(try configuration(nested: true))
+                : MiniMaxM3TextModel(try configuration())
+            randomize(plain)
+            try save(
+                arrays: Dictionary(uniqueKeysWithValues: plain.parameters().flattened()),
+                url: directory.appending(component: "model.safetensors"))
+            try save(
+                arrays: [key: unitDirection()],
+                url: directory.appending(component: "refusal_direction.safetensors"))
+            let config = try ablatedConfiguration(
+                #"{"layers": [0, 1], "alpha": 1.5, "direction_key": "\#(key)"}"#, nested: nested)
+            try config.validateModelConfiguration()
+            let model: Module = nested ? MiniMaxM3Model(config) : MiniMaxM3TextModel(config)
+            XCTAssertThrowsError(
+                try loadWeights(modelDirectory: directory, model: model as! BaseLanguageModel),
+                "nested \(nested) key \(key)")
+        }
+    }
+
+    /// The published VL layout: the direction under
+    /// `language_model.refusal_direction` in its own file, which the index
+    /// also names. It loads once and ablates; without `refusal_ablation` (an
+    /// engine without the feature) the same checkpoint refuses to load.
+    func testIndexedVLRefusalDirectionLoadsAndOlderConfigRefuses() throws {
+        let directory = URL(filePath: NSTemporaryDirectory())
+            .appending(component: "minimax-m3-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let plain = MiniMaxM3Model(try configuration(nested: true))
+        randomize(plain)
+        let base = Dictionary(uniqueKeysWithValues: plain.parameters().flattened())
+        try save(arrays: base, url: directory.appending(component: "model.safetensors"))
+        let r = unitDirection()
+        let key = "language_model.refusal_direction"
+        try save(
+            arrays: [key: r], url: directory.appending(component: "refusal_direction.safetensors"))
+        var weightMap = base.mapValues { _ in "model.safetensors" }
+        weightMap[key] = "refusal_direction.safetensors"
+        try JSONSerialization.data(withJSONObject: ["weight_map": weightMap]).write(
+            to: directory.appending(component: "model.safetensors.index.json"))
+
+        let config = try ablatedConfiguration(
+            #"{"layers": [0, 1], "alpha": 1.5, "direction_key": "\#(key)"}"#, nested: true)
+        try config.validateModelConfiguration()
+        let model = MiniMaxM3Model(config)
+        let urls = try safetensorWeightURLs(
+            in: directory, additionalFiles: model.additionalWeightFiles)
+        XCTAssertEqual(
+            urls.map(\.lastPathComponent).sorted(),
+            ["model.safetensors", "refusal_direction.safetensors"], "direction file loaded once")
+        try loadWeights(modelDirectory: directory, model: model)
+
+        let text = model.languageModel
+        for (index, layer) in text.model.layers.enumerated() {
+            if index <= 1 {
+                XCTAssertTrue(bitwiseEqual(try XCTUnwrap(layer.refusalDirection), r), "layer \(index)")
+            } else {
+                XCTAssertNil(layer.refusalDirection)
+            }
+        }
+        // The loaded model equals the explicit ablated copy of the base
+        // weights, and differs from the un-ablated model.
+        let expected = try ablatedCopy(of: plain.languageModel, config: config, direction: r)
+        let input = tokens(12)
+        let actual = model(input, cache: nil)
+        let reference = expected(input, cache: nil)
+        let unablated = plain(input, cache: nil)
+        eval(actual, reference, unablated)
+        XCTAssertTrue(bitwiseEqual(actual, reference))
+        XCTAssertGreaterThan(maxAbsDifference(actual, unablated), 1e-3)
+
+        let older = MiniMaxM3Model(try configuration(nested: true))
+        XCTAssertThrowsError(
+            try loadWeights(modelDirectory: directory, model: older), "unused direction key")
     }
 }
