@@ -1450,8 +1450,22 @@ final class MiniMaxM3DecoderLayer: Module {
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: MiniMaxM3RMSNorm
     @ModuleInfo(key: "block_sparse_moe") var blockSparseMoe: MiniMaxM3SparseMoeBlock?
     @ModuleInfo(key: "mlp") var mlp: MiniMaxM3MLP?
+    /// Unit refusal direction `[hidden]` (float32), present only on layers
+    /// inside `refusal_ablation.layers`; loaded from its own safetensors file.
+    @ParameterInfo(key: "refusal_direction") var refusalDirection: MLXArray?
+    /// `alpha` of `refusal_ablation` on the layers it covers, else `nil`.
+    let ablationAlpha: Float?
 
     init(_ config: MiniMaxM3Configuration, layer: Int) {
+        if let ablation = config.refusalAblation, ablation.covers(layer: layer) {
+            ablationAlpha = ablation.alpha
+            // NaN until the checkpoint sets it: a loader that skips the key
+            // serves visibly broken output, never silently un-ablated output.
+            _refusalDirection.wrappedValue = MLXArray(
+                [Float](repeating: .nan, count: config.hiddenSize))
+        } else {
+            ablationAlpha = nil
+        }
         _selfAttn.wrappedValue = MiniMaxM3Attention(config, layer: layer)
         _inputLayerNorm.wrappedValue = MiniMaxM3RMSNorm(
             dimensions: config.hiddenSize, eps: config.rmsNormEps, gemma: config.useGemmaNorm)
@@ -1476,6 +1490,9 @@ final class MiniMaxM3DecoderLayer: Module {
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
+        if let alpha = ablationAlpha, let direction = refusalDirection {
+            return ablated(x, mask: mask, cache: cache, alpha: alpha, direction: direction)
+        }
         let h = x + selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
         if let blockSparseMoe {
             // A float32 router takes the norm's float32 copy from the same
@@ -1488,6 +1505,38 @@ final class MiniMaxM3DecoderLayer: Module {
             return blockSparseMoe(postAttentionLayerNorm(h), residual: h)
         }
         return h + mlp!(postAttentionLayerNorm(h))
+    }
+
+    /// `y - alpha * r * (r . y)` over the hidden dim, in float32, rounded
+    /// back to `y`'s dtype.
+    static func project(_ y: MLXArray, direction r: MLXArray, alpha: Float) -> MLXArray {
+        let y32 = y.asType(.float32)
+        let dot = (y32 * r).sum(axis: -1, keepDims: true)
+        return (y32 - (alpha * dot) * r).asType(y.dtype)
+    }
+
+    /// The layer with the refusal direction projected out of the attention
+    /// and MLP/MoE outputs before each residual add. The MoE runs without
+    /// its fused residual so the projection sees the bare expert output.
+    private func ablated(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+        alpha: Float, direction: MLXArray
+    ) -> MLXArray {
+        let attention = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        let h = x + Self.project(attention, direction: direction, alpha: alpha)
+        let m: MLXArray
+        if let blockSparseMoe {
+            if blockSparseMoe.routerReadsFloat32,
+                let normed = postAttentionLayerNorm.withFloat32Copy(h)
+            {
+                m = blockSparseMoe(normed[0], residual: nil, routerInput: normed[1])
+            } else {
+                m = blockSparseMoe(postAttentionLayerNorm(h), residual: nil)
+            }
+        } else {
+            m = mlp!(postAttentionLayerNorm(h))
+        }
+        return h + Self.project(m, direction: direction, alpha: alpha)
     }
 }
 
@@ -1518,7 +1567,7 @@ public final class MiniMaxM3ModelInner: Module {
 }
 
 /// `minimax_m3` checkpoints: `model.*` and `lm_head.*`.
-public final class MiniMaxM3TextModel: Module, LLMModel {
+public final class MiniMaxM3TextModel: Module, LLMModel, AdditionalWeightFilesProviding {
     public let vocabularySize: Int
     let configuration: MiniMaxM3Configuration
 
@@ -1568,11 +1617,26 @@ public final class MiniMaxM3TextModel: Module, LLMModel {
         model.layers.map { $0.selfAttn.sparse ? MiniMaxM3Cache() : KVCacheSimple() }
     }
 
+    /// The `refusal_ablation` direction file, when configured.
+    public var additionalWeightFiles: [String] {
+        configuration.refusalAblation.map { [$0.directionFile] } ?? []
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var weights = MiniMaxM3Weights.stackExperts(
             MiniMaxM3Weights.renameScales(weights), configuration: configuration, prefix: "model")
         if configuration.tieWordEmbeddings {
             weights = weights.filter { !$0.key.hasPrefix("lm_head.") }
+        }
+        // The direction file's one tensor lands on every ablated layer. A
+        // missing tensor leaves those keys unset, which the loader rejects.
+        if let ablation = configuration.refusalAblation,
+            let direction = weights.removeValue(forKey: ablation.directionKey)
+        {
+            let direction = direction.asType(.float32)
+            for layer in 0 ..< configuration.hiddenLayers where ablation.covers(layer: layer) {
+                weights["model.layers.\(layer).refusal_direction"] = direction
+            }
         }
         return weights
     }
@@ -1582,7 +1646,7 @@ public final class MiniMaxM3TextModel: Module, LLMModel {
 
 /// `minimax_m3_vl` checkpoints: the text model under `language_model`, with
 /// the vision tower and projectors alongside (dropped).
-public final class MiniMaxM3Model: Module, LLMModel {
+public final class MiniMaxM3Model: Module, LLMModel, AdditionalWeightFilesProviding {
     public let vocabularySize: Int
 
     @ModuleInfo(key: "language_model") public var languageModel: MiniMaxM3TextModel
@@ -1605,9 +1669,16 @@ public final class MiniMaxM3Model: Module, LLMModel {
         try languageModel.newCache(parameters: parameters)
     }
 
+    public var additionalWeightFiles: [String] { languageModel.additionalWeightFiles }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var text = [String: MLXArray]()
+        let directionKey = languageModel.configuration.refusalAblation?.directionKey
         for (key, value) in weights {
+            if key == directionKey {
+                text[key] = value
+                continue
+            }
             var key = key
             if key.hasPrefix("model.language_model.") {
                 key = "language_model." + key.dropFirst("model.language_model.".count)
@@ -1710,6 +1781,42 @@ public struct MiniMaxM3Configuration: Codable, Sendable {
     var initBlocks: Int
     var localBlocks: Int
     var sparseScoreType: String
+    /// Runtime refusal-direction ablation (`refusal_ablation`); `nil` serves
+    /// the checkpoint unchanged.
+    var refusalAblation: RefusalAblation?
+
+    /// `{"layers": [lo, hi], "alpha": a, "direction_file": f, "direction_key": k}`:
+    /// decoder layers `lo...hi` project `alpha * r r^T` out of their attention
+    /// and MLP/MoE outputs, `r` the `[hidden_size]` float32 tensor `k` of the
+    /// safetensors file `f` in the model directory.
+    public struct RefusalAblation: Codable, Sendable, Equatable {
+        public var layers: [Int]
+        public var alpha: Float
+        public var directionFile: String
+        public var directionKey: String
+
+        enum CodingKeys: String, CodingKey {
+            case layers
+            case alpha
+            case directionFile = "direction_file"
+            case directionKey = "direction_key"
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            layers = try c.decode([Int].self, forKey: .layers)
+            alpha = try c.decode(Float.self, forKey: .alpha)
+            directionFile =
+                try c.decodeIfPresent(String.self, forKey: .directionFile)
+                ?? "refusal_direction.safetensors"
+            directionKey =
+                try c.decodeIfPresent(String.self, forKey: .directionKey) ?? "refusal_direction"
+        }
+
+        func covers(layer: Int) -> Bool {
+            layers.count == 2 && layer >= layers[0] && layer <= layers[1]
+        }
+    }
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -1752,10 +1859,12 @@ public struct MiniMaxM3Configuration: Codable, Sendable {
         case initBlocks = "index_init_blocks"
         case localBlocks = "index_local_blocks"
         case sparseScoreType = "sparse_score_type"
+        case refusalAblation = "refusal_ablation"
     }
 
     private enum ExtraKeys: String, CodingKey {
         case textConfig = "text_config"
+        case refusalAblation = "refusal_ablation"
         case partialRotaryFactor = "partial_rotary_factor"
         case moeLayerFreq = "moe_layer_freq"
         case mlpLayerTypes = "mlp_layer_types"
@@ -1889,6 +1998,10 @@ public struct MiniMaxM3Configuration: Codable, Sendable {
         initBlocks = sparseConfig?.sparseInitBlock ?? 0
         localBlocks = sparseConfig?.sparseLocalBlock ?? aliasLocal ?? 1
         sparseScoreType = sparseConfig?.sparseScoreType ?? "max"
+        // minimax_m3_vl may carry it in text_config or at the top level.
+        refusalAblation =
+            try c.decodeIfPresent(RefusalAblation.self, forKey: .refusalAblation)
+            ?? (nested ? try outer.decodeIfPresent(RefusalAblation.self, forKey: .refusalAblation) : nil)
     }
 }
 
@@ -1927,6 +2040,25 @@ extension MiniMaxM3Configuration: ModelConfigurationValidating {
         }
         guard attentionHeads % kvHeads == 0, rotaryDim <= headDim, rotaryDim % 2 == 0 else {
             throw fail("MiniMax M3 head layout is inconsistent")
+        }
+        if let ablation = refusalAblation {
+            guard ablation.layers.count == 2, ablation.layers[0] >= 0,
+                ablation.layers[0] <= ablation.layers[1], ablation.layers[1] < hiddenLayers
+            else {
+                throw fail(
+                    "MiniMax M3 refusal_ablation.layers must be [lo, hi] with 0 <= lo <= hi < \(hiddenLayers), got \(ablation.layers)")
+            }
+            guard ablation.alpha.isFinite else {
+                throw fail("MiniMax M3 refusal_ablation.alpha must be finite")
+            }
+            let file = ablation.directionFile
+            guard file.hasSuffix(".safetensors"), !file.contains("/"), !file.hasPrefix(".") else {
+                throw fail(
+                    "MiniMax M3 refusal_ablation.direction_file must be a .safetensors file name in the model directory, got \(file)")
+            }
+            guard !ablation.directionKey.isEmpty else {
+                throw fail("MiniMax M3 refusal_ablation.direction_key must not be empty")
+            }
         }
         if sparseLayers.contains(true) {
             guard sparseScoreType == "max" else {

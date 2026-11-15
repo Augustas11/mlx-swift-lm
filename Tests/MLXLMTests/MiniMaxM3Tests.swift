@@ -936,4 +936,248 @@ final class MiniMaxM3Tests: XCTestCase {
         XCTAssertNotNil(sanitized["language_model.model.norm.weight"])
         XCTAssertFalse(sanitized.keys.contains { $0.contains("vision") || $0.contains("experts.0") })
     }
+
+    // MARK: - Refusal ablation
+
+    private let ablationJSON =
+        #"{"layers": [0, 1], "alpha": 1.5, "direction_file": "refusal_direction.safetensors", "direction_key": "refusal_direction"}"#
+
+    /// The fixture config with `refusal_ablation` (in `text_config` when nested).
+    private func ablatedConfiguration(_ ablation: String? = nil, nested: Bool = false) throws
+        -> MiniMaxM3Configuration
+    {
+        let text = textConfigJSON().replacingOccurrences(
+            of: #""model_type": "minimax_m3","#,
+            with: #""model_type": "minimax_m3", "refusal_ablation": \#(ablation ?? ablationJSON),"#)
+        let json = nested ? #"{"model_type": "minimax_m3_vl", "text_config": \#(text)}"# : text
+        return try JSONDecoder().decode(MiniMaxM3Configuration.self, from: Data(json.utf8))
+    }
+
+    /// A seeded unit vector `[64]` in float32.
+    private func unitDirection(seed: UInt64 = 11) -> MLXArray {
+        let r = withRandomState(MLXRandom.RandomState(seed: seed)) { MLXRandom.normal([64]) }
+        return r / sqrt((r * r).sum())
+    }
+
+    /// `y - alpha r (r . y)` by an independent route: a matmul against `r`.
+    private func referenceProjection(_ y: MLXArray, _ r: MLXArray, alpha: Float) -> MLXArray {
+        let y32 = y.asType(.float32)
+        let dot = matmul(y32, r.reshaped(-1, 1))
+        return (y32 - alpha * dot * r.reshaped(1, -1)).asType(y.dtype)
+    }
+
+    /// `model` with `reference`'s weights and `direction` on each ablated layer.
+    private func ablatedCopy(
+        of reference: MiniMaxM3TextModel, config: MiniMaxM3Configuration, direction: MLXArray
+    ) throws -> MiniMaxM3TextModel {
+        let model = MiniMaxM3TextModel(config)
+        var parameters = reference.parameters().flattened()
+        for layer in 0 ..< config.hiddenLayers
+        where config.refusalAblation!.covers(layer: layer) {
+            parameters.append(("model.layers.\(layer).refusal_direction", direction))
+        }
+        try model.update(parameters: ModuleParameters.unflattened(parameters), verify: .all)
+        eval(model)
+        return model
+    }
+
+    func testConfigurationWithoutAblationKeepsLayers() throws {
+        let config = try configuration()
+        XCTAssertNil(config.refusalAblation)
+        let model = MiniMaxM3TextModel(config)
+        XCTAssertEqual(model.additionalWeightFiles, [])
+        XCTAssertFalse(model.parameters().flattened().contains { $0.0.contains("refusal") })
+        XCTAssertTrue(model.model.layers.allSatisfy { $0.ablationAlpha == nil })
+
+        let nested = try ablatedConfiguration(nested: true)
+        try nested.validateModelConfiguration()
+        XCTAssertEqual(nested.refusalAblation?.layers, [0, 1])
+        XCTAssertEqual(nested.refusalAblation?.alpha, 1.5)
+        XCTAssertEqual(MiniMaxM3Model(nested).additionalWeightFiles, ["refusal_direction.safetensors"])
+    }
+
+    /// Ablated layers (dense 0 and MoE 1) equal `x + P(attn) + P(mlp)` from
+    /// the un-ablated modules; layers 2 and 3 equal the un-ablated model's
+    /// bit for bit; the model's logits are its layers' chain bit for bit.
+    func testRefusalAblationMatchesExplicitProjection() throws {
+        let config = try ablatedConfiguration()
+        try config.validateModelConfiguration()
+        let reference = MiniMaxM3TextModel(try configuration())
+        randomize(reference)
+        let r = unitDirection()
+        let model = try ablatedCopy(of: reference, config: config, direction: r)
+        XCTAssertEqual(model.model.layers.map { $0.ablationAlpha }, [1.5, 1.5, nil, nil])
+
+        let input = tokens(12)
+        var h = reference.model.embedTokens(input)
+        let mask = createAttentionMask(h: h, cache: nil as KVCache?)
+        for (index, layer) in reference.model.layers.enumerated() {
+            let actual = model.model.layers[index](h, mask: mask, cache: nil)
+            let plain = layer(h, mask: mask, cache: nil)
+            let expected: MLXArray
+            if index <= 1 {
+                let attention = layer.selfAttn(layer.inputLayerNorm(h), mask: mask, cache: nil)
+                let mid = h + referenceProjection(attention, r, alpha: 1.5)
+                let normed = layer.postAttentionLayerNorm(mid)
+                let mlp = try layer.blockSparseMoe.map { $0(normed, residual: nil) }
+                    ?? XCTUnwrap(layer.mlp)(normed)
+                expected = mid + referenceProjection(mlp, r, alpha: 1.5)
+                eval(actual, expected, plain)
+                XCTAssertLessThan(maxAbsDifference(actual, expected), 1e-4, "layer \(index)")
+                XCTAssertGreaterThan(maxAbsDifference(actual, plain), 1e-3, "layer \(index) ablated")
+            } else {
+                expected = plain
+                eval(actual, expected)
+                XCTAssertTrue(bitwiseEqual(actual, expected), "layer \(index)")
+            }
+            h = actual
+        }
+        let logits = model(input, cache: nil)
+        let expectedLogits = try XCTUnwrap(model.lmHead)(model.model.norm(h))
+        eval(logits, expectedLogits)
+        XCTAssertTrue(bitwiseEqual(logits, expectedLogits))
+    }
+
+    /// Production paths: bf16 quantized weights, prepared (fused gate/up,
+    /// combine kernel, float32 router copy), cached decode and continuous
+    /// batching. Each ablated layer equals the explicit chain through the
+    /// MoE's un-added output; batched rows equal their serial runs bitwise.
+    func testRefusalAblationOnQuantizedCachedAndBatchedPaths() throws {
+        let reference = try quantizedModel(prepared: false)
+        let config = try ablatedConfiguration()
+        let r = unitDirection()
+        let model = MiniMaxM3TextModel(config)
+        quantize(model: model) { path, module in
+            if path.hasSuffix("block_sparse_moe.gate") { return nil }
+            guard module is Linear || module is Embedding || module is SwitchLinear else {
+                return nil
+            }
+            return (32, module is SwitchLinear ? 3 : 4, .affine)
+        }
+        var parameters = reference.parameters().flattened()
+        parameters += [0, 1].map { ("model.layers.\($0).refusal_direction", r) }
+        try model.update(parameters: ModuleParameters.unflattened(parameters), verify: .all)
+        try reference.prepare()
+        try model.prepare()
+        eval(reference, model)
+
+        let input = tokens(10)
+        let h = model.model.embedTokens(input)
+        let mask = createAttentionMask(h: h, cache: nil as KVCache?)
+        let layer = model.model.layers[1]
+        let moe = try XCTUnwrap(layer.blockSparseMoe)
+        XCTAssertTrue(moe.routerReadsFloat32)
+        let attention = layer.selfAttn(layer.inputLayerNorm(h), mask: mask, cache: nil)
+        let mid = h + MiniMaxM3DecoderLayer.project(attention, direction: r, alpha: 1.5)
+        let m = moe(layer.postAttentionLayerNorm(mid), residual: nil)
+        let expected = mid + MiniMaxM3DecoderLayer.project(m, direction: r, alpha: 1.5)
+        let actual = layer(h, mask: mask, cache: nil)
+        eval(expected, actual)
+        XCTAssertEqual(actual.dtype, .bfloat16)
+        XCTAssertTrue(bitwiseEqual(actual, expected), "max diff \(maxAbsDifference(actual, expected))")
+
+        let lengths = [5, 11]
+        var serial = [[KVCache]]()
+        var rows = [[KVCache]]()
+        var next = [Int32]()
+        for (index, length) in lengths.enumerated() {
+            let prompt = tokens(length, seed: UInt64(30 + index))
+            let serialCache = try model.newCache(parameters: nil)
+            let rowCache = try model.newCache(parameters: nil)
+            let a = model(prompt, cache: serialCache)
+            let b = model(prompt, cache: rowCache)
+            let plain = reference(prompt, cache: try reference.newCache(parameters: nil))
+            eval(a, b, plain)
+            XCTAssertTrue(bitwiseEqual(a, b))
+            XCTAssertGreaterThan(maxAbsDifference(a, plain), 1e-3, "row \(index) ablated")
+            serial.append(serialCache)
+            rows.append(rowCache)
+            next.append(Int32(argMax(a[0, -1]).item(UInt32.self)))
+        }
+        for step in 0 ..< 3 {
+            let batch: [KVCache] = (0 ..< rows[0].count).map { layer in
+                MiniMaxM3CacheBatch(rowCaches: rows.map { $0[layer] as! any MiniMaxM3SparseCache })
+            }
+            let batched = model(MLXArray(next).reshaped(lengths.count, 1), cache: batch)
+            let lone = lengths.indices.map {
+                model(MLXArray([next[$0]]).reshaped(1, 1), cache: serial[$0])
+            }
+            eval([batched] + lone)
+            for row in lengths.indices {
+                XCTAssertTrue(bitwiseEqual(batched[row ..< (row + 1)], lone[row]), "row \(row) step \(step)")
+            }
+            next = lone.map { Int32(argMax($0[0, -1]).item(UInt32.self)) }
+        }
+    }
+
+    func testRefusalAblationRejectsInvalidConfiguration() throws {
+        for ablation in [
+            #"{"layers": [2, 1], "alpha": 1.5}"#,
+            #"{"layers": [0, 4], "alpha": 1.5}"#,
+            #"{"layers": [-1, 2], "alpha": 1.5}"#,
+            #"{"layers": [1], "alpha": 1.5}"#,
+            #"{"layers": [0, 1], "alpha": 1.5, "direction_file": "../x.safetensors"}"#,
+            #"{"layers": [0, 1], "alpha": 1.5, "direction_file": "direction.npy"}"#,
+            #"{"layers": [0, 1], "alpha": 1.5, "direction_key": ""}"#,
+        ] {
+            let config = try ablatedConfiguration(ablation)
+            XCTAssertThrowsError(try config.validateModelConfiguration(), ablation)
+        }
+        XCTAssertThrowsError(try ablatedConfiguration(#"{"layers": [0, 1]}"#), "alpha required")
+    }
+
+    /// The direction loads from its own file onto every ablated layer (text
+    /// and VL packaging); a missing file or a wrong shape fails the load.
+    func testRefusalDirectionLoadsAndFailsClosed() throws {
+        for nested in [false, true] {
+            let directory = URL(filePath: NSTemporaryDirectory())
+                .appending(component: "minimax-m3-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let plain: Module
+            if nested {
+                plain = MiniMaxM3Model(try configuration(nested: true))
+            } else {
+                plain = MiniMaxM3TextModel(try configuration())
+            }
+            randomize(plain)
+            try save(
+                arrays: Dictionary(uniqueKeysWithValues: plain.parameters().flattened()),
+                url: directory.appending(component: "model.safetensors"))
+            let config = try ablatedConfiguration(nested: nested)
+            try config.validateModelConfiguration()
+            /// The text model of a freshly loaded checkpoint.
+            func load() throws -> MiniMaxM3TextModel {
+                if nested {
+                    let model = MiniMaxM3Model(config)
+                    try loadWeights(modelDirectory: directory, model: model)
+                    return model.languageModel
+                }
+                let model = MiniMaxM3TextModel(config)
+                try loadWeights(modelDirectory: directory, model: model)
+                return model
+            }
+            let file = directory.appending(component: "refusal_direction.safetensors")
+
+            XCTAssertThrowsError(try load(), "missing direction file, nested \(nested)")
+
+            try save(arrays: ["refusal_direction": MLXArray.zeros([63])], url: file)
+            XCTAssertThrowsError(try load(), "wrong direction shape, nested \(nested)")
+
+            try save(arrays: ["other": unitDirection()], url: file)
+            XCTAssertThrowsError(try load(), "wrong direction key, nested \(nested)")
+
+            let r = unitDirection()
+            try save(arrays: ["refusal_direction": r], url: file)
+            for (index, layer) in try load().model.layers.enumerated() {
+                if index <= 1 {
+                    let direction = try XCTUnwrap(layer.refusalDirection)
+                    XCTAssertEqual(direction.dtype, .float32)
+                    XCTAssertTrue(bitwiseEqual(direction, r), "layer \(index)")
+                } else {
+                    XCTAssertNil(layer.refusalDirection)
+                }
+            }
+        }
+    }
 }
