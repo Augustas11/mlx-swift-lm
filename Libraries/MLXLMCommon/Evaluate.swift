@@ -686,6 +686,24 @@ extension TokenIteratorProtocol {
     public mutating func discardGeneratedToken() {}
 }
 
+/// The cache arrays ``TokenIterator`` evaluates with each decode token.
+///
+/// `KVCacheSimple` and `RotatingKVCache` give their stored buffers: the decode
+/// graph already computes them, so evaluating them adds no operation. Their
+/// `state` slices the live rows instead, which put two `Slice` operations per
+/// layer into every token's evaluation that nothing reads (#2373). The values
+/// computed are the same either way. Every other cache, subclasses included,
+/// keeps `state`.
+package func decodeSettleArrays(_ cache: [KVCache]) -> [MLXArray] {
+    cache.flatMap { layer -> [MLXArray] in
+        let kind = type(of: layer)
+        if kind == KVCacheSimple.self || kind == RotatingKVCache.self {
+            return layer.innerState()
+        }
+        return layer.state
+    }
+}
+
 /// Generator of tokens.
 ///
 /// This is typically used via a call to ``generate(input:cache:state:parameters:context:components:wiredMemoryTicket:tools:)`` returning `AsyncStream<Generation>`.
@@ -947,7 +965,7 @@ public struct TokenIterator: TokenIteratorProtocol {
             // unevaluated chain of those updates keeps every prior step's
             // intermediates alive. Python mlx-lm settles cache state the same
             // way in its generation loop.
-            asyncEval([token] + cache.flatMap { $0.state })
+            asyncEval([token] + decodeSettleArrays(cache))
 
             // Periodically return freed buffers that cannot be reused (odd or
             // monotonically growing sizes accumulate in the pool otherwise).
