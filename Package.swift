@@ -61,7 +61,13 @@ let package = Package(
         .default(enabledTraits: ["FoundationModelsIntegration"]),
     ],
     dependencies: [
-        // macprovider: mlx-swift 0.32.3-macprovider.22. Core 0f26baba0 sends 1
+        // macprovider: mlx-swift 0.32.3-macprovider.23 is .22 plus one change in
+        // the Swift layer: a synchronous eval schedules and copies its
+        // completion events under evalLock, waits for the device without the
+        // lock, and retakes it to finish, so a second model's thread in the
+        // same process can submit while the first waits. Recursive entry, a
+        // CPU stream and a failed asynchronous schedule keep the locked path.
+        // Core is unchanged from .22: core 0f26baba0 sends 1
         // row of a qualifying small-M affine product to qmv_mma1, a single-row
         // kernel with qmv_mma's exact reduction order, and 2 rows up to the qmm
         // route (at least 16) to qmv_mma. The two kernels give the
@@ -78,7 +84,7 @@ let package = Package(
         // qmm_splitk stays off. The core also
         // erases a freed compiled function from every thread's cache and keeps
         // every internal op on the caller's stream.
-        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "0f93fa380369a1abd1e17757a465cf42a72d8f69"),
+        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "1cfafd1faa2ea502329d50cd851d97764ce20d1d"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
