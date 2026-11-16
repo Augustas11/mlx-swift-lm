@@ -31,4 +31,14 @@ final class PrefillClearCacheTests: XCTestCase {
         XCTAssertLessThan(cached[1], seeded / 4)
         XCTAssertLessThan(Memory.cacheMemory, seeded / 4)
     }
+
+    // The switch for hosts without a Metal library: the loop still runs every chunk.
+    func testChunkLoopRunsWithoutClearingWhenSwitchedOff() throws {
+        var parameters = PrefillParameters(stepSize: 4)
+        parameters.clearsBufferCache = false
+        var chunks = 0
+        let processed = try parameters.forEachChunk(total: 9) { _ in chunks += 1 }
+        XCTAssertEqual(processed, 8)
+        XCTAssertEqual(chunks, 2)
+    }
 }

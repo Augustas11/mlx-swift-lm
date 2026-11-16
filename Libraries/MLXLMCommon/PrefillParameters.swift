@@ -36,6 +36,12 @@ public struct PrefillParameters: Sendable {
     /// by a stored `GenerateParameters`) — capture weakly anything long-lived.
     public var progress: (@Sendable (_ processed: Int, _ total: Int) -> Void)?
 
+    /// Whether ``forEachChunk(total:reserving:defaultStepSize:maximumStepSize:_:)``
+    /// clears the MLX buffer cache after each chunk (the default). Clearing
+    /// needs the Metal allocator; a caller that drives the chunk loop without
+    /// MLX arrays on a host with no default metallib sets this to `false`.
+    public var clearsBufferCache = true
+
     /// Strategy dividing the prompt into prefill forwards.
     public enum Chunking: Sendable {
         /// The fewest equal chunks that respect the step-size ceiling, so no
@@ -144,7 +150,7 @@ public struct PrefillParameters: Sendable {
                 body(processed ..< processed + n)
                 processed += n
                 progress?(processed, total)
-                Memory.clearCache()
+                if clearsBufferCache { Memory.clearCache() }
             }
         }
         return processed
