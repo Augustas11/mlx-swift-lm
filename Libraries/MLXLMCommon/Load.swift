@@ -194,10 +194,13 @@ func loadWeightArrays(urls: [URL], initialMaterializationPrefixes: [String]? = n
     DispatchQueue.concurrentPerform(iterations: items.count) { index in
         let item = items[index]
         do {
-            let (selected, metadata) = try loadWeightArrayGroup(
-                url: item.url, names: item.names,
-                initialMaterializationPrefixes: initialMaterializationPrefixes)
-            state.merge(file: item.file, weights: selected, metadata: metadata)
+            // A caller's withError does not reach this worker thread.
+            try withLoaderThreadError {
+                let (selected, metadata) = try loadWeightArrayGroup(
+                    url: item.url, names: item.names,
+                    initialMaterializationPrefixes: initialMaterializationPrefixes)
+                state.merge(file: item.file, weights: selected, metadata: metadata)
+            }
         } catch {
             state.record(error: error)
         }
@@ -446,14 +449,30 @@ public func loadWeights(
     try await withCheckedThrowingContinuation {
         (continuation: CheckedContinuation<Void, any Error>) in
         DispatchQueue.global(qos: .userInitiated).async {
+            // The caller's withError does not reach this thread.
             continuation.resume(
                 with: Result {
-                    try loadWeights(
-                        modelDirectory: modelDirectory, model: model.consume(),
-                        quantization: quantization,
-                        perLayerQuantization: perLayerQuantization,
-                        weightFileSelection: weightFileSelection)
+                    try withLoaderThreadError {
+                        try loadWeights(
+                            modelDirectory: modelDirectory, model: model.consume(),
+                            quantization: quantization,
+                            perLayerQuantization: perLayerQuantization,
+                            weightFileSelection: weightFileSelection)
+                    }
                 })
+        }
+    }
+}
+
+/// Run `body` in an MLX error scope on the current thread. An MLX error is thrown
+/// in place of a later error it caused in `body`, such as a shape mismatch.
+func withLoaderThreadError<R>(_ body: () throws -> R) throws -> R {
+    try withError { mlxError in
+        do {
+            return try body()
+        } catch {
+            try mlxError.check()
+            throw error
         }
     }
 }
