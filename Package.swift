@@ -78,7 +78,14 @@ let package = Package(
         // qmm_splitk stays off. The core also
         // erases a freed compiled function from every thread's cache and keeps
         // every internal op on the caller's stream.
-        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "7fbcada97b58ddafab567121da63b959b8d092e3"),
+        // mlx-swift 0.32.3-macprovider.25 is .24 (7fbcada) plus one change in
+        // the Swift layer: a synchronous eval schedules and copies its
+        // completion events under evalLock, waits for the device without the
+        // lock, and retakes it to finish, so a second model's thread in the
+        // same process can submit while the first waits. Recursive entry, a
+        // CPU stream and a failed asynchronous schedule keep the locked path.
+        // Core is unchanged from .24.
+        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "12d26ef6c6d65ba3a265a2b65c3c9380d9c22bd7"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
