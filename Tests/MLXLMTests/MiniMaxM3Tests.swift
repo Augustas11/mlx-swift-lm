@@ -1208,14 +1208,19 @@ final class MiniMaxM3Tests: XCTestCase {
     /// A direction key naming a base weight is never taken as the direction:
     /// the base weight stays and the ablated layers fail the load.
     func testRefusalDirectionKeyCollidingWithBaseWeightFailsLoad() throws {
-        let cases: [(nested: Bool, key: String)] = [
-            (false, "model.norm.weight"),
-            (false, "model.layers.0.refusal_direction"),
-            (true, "language_model.model.norm.weight"),
-            (true, "model.language_model.model.norm.weight"),
-            (true, "model.norm.weight"),
+        // `[0, 0]`: the colliding per-layer key covers every ablated layer, so
+        // only dropping stored per-layer directions keeps an unvalidated
+        // (here non-unit) tensor from loading.
+        let cases: [(nested: Bool, key: String, layers: String)] = [
+            (false, "model.norm.weight", "[0, 1]"),
+            (false, "model.layers.0.refusal_direction", "[0, 1]"),
+            (false, "model.layers.0.refusal_direction", "[0, 0]"),
+            (true, "language_model.model.layers.0.refusal_direction", "[0, 0]"),
+            (true, "language_model.model.norm.weight", "[0, 1]"),
+            (true, "model.language_model.model.norm.weight", "[0, 1]"),
+            (true, "model.norm.weight", "[0, 1]"),
         ]
-        for (nested, key) in cases {
+        for (nested, key, layers) in cases {
             let directory = URL(filePath: NSTemporaryDirectory())
                 .appending(component: "minimax-m3-\(UUID().uuidString)")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -1229,15 +1234,15 @@ final class MiniMaxM3Tests: XCTestCase {
                 arrays: Dictionary(uniqueKeysWithValues: plain.parameters().flattened()),
                 url: directory.appending(component: "model.safetensors"))
             try save(
-                arrays: [key: unitDirection()],
+                arrays: [key: 3 * unitDirection()],
                 url: directory.appending(component: "refusal_direction.safetensors"))
             let config = try ablatedConfiguration(
-                #"{"layers": [0, 1], "alpha": 1.5, "direction_key": "\#(key)"}"#, nested: nested)
+                #"{"layers": \#(layers), "alpha": 1.5, "direction_key": "\#(key)"}"#, nested: nested)
             try config.validateModelConfiguration()
             let model: Module = nested ? MiniMaxM3Model(config) : MiniMaxM3TextModel(config)
             XCTAssertThrowsError(
                 try loadWeights(modelDirectory: directory, model: model as! BaseLanguageModel),
-                "nested \(nested) key \(key)")
+                "nested \(nested) key \(key) layers \(layers)")
         }
     }
 

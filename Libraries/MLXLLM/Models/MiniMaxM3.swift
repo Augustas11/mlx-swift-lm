@@ -1628,6 +1628,12 @@ public final class MiniMaxM3TextModel: Module, LLMModel, AdditionalWeightFilesPr
         if configuration.tieWordEmbeddings {
             weights = weights.filter { !$0.key.hasPrefix("lm_head.") }
         }
+        // Per-layer directions are runtime state set below from the one
+        // validated tensor, never checkpoint weights: a stored one would skip
+        // validation when it covers every ablated layer.
+        weights = weights.filter {
+            !($0.key.hasPrefix("model.layers.") && $0.key.hasSuffix(".refusal_direction"))
+        }
         // The direction file's one tensor lands on every ablated layer. A
         // missing, colliding or invalid tensor leaves those keys unset (still
         // NaN), which the loader's `verify: .all` rejects.
