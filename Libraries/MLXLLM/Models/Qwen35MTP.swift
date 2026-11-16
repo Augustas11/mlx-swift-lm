@@ -40,19 +40,37 @@ final class Qwen35MTPPredictor: Module {
         layers.map { _ in KVCacheSimple() }
     }
 
+    /// The normed output `[B, L, D]`; with `readLast`, only each row's last
+    /// valid column (`rowLengths[r] - 1`, else `L - 1`), `[B, 1, D]`. Every
+    /// layer's attention and cache write run on every column either way; the
+    /// last layer's post-attention norm and MLP and the final norm run on the
+    /// read column only (`mtpLastColumnEnabled`), since nothing reads the
+    /// others.
     func callAsFunction(
         inputsEmbeds: MLXArray,
         hiddenStates previousHidden: MLXArray,
         cache: [KVCache],
-        positionOffset: Int?
+        positionOffset: Int?,
+        rowLengths: [Int]? = nil,
+        readLast: Bool = false
     ) -> MLXArray {
         var hiddenStates = concatenated(
             [preFCNormEmbedding(inputsEmbeds), preFCNormHidden(previousHidden)], axis: -1)
         hiddenStates = fc(hiddenStates)
 
         precondition(cache.count == layers.count, "Qwen MTP cache/layer count mismatch")
-        for (layer, layerCache) in zip(layers, cache) {
+        let columns = rowLengths?.map { $0 - 1 }
+        let prune = readLast && mtpLastColumnEnabled && hiddenStates.dim(1) > 1
+        for (index, (layer, layerCache)) in zip(layers, cache).enumerated() {
             let faMask = createAttentionMask(h: hiddenStates, cache: layerCache)
+            if prune, index == layers.count - 1, let selfAttn = layer.selfAttn {
+                let r = selfAttn(
+                    layer.inputLayerNorm(hiddenStates), mask: faMask, cache: layerCache,
+                    positionOffset: positionOffset)
+                let h = mtpReadColumns(hiddenStates + r, columns)
+                hiddenStates = h + (layer.mlp as! UnaryLayer)(layer.postAttentionLayerNorm(h))
+                continue
+            }
             hiddenStates = layer(
                 hiddenStates,
                 attentionMask: faMask,
@@ -61,7 +79,8 @@ final class Qwen35MTPPredictor: Module {
                 positionOffset: positionOffset)
         }
 
-        return norm(hiddenStates)
+        return readLast ? mtpReadColumns(norm(hiddenStates), prune ? nil : columns)
+            : norm(hiddenStates)
     }
 }
 
@@ -125,9 +144,10 @@ public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
             inputsEmbeds: inputEmbedding(shifted),
             hiddenStates: hidden,
             cache: state.cache,
-            positionOffset: 0)
+            positionOffset: 0,
+            readLast: true)
         state.nextPosition = shifted.dim(1)
-        state.seedHidden = mtpHidden[0..., (-1)..., 0...]
+        state.seedHidden = mtpHidden
         state.seedToken = sampleMTPSeed(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
             lmHead: lmHead, sampler: sampler)
@@ -234,9 +254,10 @@ public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
             inputsEmbeds: inputEmbedding(committedTokens),
             hiddenStates: committedHidden,
             cache: state.cache,
-            positionOffset: state.nextPosition)
+            positionOffset: state.nextPosition,
+            readLast: true)
         state.nextPosition += committedTokens.dim(1)
-        state.seedHidden = mtpHidden[0..., (-1)..., 0...]
+        state.seedHidden = mtpHidden
         state.seedToken = sampleMTPSeed(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
             lmHead: lmHead, sampler: sampler)
@@ -332,14 +353,12 @@ public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
             inputsEmbeds: inputEmbedding(tokens),
             hiddenStates: rows.count == 1 ? paddedHidden[0] : concatenated(paddedHidden, axis: 0),
             cache: packedCaches,
-            positionOffset: nil)
+            positionOffset: nil,
+            rowLengths: inputCounts,
+            readLast: true)
 
-        let seedHidden = inputCounts.enumerated().map { row, count in
-            mtpHidden[row ..< row + 1, (count - 1) ..< count, 0...]
-        }
-        let packedSeedHidden = rows.count == 1 ? seedHidden[0] : concatenated(seedHidden, axis: 0)
-        let logits = lmHead.map { $0(packedSeedHidden) }
-            ?? targetEmbedTokens.asLinear(packedSeedHidden)
+        let seedHidden = rows.indices.map { row in mtpHidden[row ..< row + 1, 0..., 0...] }
+        let logits = lmHead.map { $0(mtpHidden) } ?? targetEmbedTokens.asLinear(mtpHidden)
         let proposals = sampler.sample(logits: logits[0..., -1, 0...])
             .reshaped([rows.count, 1])
 

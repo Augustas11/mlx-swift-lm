@@ -17,6 +17,10 @@ private struct DrafterRoundRow {
     let finalToken: Int
 }
 
+/// Seed-hidden drift of a multi-row packed advance against per-row commits
+/// (the mixed-width bound below).
+private let packedSeedTolerance: Float = 5e-3
+
 @Suite("Qwen35 packed MTP drafter", .serialized)
 struct Qwen35MTPPackedDrafterTests {
     private let target: Qwen35TextModel
@@ -115,9 +119,15 @@ struct Qwen35MTPPackedDrafterTests {
 
     /// Compare two advanced drafter states. Positions, shapes, and the next
     /// proposal must always match exactly. Float contents must match bit for
-    /// bit when `tolerance` is zero, else within it.
+    /// bit when `tolerance` is zero, else within it. The seed hidden of a
+    /// multi-row packed advance is compared within `packedSeedTolerance`
+    /// (`packedSeed`): the last layer's MLP and the final norm run on one
+    /// column per row (#2393), so the packed call multiplies `rows` vectors
+    /// where a per-row commit multiplies one, and the kernels may accumulate
+    /// in another order. The caches stay bit for bit.
     private func expectSameState(
-        _ lhs: MTPDrafterState, _ rhs: MTPDrafterState, row: Int, tolerance: Float = 0
+        _ lhs: MTPDrafterState, _ rhs: MTPDrafterState, row: Int, tolerance: Float = 0,
+        packedSeed: Bool = false
     ) {
         #expect(lhs.nextPosition == rhs.nextPosition, "row \(row) position")
         #expect(lhs.proposalAppended == rhs.proposalAppended, "row \(row) appended")
@@ -125,7 +135,15 @@ struct Qwen35MTPPackedDrafterTests {
         #expect(
             lhs.seedToken!.asArray(Int32.self) == rhs.seedToken!.asArray(Int32.self),
             "row \(row) seed token")
-        var arrays = [(lhs.seedHidden!, rhs.seedHidden!)]
+        var arrays = [(MLXArray, MLXArray)]()
+        #expect(lhs.seedHidden!.shape == rhs.seedHidden!.shape, "row \(row) seed hidden shape")
+        if packedSeed {
+            #expect(
+                maxDifference(lhs.seedHidden!, rhs.seedHidden!)
+                    <= Swift.max(tolerance, packedSeedTolerance), "row \(row) seed hidden drift")
+        } else {
+            arrays.append((lhs.seedHidden!, rhs.seedHidden!))
+        }
         #expect(lhs.cache.count == rhs.cache.count)
         for (left, right) in zip(lhs.cache, rhs.cache) {
             #expect(left.offset == right.offset, "row \(row) cache offset")
@@ -145,8 +163,8 @@ struct Qwen35MTPPackedDrafterTests {
 
     /// Whenever the packed forward runs the same matmul shapes as the per-row
     /// commit, it reproduces the per-row state bit for bit: every row of an
-    /// equal-width batch, and every kind of row (accepted, rejected, depth
-    /// zero) advanced on its own.
+    /// equal-width batch (seed hidden within `packedSeedTolerance`), and
+    /// every kind of row (accepted, rejected, depth zero) advanced on its own.
     @Test func packedAdvanceIsBitExactWhenShapesMatchPerRowCommit() throws {
         let states = [
             preparedState(promptLength: 5, seed: 11),
@@ -161,7 +179,7 @@ struct Qwen35MTPPackedDrafterTests {
         let reference = perRowAdvance(states, equalWidth)
         let packed = try packedAdvance(states, equalWidth)
         for row in equalWidth.indices {
-            expectSameState(packed.states[row], reference[row], row: row)
+            expectSameState(packed.states[row], reference[row], row: row, packedSeed: true)
         }
 
         let single = [
@@ -204,10 +222,10 @@ struct Qwen35MTPPackedDrafterTests {
         #expect(
             packed.proposals.asArray(Int32.self)
                 == reference.flatMap { $0.seedToken!.asArray(Int32.self) })
-        expectSameState(packed.states[0], reference[0], row: 0)
+        expectSameState(packed.states[0], reference[0], row: 0, packedSeed: true)
         expectSameState(packed.states[1], reference[1], row: 1, tolerance: 5e-3)
         expectSameState(packed.states[2], reference[2], row: 2, tolerance: 5e-3)
-        expectSameState(packed.states[3], reference[3], row: 3)
+        expectSameState(packed.states[3], reference[3], row: 3, packedSeed: true)
         #expect(packed.states.map(\.nextPosition) == [7, 3, 10, 3])
         // Inputs are not mutated.
         #expect(states.map(\.nextPosition) == [5, 2, 9, 1])
@@ -231,7 +249,7 @@ struct Qwen35MTPPackedDrafterTests {
         var referenceStates = perRowAdvance(initial, first)
         let firstPacked = try packedAdvance(initial, first)
         for row in first.indices {
-            expectSameState(firstPacked.states[row], referenceStates[row], row: row)
+            expectSameState(firstPacked.states[row], referenceStates[row], row: row, packedSeed: true)
         }
 
         // Row 1 leaves, a fresh row joins, rows 0 and 2 continue.
@@ -246,7 +264,7 @@ struct Qwen35MTPPackedDrafterTests {
         let secondPacked = try packedAdvance(
             [firstPacked.states[2], joined, firstPacked.states[0]], second)
         for row in second.indices {
-            expectSameState(secondPacked.states[row], referenceStates[row], row: row)
+            expectSameState(secondPacked.states[row], referenceStates[row], row: row, packedSeed: true)
         }
         #expect(secondPacked.states.map(\.nextPosition) == [7, 9, 8])
 
@@ -261,7 +279,7 @@ struct Qwen35MTPPackedDrafterTests {
         let thirdPacked = try packedAdvance(secondPacked.states, third)
         expectSameState(thirdPacked.states[0], referenceStates[0], row: 0, tolerance: 5e-3)
         expectSameState(thirdPacked.states[1], referenceStates[1], row: 1, tolerance: 5e-3)
-        expectSameState(thirdPacked.states[2], referenceStates[2], row: 2)
+        expectSameState(thirdPacked.states[2], referenceStates[2], row: 2, packedSeed: true)
     }
 
     /// Changing one row's verdict changes nothing in any other row of the
@@ -286,6 +304,93 @@ struct Qwen35MTPPackedDrafterTests {
         expectSameState(lhs.states[2], rhs.states[2], row: 2)
         #expect(lhs.states[1].nextPosition == 10)
         #expect(rhs.states[1].nextPosition == 9)
+    }
+
+    /// The predictor's full output (every column through the last layer's
+    /// MLP and the final norm), last column only.
+    private func fullLastColumn(
+        tokens: [Int32], hidden: MLXArray, cache: [KVCache], positionOffset: Int
+    ) -> MLXArray {
+        let full = drafter.mtp(
+            inputsEmbeds: target.model.embedTokens(MLXArray(tokens, [1, tokens.count])),
+            hiddenStates: hidden, cache: cache, positionOffset: positionOffset)
+        return full[0..., (-1)..., 0...]
+    }
+
+    /// The last MTP layer's norm and MLP and the final norm run on the read
+    /// column only (#2393). The seed hidden of a prefill, a single-row commit
+    /// and a packed commit of rows with unequal lengths equals the full
+    /// predictor's last valid column (bit for bit where the read column's
+    /// matmul shapes match, else within the mixed-width tolerance), with the
+    /// same proposal and bit-equal caches.
+    @Test func lastColumnPruningMatchesFullPredictor() throws {
+        #expect(mtpLastColumnEnabled)
+        // Prefill.
+        let promptLength = 9
+        let prompt = MLXRandom.randInt(low: 0, high: 16, [1, promptLength], key: MLXRandom.key(5))
+            .asType(.int32)
+        let promptHidden = MLXRandom.normal([1, promptLength, 16], key: MLXRandom.key(6))
+        var prefilled = drafter.makeState(parameters: nil)
+        drafter.prepareDrafterState(
+            target: target, promptTokens: prompt, targetHidden: promptHidden,
+            firstBonus: MLXArray([Int32(4)]), positionDeltas: nil, state: &prefilled,
+            sampler: sampler)
+        let prefillReference = drafter.makeState(parameters: nil)
+        let shifted = prompt[0, 1...].asArray(Int32.self) + [4]
+        let prefillFull = fullLastColumn(
+            tokens: shifted, hidden: promptHidden, cache: prefillReference.cache,
+            positionOffset: 0)
+        eval(prefilled.seedHidden!, prefillFull)
+        #expect(prefilled.seedHidden!.shape == [1, 1, 16])
+        #expect(maxDifference(prefilled.seedHidden!, prefillFull) <= 5e-3, "prefill")
+        for (l, r) in zip(prefilled.cache, prefillReference.cache) {
+            #expect(zip(l.state, r.state).allSatisfy { arrayEqual($0, $1).item(Bool.self) })
+        }
+
+        // Single-row commit of two columns.
+        let states = [
+            preparedState(promptLength: 5, seed: 11),
+            preparedState(promptLength: 2, seed: 21),
+            preparedState(promptLength: 9, seed: 31),
+        ]
+        let rows = [
+            roundRow(proposals: [3], acceptedCount: 1, finalToken: 7, seed: 501),  // 2 columns
+            roundRow(proposals: [], acceptedCount: 0, finalToken: 2, seed: 502),  // 1 column
+            roundRow(proposals: [4], acceptedCount: 1, finalToken: 9, seed: 503),  // 2 columns
+        ]
+        let committed = perRowAdvance([states[0]], [rows[0]])[0]
+        let singleReference = copied(states[0])
+        let singleFull = fullLastColumn(
+            tokens: [3, 7], hidden: rows[0].hidden, cache: singleReference.cache,
+            positionOffset: states[0].nextPosition)
+        eval(singleFull)
+        #expect(maxDifference(committed.seedHidden!, singleFull) <= 5e-3, "single-row commit")
+
+        // Packed commit, unequal row lengths (right-padded to 2).
+        let packed = try packedAdvance(states, rows)
+        #expect(packed.proposals.shape == [3, 1])
+        for (row, (state, round)) in zip(states, rows).enumerated() {
+            let reference = copied(state)
+            let tokens = round.proposals.prefix(round.acceptedCount).map(Int32.init)
+                + [Int32(round.finalToken)]
+            let full = fullLastColumn(
+                tokens: tokens, hidden: round.hidden[0..., ..<tokens.count, 0...],
+                cache: reference.cache, positionOffset: state.nextPosition)
+            eval(full, reference.cache.flatMap(\.state))
+            #expect(maxDifference(packed.states[row].seedHidden!, full) <= 5e-3, "packed \(row)")
+            let logits = target.model.embedTokens.asLinear(full)
+            #expect(
+                packed.proposals[row].asArray(Int32.self)
+                    == argMax(logits[0..., -1, 0...], axis: -1).asType(.int32).asArray(Int32.self),
+                "packed \(row) proposal")
+            #expect(packed.states[row].nextPosition == state.nextPosition + tokens.count)
+            for (l, r) in zip(packed.states[row].cache, reference.cache) {
+                #expect(l.offset == r.offset)
+                #expect(
+                    zip(l.state, r.state).allSatisfy { maxDifference($0, $1) <= 5e-3 },
+                    "packed \(row) cache")
+            }
+        }
     }
 
     @Test func malformedRowsFailBeforeAnyStateChanges() throws {

@@ -69,13 +69,19 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
 
     // MARK: - Head
 
-    private struct Head {
+    struct Head {
         let layer: GLM5NextMTPLayer
         let text: GLM5NextTextModel
 
-        /// The block's output before the shared-head norm, `[B, L, D]`.
+        /// The block's output before the shared-head norm, `[B, L, D]`; with
+        /// `readLast`, only each row's last valid column (`rowLengths[r] - 1`,
+        /// else `L - 1`), `[B, 1, D]`. Attention and the cache write run on
+        /// every column either way; the post-attention norm and the MLP run
+        /// on the read column only (`mtpLastColumnEnabled`), since nothing
+        /// reads the others.
         func forward(
-            tokens: MLXArray, hidden: MLXArray, cache: KVCache, rowLengths: [Int]? = nil
+            tokens: MLXArray, hidden: MLXArray, cache: KVCache, rowLengths: [Int]? = nil,
+            readLast: Bool = false
         ) -> MLXArray {
             let embedded = layer.enorm(text.model.embedTokens(tokens))
             var x = glm5NextProject(
@@ -84,7 +90,10 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
             let (attention, _) = block.selfAttn(
                 block.inputLayerNorm(x), cache: cache, previousTopk: [], rowLengths: rowLengths)
             x = x + attention
-            return x + (block.mlp as! UnaryLayer)(block.postAttentionLayerNorm(x))
+            let columns = rowLengths?.map { $0 - 1 }
+            if readLast, mtpLastColumnEnabled { x = mtpReadColumns(x, columns) }
+            let out = x + (block.mlp as! UnaryLayer)(block.postAttentionLayerNorm(x))
+            return readLast && !mtpLastColumnEnabled ? mtpReadColumns(out, columns) : out
         }
 
         /// One proposal per row from the last column of `raw`, `[B, 1]`.
@@ -94,7 +103,7 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
         }
     }
 
-    private func head(_ target: any LanguageModel) -> Head {
+    func head(_ target: any LanguageModel) -> Head {
         let text: GLM5NextTextModel
         if let model = target as? GLM5NextModel {
             text = model.languageModel
@@ -128,9 +137,9 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
         let start = max(0, length - promptWindow)
         let raw = head.forward(
             tokens: shifted[0..., start...], hidden: targetHidden[0..., start ..< length, 0...],
-            cache: state.cache[0])
+            cache: state.cache[0], readLast: true)
         state.nextPosition = length - start
-        state.seedHidden = raw[0..., (-1)..., 0...]
+        state.seedHidden = raw
         state.seedToken = head.sample(state.seedHidden!, sampler: sampler)
         state.proposalAppended = 0
     }
@@ -222,9 +231,9 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
         let raw = head.forward(
             tokens: concatenated(tokens, axis: 1),
             hidden: targetHidden[0..., keepAppended ..< (acceptedCount + 1), 0...],
-            cache: state.cache[0])
+            cache: state.cache[0], readLast: true)
         state.nextPosition += tokens.count
-        state.seedHidden = raw[0..., (-1)..., 0...]
+        state.seedHidden = raw
         state.seedToken = head.sample(state.seedHidden!, sampler: sampler)
         state.proposalAppended = 0
     }
@@ -295,11 +304,10 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
         let head = head(target)
         let raw = head.forward(
             tokens: tokens, hidden: hidden,
-            cache: GLM5NextLatentCacheBatch(rowCaches: caches), rowLengths: counts)
-        let seedHidden = counts.enumerated().map { row, count in
-            raw[row ..< (row + 1), (count - 1) ..< count, 0...]
-        }
-        let proposals = head.sample(concatenated(seedHidden, axis: 0), sampler: sampler)
+            cache: GLM5NextLatentCacheBatch(rowCaches: caches), rowLengths: counts,
+            readLast: true)
+        let seedHidden = rows.indices.map { row in raw[row ..< (row + 1), 0..., 0...] }
+        let proposals = head.sample(raw, sampler: sampler)
         let states = rows.indices.map { row in
             MTPDrafterState(
                 cache: [caches[row]],
