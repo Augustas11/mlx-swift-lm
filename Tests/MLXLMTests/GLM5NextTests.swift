@@ -6,6 +6,13 @@ import XCTest
 
 @testable import MLXLLM
 
+/// Largest drift of the MTP head's read column when its norm and MoE run on
+/// that column alone (#2393), relative to the column's largest magnitude: one
+/// bfloat16 ulp (2^-7). A prefill's MoE sees one token instead of the window,
+/// so the expert kernels may accumulate in another order (measured 0.5 at a
+/// magnitude of 214); commits stay bit for bit, as do caches and proposals.
+private let mtpPruneTolerance: Float = 1.0 / 128
+
 final class GLM5NextTests: XCTestCase {
 
     // MARK: - Fixtures
@@ -2364,6 +2371,114 @@ final class GLM5NextTests: XCTestCase {
                     "depth2 accepted \(acceptedCount) next seed \(r)")
                 assertDrafterStatesEqual(bases[r], snapshots[r], "unpublished chain/commit row \(r)")
             }
+        }
+    }
+
+    /// The MTP layer's norm and MoE run on the read column only (#2393): the
+    /// seed hidden of a prefill, a single-row commit and a packed commit of
+    /// rows with unequal lengths (right-padded) equals the full block's last
+    /// valid column within `mtpPruneTolerance`, the proposal is the same
+    /// token, and the head's cache is bit-equal (attention and the cache
+    /// write still run on every column).
+    func testMTPLastColumnPruningMatchesFullBlock() throws {
+        XCTAssertTrue(mtpLastColumnEnabled)
+        let model = try fusedShapesModel(seed: 231)
+        let drafter = GLM5NextMTPDraftModel(model.configuration, maximumDepth: 2)
+        let head = drafter.head(model)
+        let sampler = GenerateParameters(temperature: 0).sampler()
+        let D = model.configuration.hiddenSize
+
+        func assertClose(_ pruned: MLXArray, _ full: MLXArray, _ what: String) {
+            eval(pruned, full)
+            XCTAssertEqual(pruned.shape, full.shape, what)
+            let scale = abs(full.asType(.float32)).max().item(Float.self)
+            XCTAssertLessThanOrEqual(maxAbsDifference(pruned, full), mtpPruneTolerance * scale, what)
+            XCTAssertEqual(
+                head.sample(pruned, sampler: sampler).asArray(Int32.self),
+                head.sample(full, sampler: sampler).asArray(Int32.self), "\(what): proposal")
+        }
+
+        // Prefill.
+        var prepared = [MTPDrafterState]()
+        for (r, length) in [13, 6, 9].enumerated() {
+            let prompt = tokens(length, seed: UInt64(232 + r))
+            let cache = try model.newCache(parameters: nil)
+            let out = model(LMInput.Text(tokens: prompt), cache: cache, state: emitState())
+            let bonus = argMax(out.logits[0..., -1, 0...], axis: -1)
+            let hidden = try XCTUnwrap(out.state?[mtpLastHiddenStatesKey])
+            var state = drafter.makeState(parameters: nil)
+            drafter.prepareDrafterState(
+                target: model, promptTokens: prompt, targetHidden: hidden, firstBonus: bonus,
+                positionDeltas: nil, state: &state, sampler: sampler)
+            let reference = drafter.makeState(parameters: nil)
+            let shifted = concatenated([prompt[0..., 1...], normalizedMTPColumn(bonus)], axis: 1)
+            let full = head.forward(
+                tokens: shifted, hidden: hidden[0..., ..<length, 0...], cache: reference.cache[0])
+            assertClose(state.seedHidden!, full[0..., (-1)..., 0...], "prefill row \(r)")
+            assertCachesEqual(state.cache, reference.cache, "prefill row \(r)")
+            prepared.append(state)
+        }
+
+        // Single-row commit of three columns (two accepted proposals).
+        let commitHidden = (0 ..< 3).map { r in
+            withRandomState(MLXRandom.RandomState(seed: UInt64(240 + r))) {
+                MLXRandom.normal([1, 3, D]).asType(.bfloat16)
+            }
+        }
+        var single = copyState(prepared[0])
+        drafter.commitDrafterState(
+            target: model, targetHidden: commitHidden[0],
+            draftTokens: MLXArray([Int32(17), Int32(5)]).reshaped(1, 2), acceptedCount: 2,
+            finalToken: MLXArray([Int32(9)]), positionDeltas: nil, state: &single,
+            sampler: sampler)
+        let singleReference = copyState(prepared[0])
+        let singleFull = head.forward(
+            tokens: MLXArray([Int32(17), Int32(5), Int32(9)]).reshaped(1, 3),
+            hidden: commitHidden[0], cache: singleReference.cache[0])
+        assertClose(single.seedHidden!, singleFull[0..., (-1)..., 0...], "single-row commit")
+        assertCachesEqual(single.cache, singleReference.cache, "single-row commit")
+
+        // Packed commit: 3, 1 and 2 columns per row, right-padded to 3.
+        let accepted: [[Int]] = [[17, 5], [], [23]]
+        let finals = [9, 41, 2]
+        let packed = try drafter.advanceAndProposePacked(
+            target: model,
+            rows: (0 ..< 3).map { r in
+                MTPPackedDrafterAdvanceRow(
+                    targetHidden: commitHidden[r][0..., ..<(accepted[r].count + 1), 0...],
+                    acceptedTokens: accepted[r], finalToken: finals[r], positionDeltas: nil,
+                    state: prepared[r])
+            },
+            sampler: sampler)
+        let counts = accepted.map { $0.count + 1 }
+        let width = counts.max()!
+        let paddedTokens = MLXArray(
+            (0 ..< 3).flatMap { r in
+                (accepted[r] + [finals[r]]).map(Int32.init)
+                    + Array(repeating: Int32(0), count: width - counts[r])
+            }, [3, width])
+        let paddedHidden = concatenated(
+            (0 ..< 3).map { r in
+                let h = commitHidden[r][0..., ..<counts[r], 0...]
+                return counts[r] == width
+                    ? h
+                    : concatenated(
+                        [h, MLXArray.zeros([1, width - counts[r], D], dtype: h.dtype)], axis: 1)
+            }, axis: 0)
+        let referenceCaches = prepared.map { $0.cache[0].copy() as! GLM5NextAttentionCache }
+        let packedFull = head.forward(
+            tokens: paddedTokens, hidden: paddedHidden,
+            cache: GLM5NextLatentCacheBatch(rowCaches: referenceCaches), rowLengths: counts)
+        XCTAssertEqual(packed.proposals.shape, [3, 1])
+        for r in 0 ..< 3 {
+            assertClose(
+                packed.states[r].seedHidden!,
+                packedFull[r ..< (r + 1), (counts[r] - 1) ..< counts[r], 0...],
+                "packed row \(r)")
+            assertBitwiseEqual(
+                packed.proposals[r ..< (r + 1)], packed.states[r].seedToken,
+                "packed row \(r) proposal")
+            assertCachesEqual(packed.states[r].cache, [referenceCaches[r]], "packed row \(r)")
         }
     }
 
