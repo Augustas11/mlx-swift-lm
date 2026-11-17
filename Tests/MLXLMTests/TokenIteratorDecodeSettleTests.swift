@@ -1,5 +1,6 @@
 // Copyright © 2026 Apple Inc.
 
+import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
@@ -26,7 +27,7 @@ final class TokenIteratorDecodeSettleTests: XCTestCase {
     /// The pre-#2373 loop: a whole short prompt as the first forward, then one
     /// greedy token per step with `[token] + state` evaluated asynchronously.
     private func referenceTokens(
-        model: LlamaModel, parameters: GenerateParameters, count: Int
+        model: any LanguageModel, parameters: GenerateParameters, count: Int
     ) throws -> [Int] {
         let cache = try model.newCache(parameters: parameters)
         var logits = model(MLXArray(prompt)[.newAxis], cache: cache)
@@ -44,7 +45,7 @@ final class TokenIteratorDecodeSettleTests: XCTestCase {
     }
 
     private func iteratorTokens(
-        model: LlamaModel, parameters: GenerateParameters, count: Int
+        model: any LanguageModel, parameters: GenerateParameters, count: Int
     ) throws -> (tokens: [Int], cache: [KVCache]) {
         let cache = try model.newCache(parameters: parameters)
         var iterator = try TokenIterator(
@@ -87,6 +88,65 @@ final class TokenIteratorDecodeSettleTests: XCTestCase {
 
         XCTAssertEqual(
             tokens, try referenceTokens(model: model, parameters: parameters, count: 80))
+    }
+
+    /// LFM3 with conv, sliding-attention and full-attention layers, at the size
+    /// `LFM3Tests` uses, with random weights.
+    private func makeTinyHybridModel() throws -> LFM3Model {
+        MLXRandom.seed(2373)
+        let configuration = try JSONDecoder().decode(
+            LFM3Configuration.self,
+            from: Data(
+                """
+                {
+                    "model_type": "lfm3", "vocab_size": 64, "hidden_size": 32,
+                    "intermediate_size": 48, "num_hidden_layers": 6,
+                    "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+                    "norm_eps": 1e-5, "conv_L_cache": 3, "conv_bias": false,
+                    "sliding_window": 4, "use_sandwich_norm": true,
+                    "tie_word_embeddings": true,
+                    "layer_types": [
+                        "conv", "sliding_attention", "full_attention", "conv",
+                        "sliding_attention", "full_attention"
+                    ],
+                    "rope_parameters": {
+                        "full_attention": {
+                            "rope_type": "default", "rope_theta": 1000000.0,
+                            "partial_rotary_factor": 0.5
+                        },
+                        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}
+                    }
+                }
+                """.utf8))
+        let model = LFM3Model(configuration)
+        eval(model)
+        return model
+    }
+
+    func testHybridConvAttentionCacheKeepsConvStateAndKeepsTokens() throws {
+        let model = try makeTinyHybridModel()
+        // 200 decode steps: the 4-row sliding window wraps many times and the
+        // full-attention caches grow to 205 rows.
+        let parameters = GenerateParameters(maxTokens: 200, temperature: 0)
+        let (tokens, cache) = try iteratorTokens(model: model, parameters: parameters, count: 200)
+        XCTAssertEqual(tokens.count, 200)
+        XCTAssertTrue(cache.contains { $0 is MambaCache })
+        XCTAssertTrue(cache.contains { type(of: $0) == KVCacheSimple.self })
+
+        // Plain attention layers add nothing; every other layer adds its state, in order.
+        let kept = cache.filter {
+            type(of: $0) != KVCacheSimple.self && type(of: $0) != RotatingKVCache.self
+        }
+        XCTAssertTrue(kept.allSatisfy { $0 is MambaCache })
+        let expected = kept.flatMap { $0.state }
+        let settled = decodeSettleArrays(cache)
+        XCTAssertFalse(expected.isEmpty)
+        XCTAssertEqual(settled.count, expected.count)
+        XCTAssertTrue(
+            zip(settled, expected).allSatisfy { arrayEqual($0, $1).item(Bool.self) })
+
+        XCTAssertEqual(
+            tokens, try referenceTokens(model: model, parameters: parameters, count: 200))
     }
 
     func testOtherCachesKeepState() throws {
