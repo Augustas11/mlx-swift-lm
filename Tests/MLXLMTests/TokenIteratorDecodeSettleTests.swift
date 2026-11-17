@@ -7,7 +7,7 @@ import MLXNN
 import XCTest
 
 /// #2373: `TokenIterator.next()` settles `KVCacheSimple` and `RotatingKVCache`
-/// through their stored buffers, not through `state` slices of the live rows.
+/// through the token alone; other caches keep their `state` in the evaluation.
 final class TokenIteratorDecodeSettleTests: XCTestCase {
 
     private func makeTinyModel() -> LlamaModel {
@@ -58,28 +58,24 @@ final class TokenIteratorDecodeSettleTests: XCTestCase {
         return (tokens, cache)
     }
 
-    func testSimpleCacheSettlesStoredBuffersAndKeepsTokens() throws {
+    func testSimpleCacheSettlesThroughTheTokenAndKeepsTokens() throws {
         let model = makeTinyModel()
         let parameters = GenerateParameters(maxTokens: 40, temperature: 0)
         let (tokens, cache) = try iteratorTokens(model: model, parameters: parameters, count: 40)
         XCTAssertEqual(tokens.count, 40)
         XCTAssertTrue(cache.allSatisfy { type(of: $0) == KVCacheSimple.self })
 
-        // Offset 45 sits inside the first 256-row block: `state` would slice, the
-        // settle arrays are the stored buffers themselves.
-        let settled = decodeSettleArrays(cache)
-        XCTAssertEqual(settled.count, 2 * cache.count)
-        for (array, layer) in zip(settled, cache.flatMap { $0.innerState() }) {
-            XCTAssertTrue(array === layer)
-            XCTAssertEqual(array.dim(2), 256)
-        }
+        // Nothing but the token is evaluated for these caches; the rows the
+        // decode wrote are there all the same.
+        XCTAssertTrue(decodeSettleArrays(cache).isEmpty)
+        XCTAssertEqual(cache[0].offset, prompt.count + 40)
         XCTAssertEqual(cache[0].state[0].dim(2), cache[0].offset)
 
         XCTAssertEqual(
             tokens, try referenceTokens(model: model, parameters: parameters, count: 40))
     }
 
-    func testRotatingCacheSettlesStoredBuffersAndKeepsTokensAcrossWrap() throws {
+    func testRotatingCacheSettlesThroughTheTokenAndKeepsTokensAcrossWrap() throws {
         let model = makeTinyModel()
         // 5 prompt rows plus 80 decode rows wrap a 32-row ring twice.
         let parameters = GenerateParameters(maxTokens: 80, maxKVSize: 32, temperature: 0)
@@ -87,11 +83,7 @@ final class TokenIteratorDecodeSettleTests: XCTestCase {
         XCTAssertEqual(tokens.count, 80)
         XCTAssertTrue(cache.allSatisfy { type(of: $0) == RotatingKVCache.self })
 
-        let settled = decodeSettleArrays(cache)
-        XCTAssertEqual(settled.count, 2 * cache.count)
-        for (array, layer) in zip(settled, cache.flatMap { $0.innerState() }) {
-            XCTAssertTrue(array === layer)
-        }
+        XCTAssertTrue(decodeSettleArrays(cache).isEmpty)
 
         XCTAssertEqual(
             tokens, try referenceTokens(model: model, parameters: parameters, count: 80))

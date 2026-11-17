@@ -686,19 +686,21 @@ extension TokenIteratorProtocol {
     public mutating func discardGeneratedToken() {}
 }
 
-/// The cache arrays ``TokenIterator`` evaluates with each decode token.
+/// The cache arrays ``TokenIterator`` evaluates with each decode token, beside
+/// the token itself.
 ///
-/// `KVCacheSimple` and `RotatingKVCache` give their stored buffers: the decode
-/// graph already computes them, so evaluating them adds no operation. Their
-/// `state` slices the live rows instead, which put two `Slice` operations per
-/// layer into every token's evaluation that nothing reads (#2373). The values
-/// computed are the same either way. Every other cache, subclasses included,
-/// keeps `state`.
+/// `KVCacheSimple` and `RotatingKVCache` give none: attention reads the rows
+/// they write, so evaluating the token evaluates them, as in Python mlx-lm's
+/// `generate_step`. With their buffers in every token's evaluation, decode on
+/// plain-attention models measured slower than mlx-lm, more so the longer the
+/// cached sequence (#2373); why is not established. Every other cache,
+/// subclasses included, keeps `state`: some hold arrays no forward pass reads,
+/// or reads only after many steps.
 package func decodeSettleArrays(_ cache: [KVCache]) -> [MLXArray] {
     cache.flatMap { layer -> [MLXArray] in
         let kind = type(of: layer)
         if kind == KVCacheSimple.self || kind == RotatingKVCache.self {
-            return layer.innerState()
+            return []
         }
         return layer.state
     }
@@ -960,11 +962,8 @@ public struct TokenIterator: TokenIteratorProtocol {
             // compute the next state and async eval the next token
             let token = step(previous: previousY)
             y = .init(tokens: token)
-            // Evaluate the cache state together with the token: caches update
-            // through functional ops (concatenation, slice assignment), and an
-            // unevaluated chain of those updates keeps every prior step's
-            // intermediates alive. Python mlx-lm settles cache state the same
-            // way in its generation loop.
+            // Evaluate the token, and with it the state of the caches whose
+            // arrays the token does not settle (`decodeSettleArrays`).
             asyncEval([token] + decodeSettleArrays(cache))
 
             // Periodically return freed buffers that cannot be reused (odd or
