@@ -311,6 +311,88 @@ final class Qwen4ExpTests: XCTestCase {
         XCTAssertEqual(mapped.quantization(layer: "lm_head")?.bits, 8)
     }
 
+    /// The oQ4e build quantizes a hyper-connection's mix down and block inject
+    /// at different widths (layer 16: down 4-bit, unlisted in the config; inject
+    /// 5-bit, listed). mlx-lm merges the two and cannot load it; this port keeps
+    /// them apart. Through `loadWeights`, each part gets its own config entry
+    /// and computes its rows of the dequantized matmul; a missing entry fails
+    /// the load instead of reading a part at the wrong width.
+    func testMixedPrecisionBlockInjectLoadsApartFromTheMixDown() throws {
+        // CPU: the quantized matmuls of this check need no Metal.
+        try Device.withDefaultDevice(.cpu) { try checkMixedPrecisionBlockInject() }
+    }
+
+    private func checkMixedPrecisionBlockInject() throws {
+        let config = try tinyConfiguration(nested: true)
+        let source = Qwen4ExpModel(config)
+        randomize(source)
+        // Layer 0: quantize(model:) updates modules by path, and a sparse layer list
+        // (layer 1 alone) is not an array to it.
+        let hc = "language_model.model.layers.0.attn_hyper_connection."
+        var weights = Dictionary(uniqueKeysWithValues: source.parameters().flattened())
+        let (down, inject) = withRandomState(MLXRandom.RandomState(seed: 21)) {
+            (MLXRandom.normal([8, 64]), MLXRandom.normal([2, 64]))
+        }
+        let qd = quantized(down, groupSize: 64, bits: 4)
+        let qi = quantized(inject, groupSize: 32, bits: 8)
+        weights[hc + "input_mix_weight_down.weight"] = qd.wq
+        weights[hc + "input_mix_weight_down.scales"] = qd.scales
+        weights[hc + "input_mix_weight_down.biases"] = qd.biases
+        weights[hc + "block_inject_weight.weight"] = qi.wq
+        weights[hc + "block_inject_weight.scales"] = qi.scales
+        weights[hc + "block_inject_weight.biases"] = qi.biases
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen4exp-mixed-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try save(arrays: weights, url: directory.appendingPathComponent("model.safetensors"))
+
+        // As the checkpoint's config: the inject listed, the mix down at the default.
+        let listed = BaseConfiguration.PerLayerQuantization(
+            quantization: .init(groupSize: 64, bits: 4),
+            perLayerQuantization: [
+                String(hc.dropLast()) + ".block_inject_weight": .quantize(
+                    .init(groupSize: 32, bits: 8))
+            ])
+        let model = Qwen4ExpModel(config)
+        try loadWeights(modelDirectory: directory, model: model, perLayerQuantization: listed)
+
+        let residual = model.languageModel.model.layers[0].attnHyperConnection
+        let downLayer = try XCTUnwrap(residual.inputMixWeightDown as? QuantizedLinear)
+        let injectLayer = try XCTUnwrap(residual.blockInjectWeight as? QuantizedLinear)
+        XCTAssertEqual([downLayer.bits, downLayer.groupSize], [4, 64])
+        XCTAssertEqual([injectLayer.bits, injectLayer.groupSize], [8, 32])
+
+        let hyper = withRandomState(MLXRandom.RandomState(seed: 22)) {
+            MLXRandom.normal([1, 3, 64])
+        }
+        let normed = residual.hcNorm(hyper)
+        let downRows = dequantized(
+            qd.wq, scales: qd.scales, biases: qd.biases, groupSize: 64, bits: 4)
+        let injectRows = dequantized(
+            qi.wq, scales: qi.scales, biases: qi.biases, groupSize: 32, bits: 8)
+        var w = silu(matmul(normed, downRows.T) / 2)
+        w = sigmoid(residual.inputMixWeightUp(w)).reshaped(1, 3, 2, 32)
+        let wantMixed = (w * normed.reshaped(1, 3, 2, 32)).mean(axis: -2)
+        let wantInject = 2 * sigmoid(matmul(normed, injectRows.T) / 2)
+        let (mixed, injectScale) = residual.combine(hyper)
+        XCTAssertTrue(
+            allClose(injectScale, wantInject, rtol: 1e-4, atol: 1e-4).item(Bool.self),
+            "inject max diff \(abs(injectScale - wantInject).max().item(Float.self))")
+        XCTAssertTrue(
+            allClose(mixed, wantMixed, rtol: 1e-4, atol: 1e-4).item(Bool.self),
+            "mixed max diff \(abs(mixed - wantMixed).max().item(Float.self))")
+
+        // Without the inject's entry it would be read at the default 4 bits: refused.
+        let unlisted = BaseConfiguration.PerLayerQuantization(
+            quantization: .init(groupSize: 64, bits: 4), perLayerQuantization: [:])
+        XCTAssertThrowsError(
+            try loadWeights(
+                modelDirectory: directory, model: Qwen4ExpModel(config),
+                perLayerQuantization: unlisted))
+    }
+
     func testForwardShapesAndIncrementalDecodeMatchesPrefill() throws {
         let model = Qwen4ExpTextModel(try tinyConfiguration())
         randomize(model)
