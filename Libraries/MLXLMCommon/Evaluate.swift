@@ -689,18 +689,21 @@ extension TokenIteratorProtocol {
 /// The cache arrays ``TokenIterator`` evaluates with each decode token, beside
 /// the token itself.
 ///
-/// `KVCacheSimple` and `RotatingKVCache` give none: attention reads the rows
-/// they write, so evaluating the token evaluates them, as in Python mlx-lm's
-/// `generate_step`. With their buffers in every token's evaluation, decode on
-/// plain-attention models measured slower than mlx-lm, more so the longer the
-/// cached sequence (#2373); why is not established. Every other cache,
-/// subclasses included, keeps `state`: some hold arrays no forward pass reads,
-/// or reads only after many steps.
+/// `KVCacheSimple` and `RotatingKVCache` give none of the buffers attention
+/// reads: attention reads the rows they write, so evaluating the token
+/// evaluates them, as in Python mlx-lm's `generate_step`. With those buffers in
+/// every token's evaluation, decode on plain-attention models measured slower
+/// than mlx-lm, more so the longer the cached sequence (#2373); why is not
+/// established. A zero-width buffer stays in the evaluation: a model that
+/// stores keys only (DeepSeek V4's window layers) still writes it every step
+/// and no attention reads it. Every other cache, subclasses included, keeps
+/// `state`: some hold arrays no forward pass reads, or reads only after many
+/// steps.
 package func decodeSettleArrays(_ cache: [KVCache]) -> [MLXArray] {
     cache.flatMap { layer -> [MLXArray] in
         let kind = type(of: layer)
         if kind == KVCacheSimple.self || kind == RotatingKVCache.self {
-            return []
+            return layer.innerState().filter { $0.size == 0 }
         }
         return layer.state
     }

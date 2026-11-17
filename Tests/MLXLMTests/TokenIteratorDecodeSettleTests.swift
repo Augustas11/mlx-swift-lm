@@ -149,6 +149,25 @@ final class TokenIteratorDecodeSettleTests: XCTestCase {
             tokens, try referenceTokens(model: model, parameters: parameters, count: 200))
     }
 
+    /// A window that stores keys only (DeepSeek V4) writes a zero-width values
+    /// buffer every step that no attention reads: it stays in the evaluation.
+    func testZeroWidthBufferOfAPlainCacheStaysInTheEvaluation() throws {
+        let window = RotatingKVCache(maxSize: 8)
+        for _ in 0 ..< 3 {
+            let keys = MLXRandom.normal([1, 1, 2, 16])
+            _ = window.update(keys: keys, values: MLXArray.zeros([1, 1, 2, 0], dtype: keys.dtype))
+        }
+        let settled = decodeSettleArrays([window])
+        XCTAssertEqual(settled.count, 1)
+        XCTAssertEqual(settled[0].size, 0)
+        XCTAssertTrue(settled[0] === window.innerState()[1])
+
+        let ordinary = RotatingKVCache(maxSize: 8)
+        let rows = MLXRandom.normal([1, 1, 2, 16])
+        _ = ordinary.update(keys: rows, values: rows)
+        XCTAssertTrue(decodeSettleArrays([ordinary]).isEmpty)
+    }
+
     func testOtherCachesKeepState() throws {
         let quantized = QuantizedKVCache(groupSize: 64, bits: 4)
         let keys = MLXRandom.normal([1, 4, 3, 64])
