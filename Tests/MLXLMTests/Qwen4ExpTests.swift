@@ -452,4 +452,112 @@ final class Qwen4ExpTests: XCTestCase {
             }
         }
     }
+
+    // MARK: - Continuous batching (Metal)
+
+    /// Prompt lengths on both sides of the indexer budget (8), so some rows
+    /// decode on the causal path and most on the sparse one.
+    private static let batchPromptLengths = [3, 21, 9, 30, 14, 5, 26, 17, 11, 33, 7, 24, 19, 2, 28, 12]
+
+    private func greedy(_ logits: MLXArray) -> [Int32] {
+        argMax(logits[0..., -1, 0...], axis: -1).asType(.int32).asArray(Int32.self)
+    }
+
+    /// A model whose rows are prefilled alone and then decoded `steps` greedy
+    /// tokens together through `Qwen4ExpAttentionCacheBatch` and packed
+    /// recurrent caches must give every row the tokens and logits of that row
+    /// decoded alone. Returns the largest |logit difference|.
+    private func checkBatchedDecodeMatchesSerial(
+        _ model: Qwen4ExpTextModel, rows: Int, steps: Int, file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws -> Float {
+        let prompts: [[Int32]] = (0 ..< rows).map { r in
+            let n = Self.batchPromptLengths[r % Self.batchPromptLengths.count]
+            return withRandomState(MLXRandom.RandomState(seed: UInt64(100 + r))) {
+                MLXRandom.randInt(0 ..< 64, [n]).asType(.int32).asArray(Int32.self)
+            }
+        }
+        func prefill(_ prompt: [Int32]) throws -> ([KVCache], Int32) {
+            let cache = try model.newCache(parameters: nil)
+            let logits = model(MLXArray(prompt).reshaped(1, -1), cache: cache)
+            return (cache, greedy(logits)[0])
+        }
+
+        // Each row alone.
+        var serialTokens = [[Int32]]()
+        var serialLogits = [[MLXArray]]()
+        for prompt in prompts {
+            var (cache, token) = try prefill(prompt)
+            var tokens = [Int32]()
+            var logits = [MLXArray]()
+            for _ in 0 ..< steps {
+                let out = model(MLXArray([token]).reshaped(1, 1), cache: cache)
+                eval(out)
+                token = greedy(out)[0]
+                tokens.append(token)
+                logits.append(out[0, 0])
+            }
+            serialTokens.append(tokens)
+            serialLogits.append(logits)
+        }
+
+        // The same rows prefilled alone, then decoded together.
+        let prefilled = try prompts.map(prefill)
+        let batchCache: [KVCache] = (0 ..< model.model.layers.count).map { layer in
+            let caches = prefilled.map { $0.0[layer] }
+            if let first = caches[0] as? ArraysCache {
+                let packed = first.copy() as! ArraysCache
+                for other in caches.dropFirst() {
+                    packed.extend(other: other as! ArraysCache)
+                }
+                return packed
+            }
+            return Qwen4ExpAttentionCacheBatch(
+                rowCaches: caches.map { $0 as! any Qwen4ExpSparseCache })
+        }
+        var tokens = prefilled.map(\.1)
+        var maxDiff: Float = 0
+        for step in 0 ..< steps {
+            let out = model(MLXArray(tokens).reshaped(rows, 1), cache: batchCache)
+            eval(out)
+            tokens = greedy(out)
+            for r in 0 ..< rows {
+                maxDiff = max(
+                    maxDiff, abs(out[r, 0] - serialLogits[r][step]).max().item(Float.self))
+                XCTAssertEqual(
+                    tokens[r], serialTokens[r][step], "B=\(rows) row \(r) step \(step)",
+                    file: file, line: line)
+            }
+        }
+        return maxDiff
+    }
+
+    func testBatchedDecodeMatchesSerialRowForRow() throws {
+        let model = Qwen4ExpTextModel(try tinyConfiguration())
+        randomize(model)
+        for rows in [2, 8, 16] {
+            let diff = try checkBatchedDecodeMatchesSerial(model, rows: rows, steps: 32)
+            print("Qwen4Exp batched decode float32 B=\(rows): max |logit diff| \(diff)")
+            XCTAssertEqual(diff, 0, "B=\(rows)")
+        }
+    }
+
+    /// As the checkpoint: every linear whose input width fits the group size
+    /// quantized (4-bit, group 32), the rest (hyper-connection mix up, expert
+    /// down projections) left in float.
+    func testBatchedDecodeMatchesSerialRowForRowQuantized() throws {
+        let model = Qwen4ExpTextModel(try tinyConfiguration())
+        randomize(model)
+        quantize(model: model, groupSize: 32, bits: 4) { path, module in
+            if let linear = module as? Linear { return linear.weight.dim(-1) % 32 == 0 }
+            // The experts' down projections read 16 wide.
+            return module is SwitchLinear && !path.hasSuffix("down_proj")
+        }
+        eval(model)
+        for rows in [2, 8, 16] {
+            let diff = try checkBatchedDecodeMatchesSerial(model, rows: rows, steps: 32)
+            print("Qwen4Exp batched decode quantized B=\(rows): max |logit diff| \(diff)")
+            XCTAssertEqual(diff, 0, "B=\(rows)")
+        }
+    }
 }
