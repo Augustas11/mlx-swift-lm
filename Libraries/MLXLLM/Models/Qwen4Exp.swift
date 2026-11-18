@@ -13,8 +13,9 @@
 //  nothing.
 //
 //  Not in this port: the MTP head (its tensors are dropped on load), the
-//  vision tower (dropped), batched serving with padding (serial only), FP8
-//  checkpoints. Anything else the checkpoint holds that the port does not
+//  vision tower (dropped), FP8 checkpoints. Batched decode (continuous
+//  batching) runs each row as its serial forward would: see
+//  `Qwen4ExpBatchedSparseCache` and `qwen4ExpRowwise`. Anything else the checkpoint holds that the port does not
 //  understand fails the load.
 //
 
@@ -87,6 +88,18 @@ func qwen4ExpKeepLast(_ x: MLXArray, n: Int, lengths: MLXArray?) -> MLXArray {
     return takeAlong(x, positions, axis: 1)
 }
 
+/// `layer(x)` with each row of a multi-row batch computed alone when the
+/// layer is a plain (unquantized) `Linear`. Metal runs a one-row float matmul
+/// as GEMV and a many-row one as GEMM, and the two round differently (about
+/// 1e-3 relative in float32), so batching rows would change each row's
+/// result. A quantized layer runs every row at once: its vector kernel gives
+/// each row the same result at any row count up to the device's vector limit.
+func qwen4ExpRowwise(_ layer: Linear, _ x: MLXArray) -> MLXArray {
+    let rows = x.dim(0)
+    guard rows > 1, !(layer is QuantizedLinear) else { return layer(x) }
+    return concatenated((0 ..< rows).map { layer(x[$0 ..< ($0 + 1)]) }, axis: 0)
+}
+
 /// Add `x` to every hyper-connection stream, scaled per stream.
 func qwen4ExpInject(_ hyper: MLXArray, _ x: MLXArray, _ inject: MLXArray) -> MLXArray {
     let scaled = expandedDimensions(x, axis: -2) * expandedDimensions(inject, axis: -1)
@@ -131,11 +144,16 @@ final class Qwen4ExpQSAIndexer: Module {
 
     /// The sparse attention mask `[B, 1, L, T]`, or `nil` when every visible
     /// token fits in the budget (the causal mask is enough).
-    func callAsFunction(_ x: MLXArray, cache: Qwen4ExpAttentionCache?) -> MLXArray? {
-        let B = x.dim(0)
-        let S = x.dim(1)
+    func callAsFunction(_ x: MLXArray, cache: (any Qwen4ExpSparseCache)?) -> MLXArray? {
+        select(qk: qwen4ExpRowwise(indexQKProj, x), cache: cache)
+    }
+
+    /// The sparse mask from the projected `index_qk_proj` output of the new
+    /// tokens; with a cache, of one sequence.
+    func select(qk: MLXArray, cache: (any Qwen4ExpSparseCache)?) -> MLXArray? {
+        let B = qk.dim(0)
+        let S = qk.dim(1)
         let r = compressRatio
-        let qk = indexQKProj(x)
         let split = nHeads * headDim
         let q = qk[.ellipsis, ..<split].reshaped(B, S, nHeads, headDim)
         // One key head (`indexer_kv_heads` is 1).
@@ -228,22 +246,80 @@ final class Qwen4ExpAttention: Module {
         super.init()
     }
 
+    /// A `Qwen4ExpBatchedSparseCache` holds one cache per row of `x`
+    /// (continuous batching): the projections run on all rows at once, then
+    /// each row's norms, RoPE, cache update, indexer block selection and
+    /// attention run against its own cache at its own offset, exactly as a
+    /// serial forward of that row. Any other cache serves all of `x`.
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: Qwen4ExpAttentionCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
-        let B = x.dim(0)
-        let S = x.dim(1)
-        let offset = cache?.offset ?? 0
+        if let batch = cache as? any Qwen4ExpBatchedSparseCache {
+            return batchedAttention(x, batch: batch)
+        }
+        let merged = attend(
+            q: qwen4ExpRowwise(qProj, x), k: qwen4ExpRowwise(kProj, x),
+            v: qwen4ExpRowwise(vProj, x), indexQK: qwen4ExpRowwise(indexer.indexQKProj, x),
+            mask: mask, cache: cache as? any Qwen4ExpSparseCache)
+        return qwen4ExpRowwise(oProj, merged)
+    }
 
-        let qSplit = qProj(x).reshaped(B, S, nHeads, -1).split(parts: 2, axis: -1)
+    private func batchedAttention(_ x: MLXArray, batch: any Qwen4ExpBatchedSparseCache)
+        -> MLXArray
+    {
+        let rows = batch.rowCaches
+        let (B, L) = (x.dim(0), x.dim(1))
+        precondition(
+            rows.count == B, "Qwen4Exp batched cache has \(rows.count) rows for a batch of \(B)")
+        let lengths = batch.rowLengths
+        precondition(lengths == nil || lengths!.count == B)
+
+        let q = qwen4ExpRowwise(qProj, x)
+        let k = qwen4ExpRowwise(kProj, x)
+        let v = qwen4ExpRowwise(vProj, x)
+        let indexQK = qwen4ExpRowwise(indexer.indexQKProj, x)
+
+        var outputs = [MLXArray]()
+        for (index, rowCache) in rows.enumerated() {
+            let n = lengths?[index] ?? L
+            precondition(n >= 1 && n <= L, "Qwen4Exp row length \(n) outside 1...\(L)")
+            func row(_ a: MLXArray) -> MLXArray {
+                if B == 1 && n == L { return a }
+                return n == L ? a[index ..< (index + 1)] : a[index ..< (index + 1), ..<n]
+            }
+            // A lone forward of the row: no mask for one token, causal past it.
+            let out = attend(
+                q: row(q), k: row(k), v: row(v), indexQK: row(indexQK),
+                mask: n == 1 ? .none : .causal, cache: rowCache)
+            if n < L {
+                // Padded columns attend nothing and wrote no cache.
+                let padding = MLXArray.zeros([1, L - n, out.dim(2)], dtype: out.dtype)
+                outputs.append(concatenated([out, padding], axis: 1))
+            } else {
+                outputs.append(out)
+            }
+        }
+        return qwen4ExpRowwise(oProj, B == 1 ? outputs[0] : concatenated(outputs, axis: 0))
+    }
+
+    /// The gated attention output (before `o_proj`) from the projected
+    /// queries (with the output gate), keys, values and indexer `qk`.
+    private func attend(
+        q qGated: MLXArray, k kProjected: MLXArray, v vProjected: MLXArray, indexQK: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: (any Qwen4ExpSparseCache)?
+    ) -> MLXArray {
+        let B = qGated.dim(0)
+        let S = qGated.dim(1)
+        let offset = cache?.ropeOffset
+
+        let qSplit = qGated.reshaped(B, S, nHeads, -1).split(parts: 2, axis: -1)
         let gate = qSplit[1].reshaped(B, S, -1)
         var q = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
-        var k = kNorm(kProj(x).reshaped(B, S, nKVHeads, -1)).transposed(0, 2, 1, 3)
-        var v = vProj(x).reshaped(B, S, nKVHeads, -1).transposed(0, 2, 1, 3)
+        var k = kNorm(kProjected.reshaped(B, S, nKVHeads, -1)).transposed(0, 2, 1, 3)
+        var v = vProjected.reshaped(B, S, nKVHeads, -1).transposed(0, 2, 1, 3)
 
-        q = rope(q, offset: offset)
-        k = rope(k, offset: offset)
+        q = applyRotaryPosition(rope, to: q, offset: offset)
+        k = applyRotaryPosition(rope, to: k, offset: offset)
 
         if let cache {
             (k, v) = cache.update(keys: k, values: v)
@@ -251,14 +327,14 @@ final class Qwen4ExpAttention: Module {
 
         // The sparse mask is causal and has no padding: it replaces `mask`.
         var maskMode = mask
-        if let sparse = indexer(x, cache: cache) {
+        if let sparse = indexer.select(qk: indexQK, cache: cache) {
             maskMode = .array(sparse)
         }
 
         let out = MLXFast.scaledDotProductAttention(
             queries: q, keys: k, values: v, scale: scale, mask: maskMode)
         let merged = out.transposed(0, 2, 1, 3).reshaped(B, S, -1)
-        return oProj(merged * sigmoid(gate))
+        return merged * sigmoid(gate)
     }
 }
 
@@ -313,10 +389,10 @@ final class Qwen4ExpGatedDeltaNet: Module {
     func callAsFunction(_ x: MLXArray, mask: MLXArray?, cache: ArraysCache?) -> MLXArray {
         let B = x.dim(0)
         let S = x.dim(1)
-        var mixedQKV = inProjQKV(x)
-        let z = inProjZ(x).reshaped(B, S, nV, dv)
-        let b = inProjB(x)
-        let a = inProjA(x)
+        var mixedQKV = qwen4ExpRowwise(inProjQKV, x)
+        let z = qwen4ExpRowwise(inProjZ, x).reshaped(B, S, nV, dv)
+        let b = qwen4ExpRowwise(inProjB, x)
+        let a = qwen4ExpRowwise(inProjA, x)
 
         let convState =
             cache?[0]
@@ -349,7 +425,7 @@ final class Qwen4ExpGatedDeltaNet: Module {
             cache[1] = state
             cache.advance(S)
         }
-        return outProj(norm(out, gate: z).reshaped(B, S, -1))
+        return qwen4ExpRowwise(outProj, norm(out, gate: z).reshaped(B, S, -1))
     }
 }
 
@@ -368,7 +444,8 @@ final class Qwen4ExpMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(silu(gateProj(x)) * upProj(x))
+        qwen4ExpRowwise(
+            downProj, silu(qwen4ExpRowwise(gateProj, x)) * qwen4ExpRowwise(upProj, x))
     }
 }
 
@@ -393,13 +470,13 @@ final class Qwen4ExpSparseMoeBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let logits = gate(x.asType(.float32))
+        let logits = qwen4ExpRowwise(gate, x.asType(.float32))
         let idx = stopGradient(argPartition(-logits, kth: topK - 1, axis: -1)[.ellipsis, ..<topK])
         // The softmax of the top-k logits: the reference's renormalized top-k.
         let w = softmax(takeAlong(logits, idx, axis: -1), axis: -1)
         let routed = (switchMLP(x, idx) * expandedDimensions(w, axis: -1)).sum(axis: -2)
             .asType(x.dtype)
-        return routed + sigmoid(sharedExpertGate(x)) * sharedExpert(x)
+        return routed + sigmoid(qwen4ExpRowwise(sharedExpertGate, x)) * sharedExpert(x)
     }
 }
 
@@ -433,8 +510,8 @@ final class Qwen4ExpGatedResidual: Module {
     }
 
     private func mixed(_ normed: MLXArray) -> MLXArray {
-        var w = silu(inputMixWeightDown(normed) / Float(hc))
-        w = sigmoid(inputMixWeightUp(w))
+        var w = silu(qwen4ExpRowwise(inputMixWeightDown, normed) / Float(hc))
+        w = sigmoid(qwen4ExpRowwise(inputMixWeightUp, w))
         let lead = Array(w.shape.dropLast())
         w = w.reshaped(lead + [hc, d])
         return (w * normed.reshaped(lead + [hc, d])).mean(axis: -2)
@@ -446,7 +523,7 @@ final class Qwen4ExpGatedResidual: Module {
         guard let blockInjectWeight else {
             fatalError("Qwen4ExpGatedResidual.combine needs block_inject_weight")
         }
-        let inject = 2 * sigmoid(blockInjectWeight(normed) / Float(hc))
+        let inject = 2 * sigmoid(qwen4ExpRowwise(blockInjectWeight, normed) / Float(hc))
         return (mixed(normed), inject)
     }
 
@@ -743,8 +820,8 @@ final class Qwen4ExpPLELayer: Module {
         let emb = pleEmbedding(ids, cache: cache)
 
         let lead = Array(hidden.shape.dropLast())
-        let key = normKey(keyProj(emb)).reshaped(lead + [hc, d])
-        let value = valueProj(emb)
+        let key = normKey(qwen4ExpRowwise(keyProj, emb)).reshaped(lead + [hc, d])
+        let value = qwen4ExpRowwise(valueProj, emb)
         let query = normQuery(hidden).reshaped(lead + [hc, d])
 
         var gate = (key * query).sum(axis: -1, keepDims: true) / Float(d).squareRoot()
@@ -793,7 +870,7 @@ final class Qwen4ExpDecoderLayer: Module {
     ) -> MLXArray {
         var h = h
         let linearCache: ArraysCache?
-        let attentionCache: Qwen4ExpAttentionCache?
+        let attentionCache: KVCache?
         if let cache {
             if isLinear {
                 guard let c = cache as? ArraysCache else {
@@ -802,11 +879,12 @@ final class Qwen4ExpDecoderLayer: Module {
                 linearCache = c
                 attentionCache = nil
             } else {
-                guard let c = cache as? Qwen4ExpAttentionCache else {
-                    fatalError("Qwen4Exp attention layer needs a Qwen4ExpAttentionCache, got \(type(of: cache))")
+                guard cache is any Qwen4ExpSparseCache || cache is any Qwen4ExpBatchedSparseCache
+                else {
+                    fatalError("Qwen4Exp attention layer needs a Qwen4ExpSparseCache, got \(type(of: cache))")
                 }
                 linearCache = nil
-                attentionCache = c
+                attentionCache = cache
             }
         } else {
             linearCache = nil
@@ -893,7 +971,7 @@ public final class Qwen4ExpTextModel: Module, LLMModel {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let out = model(inputs, cache: cache)
         if let lmHead {
-            return lmHead(out)
+            return qwen4ExpRowwise(lmHead, out)
         }
         return model.embedTokens.asLinear(out)
     }

@@ -1,6 +1,64 @@
 import Foundation
 import MLX
 
+/// The cache a Qwen4-Exp full-attention layer reads and writes for one
+/// sequence: the attention keys and values (`update(keys:values:)`) and the
+/// QSA indexer's raw keys of the same tokens (`updateIndexer`).
+public protocol Qwen4ExpSparseCache: KVCache {
+    /// Tokens the indexer has seen; equal to `offset` between forwards.
+    var indexerOffset: Int { get }
+
+    /// Append indexer keys `[1, L, D]` and return every cached one `[1, T, D]`.
+    func updateIndexer(keys: MLXArray) -> MLXArray
+}
+
+/// A Qwen4-Exp full-attention layer cache for several sequences decoded in
+/// one forward (continuous batching). The model projects every row together
+/// and runs each row's norms, RoPE, indexer block selection and attention
+/// against its own `rowCaches` entry, as a serial forward of that row does.
+public protocol Qwen4ExpBatchedSparseCache: KVCache {
+    /// One cache per batch row, in row order.
+    var rowCaches: [any Qwen4ExpSparseCache] { get }
+
+    /// Valid leading columns per row of the current forward (right-padded
+    /// rows), or `nil` when every column of every row is valid. A padded
+    /// column attends nothing and writes no cache.
+    var rowLengths: [Int]? { get }
+}
+
+/// `Qwen4ExpBatchedSparseCache` over existing per-sequence caches. The rows
+/// carry the state; `offset` is unused.
+public final class Qwen4ExpAttentionCacheBatch: BaseKVCache, Qwen4ExpBatchedSparseCache {
+    public let rowCaches: [any Qwen4ExpSparseCache]
+    public private(set) var rowLengths: [Int]?
+
+    public init(rowCaches: [any Qwen4ExpSparseCache]) {
+        precondition(!rowCaches.isEmpty, "Qwen4ExpAttentionCacheBatch needs at least one row")
+        self.rowCaches = rowCaches
+        super.init()
+    }
+
+    public override func innerState() -> [MLXArray] {
+        rowCaches.flatMap { $0.innerState() }
+    }
+
+    public override var isTrimmable: Bool { false }
+
+    public override func copy() -> any KVCache {
+        Qwen4ExpAttentionCacheBatch(
+            rowCaches: rowCaches.map { $0.copy() as! any Qwen4ExpSparseCache })
+    }
+
+    /// Ragged packed forward: valid leading columns per row.
+    public override func prepare(lengths: [Int]?) {
+        rowLengths = lengths
+    }
+
+    public override func finalize() {
+        rowLengths = nil
+    }
+}
+
 /// The cache of one Qwen4-Exp (Qwen3.8-Flash-Next) full-attention layer: the
 /// attention keys and values, and the QSA indexer's raw keys.
 ///
@@ -11,7 +69,7 @@ import MLX
 /// It is not trimmable: the model's linear-attention layers keep recurrent
 /// state that cannot be rewound, so trimming one layer alone would leave the
 /// model inconsistent.
-public final class Qwen4ExpAttentionCache: BaseKVCache {
+public final class Qwen4ExpAttentionCache: BaseKVCache, Qwen4ExpSparseCache {
     private var kv = KVCacheSimple()
     private var indexer = KVCacheSimple()
 
