@@ -81,6 +81,7 @@ package func draftMTPTokenBlock(
     blockSize: Int,
     sampler: any LogitSampler,
     cache: [KVCache],
+    draftVocabulary: DraftVocabularyProjection? = nil,
     forward: (
         _ inputsEmbeds: MLXArray, _ hiddenStates: MLXArray, _ cache: [KVCache],
         _ positionOffset: Int
@@ -103,14 +104,19 @@ package func draftMTPTokenBlock(
         )
         hidden = mtpHidden
 
-        let logits: MLXArray
-        if let lmHead {
-            logits = lmHead(mtpHidden)
+        let next: MLXArray
+        if let draftVocabulary {
+            next = draftVocabulary.sample(
+                subsetLogits: draftVocabulary.logits(mtpHidden)[0..., -1, 0...], sampler: sampler)
         } else {
-            logits = targetEmbedTokens.asLinear(mtpHidden)
+            let logits: MLXArray
+            if let lmHead {
+                logits = lmHead(mtpHidden)
+            } else {
+                logits = targetEmbedTokens.asLinear(mtpHidden)
+            }
+            next = sampler.sample(logits: logits[0..., -1, 0...])
         }
-
-        let next = sampler.sample(logits: logits[0..., -1, 0...])
         tok = next.ndim == 1 ? next.reshaped([next.dim(0), 1]) : next
         tokens.append(tok)
     }
@@ -136,9 +142,28 @@ package func sampleMTPSeed(
     hidden: MLXArray,
     targetEmbedTokens: Embedding,
     lmHead: Linear?,
-    sampler: any LogitSampler
+    sampler: any LogitSampler,
+    draftVocabulary: DraftVocabularyProjection? = nil
 ) -> MLXArray {
+    normalizedMTPColumn(
+        sampleMTPLastColumn(
+            hidden: hidden, targetEmbedTokens: targetEmbedTokens, lmHead: lmHead,
+            sampler: sampler, draftVocabulary: draftVocabulary))
+}
+
+/// One draft per row from the last column of `hidden`: the full head, or the
+/// gathered subset head mapped back to token ids.
+package func sampleMTPLastColumn(
+    hidden: MLXArray,
+    targetEmbedTokens: Embedding,
+    lmHead: Linear?,
+    sampler: any LogitSampler,
+    draftVocabulary: DraftVocabularyProjection?
+) -> MLXArray {
+    if let draftVocabulary {
+        return draftVocabulary.sample(
+            subsetLogits: draftVocabulary.logits(hidden)[0..., -1, 0...], sampler: sampler)
+    }
     let logits = lmHead.map { $0(hidden) } ?? targetEmbedTokens.asLinear(hidden)
-    let sampled = sampler.sample(logits: logits[0..., -1, 0...])
-    return normalizedMTPColumn(sampled)
+    return sampler.sample(logits: logits[0..., -1, 0...])
 }

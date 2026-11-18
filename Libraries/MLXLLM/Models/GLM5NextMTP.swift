@@ -27,7 +27,9 @@ import MLXNN
 /// cache holds committed entries only. It owns no parameters: every call
 /// resolves the target's `mtp[0]` layer, embeddings and lm_head. Its
 /// per-stream state is one `GLM5NextAttentionCache`.
-public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel {
+public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel,
+    MTPDraftVocabularyInstallable
+{
     public let configuration: GLM5NextConfiguration
     /// Drafts per round at most: 1 by default, the depth measured to pay on
     /// the M3 Ultra (+18% at 1k, +5% at 8k; depth 2 lost to plain). Deeper
@@ -67,11 +69,31 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
         ])
     }
 
+    // MARK: - Draft vocabulary
+
+    /// The draft head restricted to a token subset (issue 2428); nil drafts
+    /// over the full lm_head.
+    private var draftProjection: DraftVocabularyProjection?
+    public var draftVocabulary: DraftVocabulary? { draftProjection?.vocabulary }
+
+    public func installDraftVocabulary(
+        _ vocabulary: DraftVocabulary?, target: any LanguageModel
+    ) throws {
+        guard let vocabulary else {
+            draftProjection = nil
+            return
+        }
+        let text = head(target).text
+        draftProjection = try DraftVocabularyProjection(
+            vocabulary: vocabulary, lmHead: text.lmHead, embedding: text.model.embedTokens)
+    }
+
     // MARK: - Head
 
     struct Head {
         let layer: GLM5NextMTPLayer
         let text: GLM5NextTextModel
+        var projection: DraftVocabularyProjection? = nil
 
         /// The block's output before the shared-head norm, `[B, L, D]`; with
         /// `readLast`, only each row's last valid column (`rowLengths[r] - 1`,
@@ -98,6 +120,12 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
 
         /// One proposal per row from the last column of `raw`, `[B, 1]`.
         func sample(_ raw: MLXArray, sampler: any LogitSampler) -> MLXArray {
+            if let projection {
+                // Same projection kernel as `text.logits`, over the gathered rows.
+                let logits = projection.logits(layer.norm(raw)) { glm5NextProject($0, $1) }
+                return projection.sample(subsetLogits: logits[0..., -1, 0...], sampler: sampler)
+                    .reshaped(raw.dim(0), 1)
+            }
             let logits = text.logits(layer.norm(raw))
             return sampler.sample(logits: logits[0..., -1, 0...]).reshaped(raw.dim(0), 1)
         }
@@ -115,7 +143,7 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
         guard let layer = text.mtp.first as? GLM5NextMTPLayer else {
             fatalError("GLM5NextMTPDraftModel: the target was loaded without MTP weights")
         }
-        return Head(layer: layer, text: text)
+        return Head(layer: layer, text: text, projection: draftProjection)
     }
 
     // MARK: - Serial

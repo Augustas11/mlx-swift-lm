@@ -2727,6 +2727,86 @@ final class GLM5NextTests: XCTestCase {
         model.model.deferredDecode = true
     }
 
+    // MARK: - Draft vocabulary (issue 2428)
+
+    /// The gathered lm_head rows through the fused QMV kernel give the full
+    /// head's logit columns bit for bit, at every decode width and past it
+    /// (op fallback); a subset whose size is not a multiple of 8 is padded so
+    /// it stays on the fused kernel.
+    func testDraftVocabularyLogitsMatchFullHeadColumnsBitwise() throws {
+        let model = try fusedShapesModel(seed: 2428)
+        let lmHead = try XCTUnwrap(model.lmHead)
+        for ids in [Array(stride(from: 0, to: 64, by: 3)), [1, 2, 3, 5, 8, 13, 21, 34, 55, 63]] {
+            let vocabulary = try DraftVocabulary(ids: ids, vocabularySize: 64)
+            let projection = try DraftVocabularyProjection(
+                vocabulary: vocabulary, lmHead: lmHead, embedding: model.model.embedTokens)
+            let parts = try XCTUnwrap(glm5NextAffine(try XCTUnwrap(projection.linear)))
+            for width in [1, 2, 5, 8, 12] {
+                let hidden = MLXRandom.normal([1, width, 1024], key: MLXRandom.key(UInt64(width)))
+                    .asType(.bfloat16)
+                if width <= 8 {
+                    XCTAssertNotNil(
+                        glm5NextQMVBatch(hidden.reshaped(width, 1024), parts),
+                        "subset head on the fused kernel at width \(width)")
+                }
+                let full = model.logits(hidden)
+                let subset = projection.logits(hidden) { glm5NextProject($0, $1) }
+                let gathered = take(full, projection.idArray, axis: -1)
+                eval(full, subset, gathered)
+                XCTAssertEqual(subset.shape, [1, width, ids.count])
+                XCTAssertEqual(
+                    maxAbsDifference(subset, gathered), 0, "K=\(ids.count) width \(width)")
+                let fullArgmax = argMax(full, axis: -1).reshaped(-1).asArray(Int.self)
+                let subsetArgmax = projection.idArray[argMax(subset, axis: -1)].reshaped(-1)
+                    .asArray(Int.self)
+                for (f, s) in zip(fullArgmax, subsetArgmax) where ids.contains(f) {
+                    XCTAssertEqual(f, s)
+                }
+            }
+        }
+    }
+
+    /// GLM drafter with a draft vocabulary: MTP greedy still equals plain
+    /// greedy at depths 1 and 2; the whole vocabulary drafts exactly what the
+    /// full head does; uninstalling restores it.
+    func testDraftVocabularyMTPGreedyMatchesPlainGreedy() throws {
+        let model = try fusedShapesModel(seed: 2429)
+        let prompt = tokens(13, seed: 2430).reshaped(-1)
+        let parameters = greedyParameters(maxTokens: 24)
+        var plain = try TokenIterator(prompt: prompt, model: model, parameters: parameters)
+        var expected = [Int]()
+        while let token = plain.next() { expected.append(token) }
+
+        func run(_ drafter: GLM5NextMTPDraftModel, depth: Int) throws -> (Int, Int) {
+            var speculative = try MTPSpeculativeTokenIterator(
+                input: LMInput(tokens: prompt), mainModel: model, drafter: drafter,
+                parameters: parameters, blockSize: depth + 1)
+            var produced = [Int]()
+            while let token = speculative.next() { produced.append(token) }
+            XCTAssertNil(speculative.passthroughReason)
+            let size = drafter.draftVocabulary?.ids.count ?? 64
+            XCTAssertEqual(produced, expected, "depth \(depth), \(size) draft ids")
+            XCTAssertGreaterThan(speculative.proposedCount, 0)
+            return (speculative.proposedCount, speculative.acceptedCount)
+        }
+
+        for depth in [1, 2] {
+            let drafter = GLM5NextMTPDraftModel(model.configuration, maximumDepth: depth)
+            let baseline = try run(drafter, depth: depth)
+            try drafter.installDraftVocabulary(
+                DraftVocabulary(ids: 0 ..< 64, vocabularySize: 64), target: model)
+            let whole = try run(drafter, depth: depth)
+            XCTAssertTrue(whole == baseline, "whole vocabulary drafts as the full head")
+            try drafter.installDraftVocabulary(
+                DraftVocabulary(ids: stride(from: 1, to: 64, by: 2), vocabularySize: 64),
+                target: model)
+            _ = try run(drafter, depth: depth)
+            try drafter.installDraftVocabulary(nil, target: model)
+            XCTAssertNil(drafter.draftVocabulary)
+            XCTAssertTrue(try run(drafter, depth: depth) == baseline)
+        }
+    }
+
     /// On the real 4-layer cut (`GLM5NEXT_CUT_DIR`): MTP greedy equals plain
     /// greedy, and the acceptance rate is reported (the cut's trunk is not the
     /// one the head was trained on, so it is a lower bound).

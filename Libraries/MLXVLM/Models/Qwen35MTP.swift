@@ -75,7 +75,9 @@ final class Qwen35VLMNextNPredictor: Module {
     }
 }
 
-public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
+public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel,
+    MTPDraftVocabularyInstallable
+{
     public let configuration: Qwen35Configuration.TextConfiguration
     public let maximumBlockSize: Int? = 2
     public let requiresSharedTargetKV = false
@@ -85,6 +87,26 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
     private let standaloneCheckpoint: Bool
 
     @ModuleInfo(key: "mtp") var mtp: Qwen35VLMNextNPredictor
+
+    /// The draft head restricted to a token subset (issue 2428); nil drafts
+    /// over the full head.
+    private var draftProjection: DraftVocabularyProjection?
+    public var draftVocabulary: DraftVocabulary? { draftProjection?.vocabulary }
+
+    public func installDraftVocabulary(
+        _ vocabulary: DraftVocabulary?, target: any LanguageModel
+    ) throws {
+        guard let vocabulary else {
+            draftProjection = nil
+            return
+        }
+        guard let target = target as? Qwen35 else {
+            throw DraftVocabulary.Error.unsupportedHead(String(describing: type(of: target)))
+        }
+        draftProjection = try DraftVocabularyProjection(
+            vocabulary: vocabulary, lmHead: target.languageModel.lmHead,
+            embedding: target.languageModel.model.embedTokens)
+    }
 
     public init(
         _ configuration: Qwen35Configuration.TextConfiguration,
@@ -141,7 +163,8 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         state.seedHidden = mtpHidden[0..., (-1)..., 0...]
         state.seedToken = sampleMTPSeed(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
-            lmHead: target.languageModel.lmHead, sampler: sampler)
+            lmHead: target.languageModel.lmHead, sampler: sampler,
+            draftVocabulary: draftProjection)
         state.proposalAppended = 0
     }
 
@@ -205,7 +228,8 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
             queryOffset: queryOffset,
             blockSize: blockSize,
             sampler: sampler,
-            cache: state.cache
+            cache: state.cache,
+            draftVocabulary: draftProjection
         ) { inputsEmbeds, hiddenStates, cache, positionOffset in
             mtp(
                 inputsEmbeds: inputsEmbeds,
@@ -259,7 +283,8 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         state.seedHidden = mtpHidden[0..., (-1)..., 0...]
         state.seedToken = sampleMTPSeed(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
-            lmHead: target.languageModel.lmHead, sampler: sampler)
+            lmHead: target.languageModel.lmHead, sampler: sampler,
+            draftVocabulary: draftProjection)
         state.proposalAppended = 0
     }
 

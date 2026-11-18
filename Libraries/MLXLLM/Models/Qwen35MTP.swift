@@ -84,7 +84,9 @@ final class Qwen35MTPPredictor: Module {
     }
 }
 
-public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
+public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel,
+    MTPDraftVocabularyInstallable
+{
     public let configuration: Qwen35TextConfiguration
     public let maximumBlockSize: Int? = 2
     public let requiresSharedTargetKV = false
@@ -94,6 +96,23 @@ public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
     private let standaloneCheckpoint: Bool
 
     @ModuleInfo(key: "mtp") var mtp: Qwen35MTPPredictor
+
+    /// The draft head restricted to a token subset (issue 2428); nil drafts
+    /// over the full head.
+    private var draftProjection: DraftVocabularyProjection?
+    public var draftVocabulary: DraftVocabulary? { draftProjection?.vocabulary }
+
+    public func installDraftVocabulary(
+        _ vocabulary: DraftVocabulary?, target: any LanguageModel
+    ) throws {
+        guard let vocabulary else {
+            draftProjection = nil
+            return
+        }
+        let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
+        draftProjection = try DraftVocabularyProjection(
+            vocabulary: vocabulary, lmHead: lmHead, embedding: targetEmbedTokens)
+    }
 
     public init(
         _ configuration: Qwen35TextConfiguration,
@@ -150,7 +169,7 @@ public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
         state.seedHidden = mtpHidden
         state.seedToken = sampleMTPSeed(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
-            lmHead: lmHead, sampler: sampler)
+            lmHead: lmHead, sampler: sampler, draftVocabulary: draftProjection)
         state.proposalAppended = 0
     }
 
@@ -208,7 +227,8 @@ public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
             queryOffset: queryOffset,
             blockSize: blockSize,
             sampler: sampler,
-            cache: state.cache
+            cache: state.cache,
+            draftVocabulary: draftProjection
         ) { inputsEmbeds, hiddenStates, cache, positionOffset in
             mtp(
                 inputsEmbeds: inputsEmbeds,
@@ -260,7 +280,7 @@ public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
         state.seedHidden = mtpHidden
         state.seedToken = sampleMTPSeed(
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
-            lmHead: lmHead, sampler: sampler)
+            lmHead: lmHead, sampler: sampler, draftVocabulary: draftProjection)
         state.proposalAppended = 0
     }
 
@@ -358,9 +378,10 @@ public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
             readLast: true)
 
         let seedHidden = rows.indices.map { row in mtpHidden[row ..< row + 1, 0..., 0...] }
-        let logits = lmHead.map { $0(mtpHidden) } ?? targetEmbedTokens.asLinear(mtpHidden)
-        let proposals = sampler.sample(logits: logits[0..., -1, 0...])
-            .reshaped([rows.count, 1])
+        let proposals = sampleMTPLastColumn(
+            hidden: mtpHidden, targetEmbedTokens: targetEmbedTokens, lmHead: lmHead,
+            sampler: sampler, draftVocabulary: draftProjection
+        ).reshaped([rows.count, 1])
 
         var advancedCaches = rows.map { _ in [KVCache]() }
         for packed in packedCaches {
