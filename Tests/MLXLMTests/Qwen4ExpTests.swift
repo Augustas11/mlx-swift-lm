@@ -393,7 +393,17 @@ final class Qwen4ExpTests: XCTestCase {
                 perLayerQuantization: unlisted))
     }
 
+    /// On CPU: the Metal float32 GEMM (a prefill of many tokens) and GEMV
+    /// (one token) differ by about 1e-3 relative on this hardware (a plain
+    /// `[20, 64] x [64, 128]` matmul: GEMM row 0 vs GEMV 1.8e-2 at |x| 27;
+    /// GEMV vs CPU 6e-6), which put a constant 2-5e-3 on every decoded
+    /// position from the first one, cached state or not. On CPU decode
+    /// matches the prefill within 3e-6, so the cached state is exact.
     func testForwardShapesAndIncrementalDecodeMatchesPrefill() throws {
+        try Device.withDefaultDevice(.cpu) { try checkIncrementalDecodeMatchesPrefill() }
+    }
+
+    private func checkIncrementalDecodeMatchesPrefill() throws {
         let model = Qwen4ExpTextModel(try tinyConfiguration())
         randomize(model)
         let tokens = withRandomState(MLXRandom.RandomState(seed: 5)) {
@@ -416,7 +426,7 @@ final class Qwen4ExpTests: XCTestCase {
         let incremental = concatenated(steps, axis: 1)
         XCTAssertEqual(cache[3].offset, 20)
         XCTAssertTrue(
-            allClose(incremental, full, rtol: 1e-3, atol: 1e-3).item(Bool.self),
+            allClose(incremental, full, rtol: 1e-4, atol: 1e-4).item(Bool.self),
             "max diff \(abs(incremental - full).max().item(Float.self))")
     }
 
