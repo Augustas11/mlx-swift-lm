@@ -560,4 +560,83 @@ final class Qwen4ExpTests: XCTestCase {
             XCTAssertEqual(diff, 0, "B=\(rows)")
         }
     }
+
+    /// The batched norms, RoPE (one offset per row) and output gate against
+    /// the per-row oracle (`Qwen4ExpAttention.perRowOracle`), on rows at
+    /// different cache offsets (both sides of the indexer budget): a ragged
+    /// forward of right-padded rows, an equal-length multi-token forward and
+    /// greedy decode steps. Every logit, padded columns included, is equal.
+    func testBatchedRopeMatchesPerRowOracleAtMixedOffsetsAndLengths() throws {
+        let model = Qwen4ExpTextModel(try tinyConfiguration())
+        randomize(model)
+        let promptLengths = [3, 21, 9, 30, 14, 5]
+        let rows = promptLengths.count
+        func batchCache() throws -> [KVCache] {
+            let prefilled: [[KVCache]] = try promptLengths.enumerated().map { r, n in
+                let prompt = withRandomState(MLXRandom.RandomState(seed: UInt64(500 + r))) {
+                    MLXRandom.randInt(0 ..< 64, [1, n]).asType(.int32)
+                }
+                let cache = try model.newCache(parameters: nil)
+                eval(model(prompt, cache: cache))
+                return cache
+            }
+            return (0 ..< model.model.layers.count).map { layer in
+                let caches = prefilled.map { $0[layer] }
+                if let first = caches[0] as? ArraysCache {
+                    let packed = first.copy() as! ArraysCache
+                    for other in caches.dropFirst() { packed.extend(other: other as! ArraysCache) }
+                    return packed
+                }
+                return Qwen4ExpAttentionCacheBatch(
+                    rowCaches: caches.map { $0 as! any Qwen4ExpSparseCache })
+            }
+        }
+        func forward(_ tokens: MLXArray, lengths: [Int]?, cache: [KVCache], oracle: Bool)
+            -> MLXArray
+        {
+            let saved = Qwen4ExpAttention.perRowOracle
+            defer { Qwen4ExpAttention.perRowOracle = saved }
+            Qwen4ExpAttention.perRowOracle = oracle
+            cache.forEach { $0.prepare(lengths: lengths) }
+            defer { cache.forEach { $0.finalize() } }
+            let out = model(tokens, cache: cache)
+            eval(out)
+            return out
+        }
+
+        let oracleCache = try batchCache()
+        let batchedCache = try batchCache()
+        let ragged = withRandomState(MLXRandom.RandomState(seed: 600)) {
+            MLXRandom.randInt(0 ..< 64, [rows, 3]).asType(.int32)
+        }
+        let equal = withRandomState(MLXRandom.RandomState(seed: 601)) {
+            MLXRandom.randInt(0 ..< 64, [rows, 2]).asType(.int32)
+        }
+        let steps: [(MLXArray, [Int]?)] = [(ragged, [3, 1, 2, 3, 1, 2]), (equal, nil)]
+        var tokens = [Int32]()
+        for (index, (input, lengths)) in steps.enumerated() {
+            let want = forward(input, lengths: lengths, cache: oracleCache, oracle: true)
+            let got = forward(input, lengths: lengths, cache: batchedCache, oracle: false)
+            XCTAssertEqual(abs(got - want).max().item(Float.self), 0, "forward \(index)")
+            tokens = greedy(want)
+        }
+        for step in 0 ..< 12 {
+            let input = MLXArray(tokens).reshaped(rows, 1)
+            let want = forward(input, lengths: nil, cache: oracleCache, oracle: true)
+            let got = forward(input, lengths: nil, cache: batchedCache, oracle: false)
+            XCTAssertEqual(abs(got - want).max().item(Float.self), 0, "decode step \(step)")
+            tokens = greedy(want)
+            XCTAssertEqual(greedy(got), tokens, "decode step \(step)")
+        }
+        for case let (a as Qwen4ExpAttentionCacheBatch, b as Qwen4ExpAttentionCacheBatch)
+            in zip(oracleCache, batchedCache)
+        {
+            XCTAssertEqual(
+                a.rowCaches.map(\.offset), zip(promptLengths, [3, 1, 2, 3, 1, 2]).map { $0 + $1 + 2 + 12 })
+            XCTAssertEqual(a.rowCaches.map(\.offset), b.rowCaches.map(\.offset))
+            for (x, y) in zip(a.innerState(), b.innerState()) {
+                XCTAssertEqual(abs(x - y).max().item(Float.self), 0, "attention cache")
+            }
+        }
+    }
 }
