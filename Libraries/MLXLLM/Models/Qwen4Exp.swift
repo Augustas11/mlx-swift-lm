@@ -252,10 +252,11 @@ final class Qwen4ExpAttention: Module {
     }
 
     /// A `Qwen4ExpBatchedSparseCache` holds one cache per row of `x`
-    /// (continuous batching): the projections run on all rows at once, then
-    /// each row's norms, RoPE, cache update, indexer block selection and
-    /// attention run against its own cache at its own offset, exactly as a
-    /// serial forward of that row. Any other cache serves all of `x`.
+    /// (continuous batching): the projections, norms, RoPE (one offset per
+    /// row) and output gate run on all rows at once, then each row's cache
+    /// update, indexer block selection and attention run against its own
+    /// cache, bit for bit as a serial forward of that row. Any other cache
+    /// serves all of `x`.
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
@@ -278,6 +279,10 @@ final class Qwen4ExpAttention: Module {
         return LabSectionTimer.run("attn.o_proj") { qwen4ExpRowwise(oProj, merged) }
     }
 
+    /// Tests set this to run the batched cache's oracle: each row's norms,
+    /// RoPE and output gate inside its own `attend`, as a serial forward does.
+    nonisolated(unsafe) static var perRowOracle = false
+
     private func batchedAttention(_ x: MLXArray, batch: any Qwen4ExpBatchedSparseCache)
         -> MLXArray
     {
@@ -297,7 +302,69 @@ final class Qwen4ExpAttention: Module {
             )
         }
 
+        // Every row's position as one RoPE offset array; a row cache with
+        // per-sequence offsets of its own takes the per-row path.
+        let offsets: [Int32]? =
+            Self.perRowOracle
+            ? nil
+            : rows.reduce(into: [Int32]()) { all, row in
+                if case .scalar(let offset) = row.ropeOffset { all.append(Int32(offset)) }
+            }
+        guard let offsets, offsets.count == B else {
+            let attended = perRowAttention(q: q, k: k, v: v, indexQK: indexQK, batch: batch)
+            return LabSectionTimer.run("attn.o_proj") { qwen4ExpRowwise(oProj, attended) }
+        }
+
+        // Norms, RoPE and the output gate are per token and per head: one op
+        // over all rows computes each element as the row's own forward does.
+        let (qRoped, kRoped, vHeads, gate) = LabSectionTimer.run(
+            "attn.norm_rope", outputs: { [$0.0, $0.1, $0.2, $0.3] }
+        ) {
+            let (q0, k0, v0, gate) = heads(q: q, k: k, v: v)
+            let offset = RoPEOffset.batch(MLXArray(offsets))
+            return (
+                applyRotaryPosition(rope, to: q0, offset: offset),
+                applyRotaryPosition(rope, to: k0, offset: offset), v0, sigmoid(gate)
+            )
+        }
+
         let attended = LabSectionTimer.run("attn.rows") { () -> MLXArray in
+            var outputs = [MLXArray]()
+            for (index, rowCache) in rows.enumerated() {
+                let n = lengths?[index] ?? L
+                precondition(n >= 1 && n <= L, "Qwen4Exp row length \(n) outside 1...\(L)")
+                // `[B, H, L, D]` heads and `[B, L, X]` indexer input.
+                func rowHeads(_ a: MLXArray) -> MLXArray {
+                    if B == 1 && n == L { return a }
+                    return n == L
+                        ? a[index ..< (index + 1)] : a[index ..< (index + 1), 0..., ..<n]
+                }
+                func row(_ a: MLXArray) -> MLXArray {
+                    if B == 1 && n == L { return a }
+                    return n == L ? a[index ..< (index + 1)] : a[index ..< (index + 1), ..<n]
+                }
+                // A lone forward of the row: no mask for one token, causal past it.
+                let out = attendRoped(
+                    q: rowHeads(qRoped), k: rowHeads(kRoped), v: rowHeads(vHeads),
+                    indexQK: row(indexQK), mask: n == 1 ? .none : .causal, cache: rowCache)
+                outputs.append(padded(out, to: L))
+            }
+            // Padded columns are zero, and zero times the gate stays zero.
+            return (B == 1 ? outputs[0] : concatenated(outputs, axis: 0)) * gate
+        }
+        return LabSectionTimer.run("attn.o_proj") { qwen4ExpRowwise(oProj, attended) }
+    }
+
+    /// Each row's whole attention against its own cache, one row at a time:
+    /// the oracle of the batched norms, RoPE and gate.
+    private func perRowAttention(
+        q: MLXArray, k: MLXArray, v: MLXArray, indexQK: MLXArray,
+        batch: any Qwen4ExpBatchedSparseCache
+    ) -> MLXArray {
+        let rows = batch.rowCaches
+        let lengths = batch.rowLengths
+        let (B, L) = (q.dim(0), q.dim(1))
+        return LabSectionTimer.run("attn.rows") { () -> MLXArray in
             var outputs = [MLXArray]()
             for (index, rowCache) in rows.enumerated() {
                 let n = lengths?[index] ?? L
@@ -306,21 +373,37 @@ final class Qwen4ExpAttention: Module {
                     if B == 1 && n == L { return a }
                     return n == L ? a[index ..< (index + 1)] : a[index ..< (index + 1), ..<n]
                 }
-                // A lone forward of the row: no mask for one token, causal past it.
                 let out = attend(
                     q: row(q), k: row(k), v: row(v), indexQK: row(indexQK),
                     mask: n == 1 ? .none : .causal, cache: rowCache)
-                if n < L {
-                    // Padded columns attend nothing and wrote no cache.
-                    let padding = MLXArray.zeros([1, L - n, out.dim(2)], dtype: out.dtype)
-                    outputs.append(concatenated([out, padding], axis: 1))
-                } else {
-                    outputs.append(out)
-                }
+                outputs.append(padded(out, to: L))
             }
             return B == 1 ? outputs[0] : concatenated(outputs, axis: 0)
         }
-        return LabSectionTimer.run("attn.o_proj") { qwen4ExpRowwise(oProj, attended) }
+    }
+
+    /// A row's `[1, n, X]` output with zero columns up to `L`: padded columns
+    /// attend nothing and wrote no cache.
+    private func padded(_ out: MLXArray, to L: Int) -> MLXArray {
+        let n = out.dim(1)
+        guard n < L else { return out }
+        let padding = MLXArray.zeros([1, L - n, out.dim(2)], dtype: out.dtype)
+        return concatenated([out, padding], axis: 1)
+    }
+
+    /// The normed `[B, H, S, D]` queries and keys (before RoPE), the values,
+    /// and the output gate `[B, S, H * D]`, from the projections.
+    private func heads(q qGated: MLXArray, k kProjected: MLXArray, v vProjected: MLXArray)
+        -> (MLXArray, MLXArray, MLXArray, MLXArray)
+    {
+        let B = qGated.dim(0)
+        let S = qGated.dim(1)
+        let qSplit = qGated.reshaped(B, S, nHeads, -1).split(parts: 2, axis: -1)
+        let gate = qSplit[1].reshaped(B, S, -1)
+        let q = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
+        let k = kNorm(kProjected.reshaped(B, S, nKVHeads, -1)).transposed(0, 2, 1, 3)
+        let v = vProjected.reshaped(B, S, nKVHeads, -1).transposed(0, 2, 1, 3)
+        return (q, k, v, gate)
     }
 
     /// The gated attention output (before `o_proj`) from the projected
@@ -329,15 +412,8 @@ final class Qwen4ExpAttention: Module {
         q qGated: MLXArray, k kProjected: MLXArray, v vProjected: MLXArray, indexQK: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: (any Qwen4ExpSparseCache)?
     ) -> MLXArray {
-        let B = qGated.dim(0)
-        let S = qGated.dim(1)
         let offset = cache?.ropeOffset
-
-        let qSplit = qGated.reshaped(B, S, nHeads, -1).split(parts: 2, axis: -1)
-        let gate = qSplit[1].reshaped(B, S, -1)
-        var q = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
-        var k = kNorm(kProjected.reshaped(B, S, nKVHeads, -1)).transposed(0, 2, 1, 3)
-        var v = vProjected.reshaped(B, S, nKVHeads, -1).transposed(0, 2, 1, 3)
+        var (q, k, v, gate) = heads(q: qGated, k: kProjected, v: vProjected)
 
         (q, k) = LabSectionTimer.run("attn.row.norm_rope", outputs: { [$0.0, $0.1] }) {
             (
@@ -345,7 +421,18 @@ final class Qwen4ExpAttention: Module {
                 applyRotaryPosition(rope, to: k, offset: offset)
             )
         }
+        gate = sigmoid(gate)
+        return attendRoped(q: q, k: k, v: v, indexQK: indexQK, mask: mask, cache: cache) * gate
+    }
 
+    /// The attention output `[B, S, H * D]` (before the gate) from roped
+    /// `[B, H, S, D]` queries and keys, the values and the indexer `qk`.
+    private func attendRoped(
+        q: MLXArray, k kNew: MLXArray, v vNew: MLXArray, indexQK: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: (any Qwen4ExpSparseCache)?
+    ) -> MLXArray {
+        let (B, S) = (q.dim(0), q.dim(2))
+        var (k, v) = (kNew, vNew)
         if let cache {
             (k, v) = LabSectionTimer.run("attn.row.cache_update", outputs: { [$0.0, $0.1] }) {
                 cache.update(keys: k, values: v)
@@ -364,8 +451,7 @@ final class Qwen4ExpAttention: Module {
         return LabSectionTimer.run("attn.row.sdpa") {
             let out = MLXFast.scaledDotProductAttention(
                 queries: q, keys: k, values: v, scale: scale, mask: maskMode)
-            let merged = out.transposed(0, 2, 1, 3).reshaped(B, S, -1)
-            return merged * sigmoid(gate)
+            return out.transposed(0, 2, 1, 3).reshaped(B, S, -1)
         }
     }
 }

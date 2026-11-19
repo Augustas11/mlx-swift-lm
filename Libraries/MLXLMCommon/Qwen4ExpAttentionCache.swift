@@ -13,9 +13,10 @@ public protocol Qwen4ExpSparseCache: KVCache {
 }
 
 /// A Qwen4-Exp full-attention layer cache for several sequences decoded in
-/// one forward (continuous batching). The model projects every row together
-/// and runs each row's norms, RoPE, indexer block selection and attention
-/// against its own `rowCaches` entry, as a serial forward of that row does.
+/// one forward (continuous batching). The model projects, norms and ropes
+/// every row together (one RoPE offset per row) and runs each row's cache
+/// update, indexer block selection and attention against its own `rowCaches`
+/// entry, as a serial forward of that row does.
 public protocol Qwen4ExpBatchedSparseCache: KVCache {
     /// One cache per batch row, in row order.
     var rowCaches: [any Qwen4ExpSparseCache] { get }
