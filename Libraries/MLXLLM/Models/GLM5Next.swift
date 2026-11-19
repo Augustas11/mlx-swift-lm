@@ -1064,11 +1064,16 @@ final class GLM5NextAttention: Module {
                 "GLM5Next sparse layer needs a GLM5NextLatentCache, got \(type(of: cache!))")
         }
 
-        let qResid = qALayerNorm(glm5NextProject(qAProj, x))
-        let q = glm5NextProject(qBProj, qResid).reshaped(B, L, numHeads, qHeadDim)
-            .transposed(0, 2, 1, 3)
-        let latentIn = expandedDimensions(kvALayerNorm(glm5NextProject(kvAProj, x)), axis: 1)
-        let qLatent = callMultiLinear(embedQ, q)
+        let (qResid, latentIn, qLatent) = LabSectionTimer.run(
+            "mla.proj", outputs: { [$0.0, $0.1, $0.2] }
+        ) { () -> (MLXArray, MLXArray, MLXArray) in
+            let qResid = qALayerNorm(glm5NextProject(qAProj, x))
+            let q = glm5NextProject(qBProj, qResid).reshaped(B, L, numHeads, qHeadDim)
+                .transposed(0, 2, 1, 3)
+            let latentIn = expandedDimensions(
+                kvALayerNorm(glm5NextProject(kvAProj, x)), axis: 1)
+            return (qResid, latentIn, callMultiLinear(embedQ, q))
+        }
 
         precondition(rowLengths == nil || rowLengths!.count == rows.count)
         // Share only the vector-stable qmv route. Other projection shapes
@@ -1139,10 +1144,13 @@ final class GLM5NextAttention: Module {
             selections.append(topk)
         }
         let all = attended.count == 1 ? attended[0] : concatenated(attended, axis: 0)
-        let output = callMultiLinear(unembedOut, all)
-            .transposed(0, 2, 1, 3)
-            .reshaped(B, L, numHeads * vHeadDim)
-        return (glm5NextProject(oProj, output), selections)
+        let projected = LabSectionTimer.run("mla.out") {
+            let output = callMultiLinear(unembedOut, all)
+                .transposed(0, 2, 1, 3)
+                .reshaped(B, L, numHeads * vHeadDim)
+            return glm5NextProject(oProj, output)
+        }
+        return (projected, selections)
     }
 
     /// One cache's attention: append the latent, update the indexer's pools,
@@ -1157,12 +1165,17 @@ final class GLM5NextAttention: Module {
             x: x, qResid: qResid, latentIn: latentIn, cache: cache,
             previousTopk: previousTopk, indexerInputs: indexerInputs)
         if let topk {
-            return (sparseAttention(qLatent, latent: latent, topk: topk), topk)
+            let out = LabSectionTimer.run("mla.attn_sparse") {
+                sparseAttention(qLatent, latent: latent, topk: topk)
+            }
+            return (out, topk)
         }
         let mask: MLXFast.ScaledDotProductAttentionMaskMode =
             L == 1 ? .none : .array(createCausalMask(n: L, offset: cache.offset - L))
-        let out = MLXFast.scaledDotProductAttention(
-            queries: qLatent, keys: latent, values: latent, scale: scale, mask: mask)
+        let out = LabSectionTimer.run("mla.attn_dense") {
+            MLXFast.scaledDotProductAttention(
+                queries: qLatent, keys: latent, values: latent, scale: scale, mask: mask)
+        }
         return (out, nil)
     }
 
@@ -1171,17 +1184,21 @@ final class GLM5NextAttention: Module {
         cache: any GLM5NextLatentCache, previousTopk: MLXArray?,
         indexerInputs: (keys: MLXArray?, q: MLXArray?, weights: MLXArray?)
     ) -> (latent: MLXArray, topk: MLXArray?) {
-        let latent = cache.appendLatent(latentIn)
+        let latent = LabSectionTimer.run("mla.cache_append") { cache.appendLatent(latentIn) }
         let kvLength = cache.offset
         let dense = denseBypass && kvLength <= indexTopk
 
         var topk: MLXArray?
         if let indexer {
-            let pooled = indexer.updatePools(x, cache: cache, keys: indexerInputs.keys)
+            let pooled = LabSectionTimer.run(
+                "indexer.pools", outputs: { ($0.map { [$0] } ?? []) + cache.state }
+            ) { indexer.updatePools(x, cache: cache, keys: indexerInputs.keys) }
             if !dense {
-                topk = indexer.select(
-                    x, qResid: qResid, pooledKeys: pooled, kvLength: kvLength,
-                    q: indexerInputs.q, weights: indexerInputs.weights)
+                topk = LabSectionTimer.run("indexer.select") {
+                    indexer.select(
+                        x, qResid: qResid, pooledKeys: pooled, kvLength: kvLength,
+                        q: indexerInputs.q, weights: indexerInputs.weights)
+                }
             }
         } else if !dense {
             guard let previousTopk else {
@@ -1273,23 +1290,39 @@ final class GLM5NextDecoderLayer: Module {
     func callAsFunction(
         _ x: MLXArray, cache: KVCache?, previousTopk: [MLXArray?], checkpointAfter: Int? = nil
     ) -> (MLXArray, [MLXArray?]) {
-        let (normed, post, comb) = attnHC.normalizedBranchInput(x, norm: inputLayerNorm)
+        // `LabSectionTimer` sections are pass-throughs unless lab timing is on.
+        let (normed, post, comb) = LabSectionTimer.run(
+            "hc.attn_pre", [x], outputs: { [$0.0, $0.1, $0.2] }
+        ) { attnHC.normalizedBranchInput(x, norm: inputLayerNorm) }
         let attention: MLXArray
         var topk = previousTopk
         if isLinear {
-            attention = (selfAttn as! GLM5NextLinearAttention)(
-                normed, cache: linearCache(cache), checkpointAfter: checkpointAfter)
+            let linear = linearCache(cache)
+            attention = LabSectionTimer.run(
+                "kda", outputs: { [$0] + (linear?.state ?? []) }
+            ) {
+                (selfAttn as! GLM5NextLinearAttention)(
+                    normed, cache: linear, checkpointAfter: checkpointAfter)
+            }
         } else {
             (attention, topk) = (selfAttn as! GLM5NextAttention)(
                 normed, cache: cache, previousTopk: previousTopk,
                 perColumn: checkpointAfter != nil && x.dim(1) > 1)
         }
-        let h = glm5NextHCExpand(attention, x, post, comb)
+        let h = LabSectionTimer.run("hc.attn_expand") {
+            glm5NextHCExpand(attention, x, post, comb)
+        }
 
-        let (ffnNormed, ffnPost, ffnComb) = ffnHC.normalizedBranchInput(
-            h, norm: postAttentionLayerNorm)
-        let ffnOut = (mlp as! UnaryLayer)(ffnNormed)
-        return (glm5NextHCExpand(ffnOut, h, ffnPost, ffnComb), topk)
+        let (ffnNormed, ffnPost, ffnComb) = LabSectionTimer.run(
+            "hc.ffn_pre", outputs: { [$0.0, $0.1, $0.2] }
+        ) { ffnHC.normalizedBranchInput(h, norm: postAttentionLayerNorm) }
+        let ffnOut = LabSectionTimer.run(mlp is GLM5NextMoE ? "moe" : "mlp") {
+            (mlp as! UnaryLayer)(ffnNormed)
+        }
+        let out = LabSectionTimer.run("hc.ffn_expand") {
+            glm5NextHCExpand(ffnOut, h, ffnPost, ffnComb)
+        }
+        return (out, topk)
     }
 
     func deferredDecodeSupported(dtype: DType) -> Bool {
@@ -1482,7 +1515,10 @@ public final class GLM5NextTextModel: Module, LLMModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        logits(model(inputs, cache: cache))
+        let hidden = LabSectionTimer.forward(
+            tag: "rows=\(inputs.dim(0)),L=\(inputs.dim(1))", outputs: { [$0] }
+        ) { model(inputs, cache: cache) }
+        return logits(hidden)
     }
 
     func logits(_ normalized: MLXArray) -> MLXArray {

@@ -96,8 +96,13 @@ func qwen4ExpKeepLast(_ x: MLXArray, n: Int, lengths: MLXArray?) -> MLXArray {
 /// each row the same result at any row count up to the device's vector limit.
 func qwen4ExpRowwise(_ layer: Linear, _ x: MLXArray) -> MLXArray {
     let rows = x.dim(0)
-    guard rows > 1, !(layer is QuantizedLinear) else { return layer(x) }
-    return concatenated((0 ..< rows).map { layer(x[$0 ..< ($0 + 1)]) }, axis: 0)
+    if layer is QuantizedLinear { return layer(x) }
+    let call = {
+        rows > 1 ? concatenated((0 ..< rows).map { layer(x[$0 ..< ($0 + 1)]) }, axis: 0) : layer(x)
+    }
+    // Lab timing: every unquantized linear is its own section, at any row count.
+    guard LabSectionTimer.enabled else { return call() }
+    return LabSectionTimer.run("fp_linear.\(layer.weight.dim(1))x\(layer.weight.dim(0))", [], call)
 }
 
 /// Add `x` to every hyper-connection stream, scaled per stream.
@@ -257,11 +262,20 @@ final class Qwen4ExpAttention: Module {
         if let batch = cache as? any Qwen4ExpBatchedSparseCache {
             return batchedAttention(x, batch: batch)
         }
-        let merged = attend(
-            q: qwen4ExpRowwise(qProj, x), k: qwen4ExpRowwise(kProj, x),
-            v: qwen4ExpRowwise(vProj, x), indexQK: qwen4ExpRowwise(indexer.indexQKProj, x),
-            mask: mask, cache: cache as? any Qwen4ExpSparseCache)
-        return qwen4ExpRowwise(oProj, merged)
+        let (q, k, v, indexQK) = LabSectionTimer.run(
+            "attn.proj", outputs: { [$0.0, $0.1, $0.2, $0.3] }
+        ) {
+            (
+                qwen4ExpRowwise(qProj, x), qwen4ExpRowwise(kProj, x), qwen4ExpRowwise(vProj, x),
+                qwen4ExpRowwise(indexer.indexQKProj, x)
+            )
+        }
+        let merged = LabSectionTimer.run("attn.rows") {
+            attend(
+                q: q, k: k, v: v, indexQK: indexQK, mask: mask,
+                cache: cache as? any Qwen4ExpSparseCache)
+        }
+        return LabSectionTimer.run("attn.o_proj") { qwen4ExpRowwise(oProj, merged) }
     }
 
     private func batchedAttention(_ x: MLXArray, batch: any Qwen4ExpBatchedSparseCache)
@@ -274,32 +288,39 @@ final class Qwen4ExpAttention: Module {
         let lengths = batch.rowLengths
         precondition(lengths == nil || lengths!.count == B)
 
-        let q = qwen4ExpRowwise(qProj, x)
-        let k = qwen4ExpRowwise(kProj, x)
-        let v = qwen4ExpRowwise(vProj, x)
-        let indexQK = qwen4ExpRowwise(indexer.indexQKProj, x)
-
-        var outputs = [MLXArray]()
-        for (index, rowCache) in rows.enumerated() {
-            let n = lengths?[index] ?? L
-            precondition(n >= 1 && n <= L, "Qwen4Exp row length \(n) outside 1...\(L)")
-            func row(_ a: MLXArray) -> MLXArray {
-                if B == 1 && n == L { return a }
-                return n == L ? a[index ..< (index + 1)] : a[index ..< (index + 1), ..<n]
-            }
-            // A lone forward of the row: no mask for one token, causal past it.
-            let out = attend(
-                q: row(q), k: row(k), v: row(v), indexQK: row(indexQK),
-                mask: n == 1 ? .none : .causal, cache: rowCache)
-            if n < L {
-                // Padded columns attend nothing and wrote no cache.
-                let padding = MLXArray.zeros([1, L - n, out.dim(2)], dtype: out.dtype)
-                outputs.append(concatenated([out, padding], axis: 1))
-            } else {
-                outputs.append(out)
-            }
+        let (q, k, v, indexQK) = LabSectionTimer.run(
+            "attn.proj", outputs: { [$0.0, $0.1, $0.2, $0.3] }
+        ) {
+            (
+                qwen4ExpRowwise(qProj, x), qwen4ExpRowwise(kProj, x), qwen4ExpRowwise(vProj, x),
+                qwen4ExpRowwise(indexer.indexQKProj, x)
+            )
         }
-        return qwen4ExpRowwise(oProj, B == 1 ? outputs[0] : concatenated(outputs, axis: 0))
+
+        let attended = LabSectionTimer.run("attn.rows") { () -> MLXArray in
+            var outputs = [MLXArray]()
+            for (index, rowCache) in rows.enumerated() {
+                let n = lengths?[index] ?? L
+                precondition(n >= 1 && n <= L, "Qwen4Exp row length \(n) outside 1...\(L)")
+                func row(_ a: MLXArray) -> MLXArray {
+                    if B == 1 && n == L { return a }
+                    return n == L ? a[index ..< (index + 1)] : a[index ..< (index + 1), ..<n]
+                }
+                // A lone forward of the row: no mask for one token, causal past it.
+                let out = attend(
+                    q: row(q), k: row(k), v: row(v), indexQK: row(indexQK),
+                    mask: n == 1 ? .none : .causal, cache: rowCache)
+                if n < L {
+                    // Padded columns attend nothing and wrote no cache.
+                    let padding = MLXArray.zeros([1, L - n, out.dim(2)], dtype: out.dtype)
+                    outputs.append(concatenated([out, padding], axis: 1))
+                } else {
+                    outputs.append(out)
+                }
+            }
+            return B == 1 ? outputs[0] : concatenated(outputs, axis: 0)
+        }
+        return LabSectionTimer.run("attn.o_proj") { qwen4ExpRowwise(oProj, attended) }
     }
 
     /// The gated attention output (before `o_proj`) from the projected
@@ -318,23 +339,34 @@ final class Qwen4ExpAttention: Module {
         var k = kNorm(kProjected.reshaped(B, S, nKVHeads, -1)).transposed(0, 2, 1, 3)
         var v = vProjected.reshaped(B, S, nKVHeads, -1).transposed(0, 2, 1, 3)
 
-        q = applyRotaryPosition(rope, to: q, offset: offset)
-        k = applyRotaryPosition(rope, to: k, offset: offset)
+        (q, k) = LabSectionTimer.run("attn.row.norm_rope", outputs: { [$0.0, $0.1] }) {
+            (
+                applyRotaryPosition(rope, to: q, offset: offset),
+                applyRotaryPosition(rope, to: k, offset: offset)
+            )
+        }
 
         if let cache {
-            (k, v) = cache.update(keys: k, values: v)
+            (k, v) = LabSectionTimer.run("attn.row.cache_update", outputs: { [$0.0, $0.1] }) {
+                cache.update(keys: k, values: v)
+            }
         }
 
         // The sparse mask is causal and has no padding: it replaces `mask`.
         var maskMode = mask
-        if let sparse = indexer.select(qk: indexQK, cache: cache) {
+        let sparse = LabSectionTimer.run(
+            "attn.row.indexer", outputs: { $0.map { [$0] } ?? [] }
+        ) { indexer.select(qk: indexQK, cache: cache) }
+        if let sparse {
             maskMode = .array(sparse)
         }
 
-        let out = MLXFast.scaledDotProductAttention(
-            queries: q, keys: k, values: v, scale: scale, mask: maskMode)
-        let merged = out.transposed(0, 2, 1, 3).reshaped(B, S, -1)
-        return merged * sigmoid(gate)
+        return LabSectionTimer.run("attn.row.sdpa") {
+            let out = MLXFast.scaledDotProductAttention(
+                queries: q, keys: k, values: v, scale: scale, mask: maskMode)
+            let merged = out.transposed(0, 2, 1, 3).reshaped(B, S, -1)
+            return merged * sigmoid(gate)
+        }
     }
 }
 
@@ -389,43 +421,55 @@ final class Qwen4ExpGatedDeltaNet: Module {
     func callAsFunction(_ x: MLXArray, mask: MLXArray?, cache: ArraysCache?) -> MLXArray {
         let B = x.dim(0)
         let S = x.dim(1)
-        var mixedQKV = qwen4ExpRowwise(inProjQKV, x)
-        let z = qwen4ExpRowwise(inProjZ, x).reshaped(B, S, nV, dv)
-        let b = qwen4ExpRowwise(inProjB, x)
-        let a = qwen4ExpRowwise(inProjA, x)
-
-        let convState =
-            cache?[0]
-            ?? MLXArray.zeros([B, convKernelSize - 1, convDim], dtype: x.dtype)
-        if let mask {
-            mixedQKV = which(expandedDimensions(mask, axis: -1), mixedQKV, 0)
+        let (projectedQKV, z, b, a) = LabSectionTimer.run(
+            "gdn.in_proj", outputs: { [$0.0, $0.1, $0.2, $0.3] }
+        ) {
+            (
+                qwen4ExpRowwise(inProjQKV, x), qwen4ExpRowwise(inProjZ, x).reshaped(B, S, nV, dv),
+                qwen4ExpRowwise(inProjB, x), qwen4ExpRowwise(inProjA, x)
+            )
         }
-        let convInput = concatenated([convState, mixedQKV], axis: 1)
-        if let cache {
-            cache[0] = qwen4ExpKeepLast(
-                convInput, n: convKernelSize - 1, lengths: cache.currentLengths)
+
+        let deltaOut = LabSectionTimer.run(
+            "gdn.conv_delta", outputs: { [$0] + (cache?.state ?? []) }
+        ) { () -> MLXArray in
+            var mixedQKV = projectedQKV
+            let convState =
+                cache?[0]
+                ?? MLXArray.zeros([B, convKernelSize - 1, convDim], dtype: x.dtype)
+            if let mask {
+                mixedQKV = which(expandedDimensions(mask, axis: -1), mixedQKV, 0)
+            }
+            let convInput = concatenated([convState, mixedQKV], axis: 1)
+            if let cache {
+                cache[0] = qwen4ExpKeepLast(
+                    convInput, n: convKernelSize - 1, lengths: cache.currentLengths)
+            }
+            let convOut = silu(conv1d(convInput))
+
+            let parts = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+            var q = parts[0].reshaped(B, S, nK, dk)
+            var k = parts[1].reshaped(B, S, nK, dk)
+            let v = parts[2].reshaped(B, S, nV, dv)
+
+            // mlx-lm `normalize_qk(q, k, inv_scale=dk**-0.5, eps=1e-6)`.
+            let invScale = pow(Float(dk), -0.5)
+            let rmsEps = 1e-6 * invScale * invScale
+            q = (invScale * invScale) * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: rmsEps)
+            k = invScale * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: rmsEps)
+
+            let (out, state) = gatedDeltaUpdate(
+                q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+                state: cache?[1], mask: mask, useKernel: !training)
+            if let cache {
+                cache[1] = state
+                cache.advance(S)
+            }
+            return out
         }
-        let convOut = silu(conv1d(convInput))
-
-        let parts = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        var q = parts[0].reshaped(B, S, nK, dk)
-        var k = parts[1].reshaped(B, S, nK, dk)
-        let v = parts[2].reshaped(B, S, nV, dv)
-
-        // mlx-lm `normalize_qk(q, k, inv_scale=dk**-0.5, eps=1e-6)`.
-        let invScale = pow(Float(dk), -0.5)
-        let rmsEps = 1e-6 * invScale * invScale
-        q = (invScale * invScale) * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: rmsEps)
-        k = invScale * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: rmsEps)
-
-        let (out, state) = gatedDeltaUpdate(
-            q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
-            state: cache?[1], mask: mask, useKernel: !training)
-        if let cache {
-            cache[1] = state
-            cache.advance(S)
+        return LabSectionTimer.run("gdn.out") {
+            qwen4ExpRowwise(outProj, norm(deltaOut, gate: z).reshaped(B, S, -1))
         }
-        return qwen4ExpRowwise(outProj, norm(out, gate: z).reshaped(B, S, -1))
     }
 }
 
@@ -470,13 +514,21 @@ final class Qwen4ExpSparseMoeBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let logits = qwen4ExpRowwise(gate, x.asType(.float32))
-        let idx = stopGradient(argPartition(-logits, kth: topK - 1, axis: -1)[.ellipsis, ..<topK])
-        // The softmax of the top-k logits: the reference's renormalized top-k.
-        let w = softmax(takeAlong(logits, idx, axis: -1), axis: -1)
-        let routed = (switchMLP(x, idx) * expandedDimensions(w, axis: -1)).sum(axis: -2)
-            .asType(x.dtype)
-        return routed + sigmoid(qwen4ExpRowwise(sharedExpertGate, x)) * sharedExpert(x)
+        let (idx, w) = LabSectionTimer.run("moe.router", [x], outputs: { [$0.0, $0.1] }) {
+            () -> (MLXArray, MLXArray) in
+            let logits = qwen4ExpRowwise(gate, x.asType(.float32))
+            let idx = stopGradient(
+                argPartition(-logits, kth: topK - 1, axis: -1)[.ellipsis, ..<topK])
+            // The softmax of the top-k logits: the reference's renormalized top-k.
+            return (idx, softmax(takeAlong(logits, idx, axis: -1), axis: -1))
+        }
+        let routed = LabSectionTimer.run("moe.experts") {
+            (switchMLP(x, idx) * expandedDimensions(w, axis: -1)).sum(axis: -2).asType(x.dtype)
+        }
+        let shared = LabSectionTimer.run("moe.shared") {
+            sigmoid(qwen4ExpRowwise(sharedExpertGate, x)) * sharedExpert(x)
+        }
+        return routed + shared
     }
 }
 
@@ -892,19 +944,32 @@ final class Qwen4ExpDecoderLayer: Module {
         }
 
         if let ple {
-            h = h + ple(h, ids: ids, cache: linearCache, mask: convMask)
+            let hIn = h
+            h = LabSectionTimer.run("ple", [hIn]) {
+                hIn + ple(hIn, ids: ids, cache: linearCache, mask: convMask)
+            }
         }
 
-        var (x, inject) = attnHyperConnection.combine(h)
+        // `LabSectionTimer` sections are pass-throughs unless lab timing is on.
+        let hAttn = h
+        var (x, inject) = LabSectionTimer.run("hc.combine", [hAttn], outputs: { [$0.0, $0.1] }) {
+            attnHyperConnection.combine(hAttn)
+        }
         if let linearAttn {
             x = linearAttn(x, mask: convMask, cache: linearCache)
         } else {
             x = selfAttn!(x, mask: mask, cache: attentionCache)
         }
-        h = qwen4ExpInject(h, x, inject)
+        let (xAttn, injectAttn) = (x, inject)
+        h = LabSectionTimer.run("hc.inject") { qwen4ExpInject(hAttn, xAttn, injectAttn) }
 
-        (x, inject) = mlpHyperConnection.combine(h)
-        return qwen4ExpInject(h, mlp(x), inject)
+        let hMLP = h
+        (x, inject) = LabSectionTimer.run("hc.combine", outputs: { [$0.0, $0.1] }) {
+            mlpHyperConnection.combine(hMLP)
+        }
+        let moe = mlp(x)
+        let injectMLP = inject
+        return LabSectionTimer.run("hc.inject") { qwen4ExpInject(hMLP, moe, injectMLP) }
     }
 }
 
@@ -932,7 +997,7 @@ public final class Qwen4ExpModelInner: Module {
     }
 
     func callAsFunction(_ ids: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var h = embedTokens(ids)
+        var h = LabSectionTimer.run("embed") { embedTokens(ids) }
         let n = h.dim(1)
         // Each kind of layer shares the mask of its first layer.
         let mask = makeAttentionMask(n: n, cache: cache?[firstAttention])
@@ -943,7 +1008,8 @@ public final class Qwen4ExpModelInner: Module {
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, convMask: convMask, cache: cache?[i], ids: ids)
         }
-        return hyperConnectionMixer.merge(h)
+        let hOut = h
+        return LabSectionTimer.run("hc.mixer") { hyperConnectionMixer.merge(hOut) }
     }
 }
 
@@ -969,11 +1035,21 @@ public final class Qwen4ExpTextModel: Module, LLMModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let out = model(inputs, cache: cache)
-        if let lmHead {
-            return qwen4ExpRowwise(lmHead, out)
+        // Lab timing: a decode forward (one token per row) evaluates its
+        // logits inside the bracket; a prefill forward leaves them lazy.
+        let decode = inputs.dim(1) == 1
+        return LabSectionTimer.forward(
+            tag: "rows=\(inputs.dim(0)),L=\(inputs.dim(1))", outputs: { decode ? [$0] : [] }
+        ) { () -> MLXArray in
+            let out = model(inputs, cache: cache)
+            return LabSectionTimer.run("lm_head", outputs: { decode ? [$0] : [] }) {
+                () -> MLXArray in
+                if let lmHead {
+                    return qwen4ExpRowwise(lmHead, out)
+                }
+                return model.embedTokens.asLinear(out)
+            }
         }
-        return model.embedTokens.asLinear(out)
     }
 
     /// One cache per decoder layer: attention keys and values plus indexer

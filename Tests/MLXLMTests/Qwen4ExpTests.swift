@@ -560,4 +560,64 @@ final class Qwen4ExpTests: XCTestCase {
             XCTAssertEqual(diff, 0, "B=\(rows)")
         }
     }
+
+    /// Lab section timing (`LabSectionTimer`, off by default) only evaluates
+    /// at section edges: batched decode logits are bit-identical with it on,
+    /// and the forward's sections are recorded under its row tag.
+    func testLabSectionTimingLeavesBatchedDecodeUnchanged() throws {
+        let model = Qwen4ExpTextModel(try tinyConfiguration())
+        randomize(model)
+        let rows = 4
+        func batchedDecode() throws -> [MLXArray] {
+            let prefilled: [([KVCache], Int32)] = try (0 ..< rows).map { r in
+                let prompt = withRandomState(MLXRandom.RandomState(seed: UInt64(300 + r))) {
+                    MLXRandom.randInt(0 ..< 64, [Self.batchPromptLengths[r]]).asType(.int32)
+                }
+                let cache = try model.newCache(parameters: nil)
+                return (cache, greedy(model(prompt.reshaped(1, -1), cache: cache))[0])
+            }
+            let batchCache: [KVCache] = (0 ..< model.model.layers.count).map { layer in
+                let caches = prefilled.map { $0.0[layer] }
+                if let first = caches[0] as? ArraysCache {
+                    let packed = first.copy() as! ArraysCache
+                    for other in caches.dropFirst() { packed.extend(other: other as! ArraysCache) }
+                    return packed
+                }
+                return Qwen4ExpAttentionCacheBatch(
+                    rowCaches: caches.map { $0 as! any Qwen4ExpSparseCache })
+            }
+            var tokens = prefilled.map(\.1)
+            var logits = [MLXArray]()
+            for _ in 0 ..< 6 {
+                let out = model(MLXArray(tokens).reshaped(rows, 1), cache: batchCache)
+                eval(out)
+                tokens = greedy(out)
+                logits.append(out)
+            }
+            return logits
+        }
+
+        let saved = (LabSectionTimer.enabled, LabSectionTimer.emitLines)
+        defer { (LabSectionTimer.enabled, LabSectionTimer.emitLines) = saved }
+        LabSectionTimer.enabled = false
+        let plain = try batchedDecode()
+        _ = LabSectionTimer.drain()
+        LabSectionTimer.enabled = true
+        LabSectionTimer.emitLines = false
+        let timed = try batchedDecode()
+        let totals = LabSectionTimer.drain()
+        LabSectionTimer.enabled = false
+
+        for (a, b) in zip(plain, timed) {
+            XCTAssertEqual(abs(a - b).max().item(Float.self), 0)
+        }
+        let decode = try XCTUnwrap(totals["rows=\(rows),L=1"])
+        XCTAssertEqual(decode["forward"]?.calls, 6)
+        for section in ["attn.rows", "attn.row.sdpa", "gdn.conv_delta", "moe.experts", "hc.combine"] {
+            XCTAssertGreaterThan(decode[section]?.calls ?? 0, 0, section)
+        }
+        // Each row of a batched attention layer runs its own SDPA.
+        XCTAssertEqual(decode["attn.row.sdpa"]!.calls, rows * decode["attn.rows"]!.calls)
+        XCTAssertTrue(decode.keys.contains { $0.hasPrefix("fp_linear.") })
+    }
 }
