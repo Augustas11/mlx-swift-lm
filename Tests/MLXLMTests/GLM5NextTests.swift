@@ -2527,11 +2527,14 @@ final class GLM5NextTests: XCTestCase {
             sampler: sampler)
         let counts = accepted.map { $0.count + 1 }
         let width = counts.max()!
-        let paddedTokens = MLXArray(
-            (0 ..< 3).flatMap { r in
-                (accepted[r] + [finals[r]]).map(Int32.init)
-                    + Array(repeating: Int32(0), count: width - counts[r])
-            }, [3, width])
+        // Split for the type checker: the one-expression form times out on some toolchains.
+        var paddedTokenValues: [Int32] = []
+        for r in 0 ..< 3 {
+            let row: [Int32] = (accepted[r] + [finals[r]]).map { Int32($0) }
+            paddedTokenValues.append(contentsOf: row)
+            paddedTokenValues.append(contentsOf: [Int32](repeating: 0, count: width - counts[r]))
+        }
+        let paddedTokens = MLXArray(paddedTokenValues, [3, width])
         let paddedHidden = concatenated(
             (0 ..< 3).map { r in
                 let h = commitHidden[r][0..., ..<counts[r], 0...]
