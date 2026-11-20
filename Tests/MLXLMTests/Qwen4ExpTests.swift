@@ -546,6 +546,147 @@ final class Qwen4ExpTests: XCTestCase {
     /// quantized (4-bit, group 32), the rest (hyper-connection mix up, expert
     /// down projections) left in float.
     func testBatchedDecodeMatchesSerialRowForRowQuantized() throws {
+        let model = try quantizedTinyModel()
+        for rows in [2, 8, 16] {
+            let diff = try checkBatchedDecodeMatchesSerial(model, rows: rows, steps: 32)
+            print("Qwen4Exp batched decode quantized B=\(rows): max |logit diff| \(diff)")
+            XCTAssertEqual(diff, 0, "B=\(rows)")
+        }
+    }
+
+    /// A batch whose membership changes while it decodes. Each phase names
+    /// the rows decoding together and runs `steps` greedy decode steps. A row
+    /// first named in a phase is prefilled alone just before that phase
+    /// (while the others wait) and joins the packed batch at its own cache
+    /// offset; a row missing from a phase leaves the batch and never returns.
+    /// Every decode step of every row must give the logits (difference 0) and
+    /// token of that row decoded alone at the same position of its own run,
+    /// including the steps right before and after each change. Returns the
+    /// largest |logit difference| of each phase.
+    private func checkMembershipChangesMatchSerial(
+        _ model: Qwen4ExpTextModel, phases: [(rows: [Int], steps: Int)], label: String,
+        file: StaticString = #filePath, line: UInt = #line
+    ) throws -> [Float] {
+        let rowCount = (phases.flatMap(\.rows).max() ?? -1) + 1
+        let prompts: [[Int32]] = (0 ..< rowCount).map { r in
+            let n = Self.batchPromptLengths[r % Self.batchPromptLengths.count]
+            return withRandomState(MLXRandom.RandomState(seed: UInt64(700 + r))) {
+                MLXRandom.randInt(0 ..< 64, [n]).asType(.int32).asArray(Int32.self)
+            }
+        }
+        let decodeSteps = (0 ..< rowCount).map { r in
+            phases.filter { $0.rows.contains(r) }.map(\.steps).reduce(0, +)
+        }
+        func prefill(_ prompt: [Int32]) throws -> ([KVCache], Int32) {
+            let cache = try model.newCache(parameters: nil)
+            let logits = model(MLXArray(prompt).reshaped(1, -1), cache: cache)
+            return (cache, greedy(logits)[0])
+        }
+
+        // Each row alone, for as many steps as it decodes in the batch.
+        var serialTokens = [[Int32]]()
+        var serialLogits = [[MLXArray]]()
+        for (prompt, steps) in zip(prompts, decodeSteps) {
+            var (cache, token) = try prefill(prompt)
+            var tokens = [Int32]()
+            var logits = [MLXArray]()
+            for _ in 0 ..< steps {
+                let out = model(MLXArray([token]).reshaped(1, 1), cache: cache)
+                eval(out)
+                token = greedy(out)[0]
+                tokens.append(token)
+                logits.append(out[0, 0])
+            }
+            serialTokens.append(tokens)
+            serialLogits.append(logits)
+        }
+
+        // The batch: `order` is the row of each batch position.
+        var order = [Int]()
+        var batchCache = [KVCache]()
+        var tokens = [Int32]()
+        var decoded = [Int](repeating: 0, count: rowCount)
+        var left = Set<Int>()
+        var phaseDiffs = [Float]()
+        for (p, phase) in phases.enumerated() {
+            // Leave: drop the rows this phase does not name.
+            let kept = order.indices.filter { phase.rows.contains(order[$0]) }
+            if kept.count < order.count {
+                left.formUnion(order.filter { !phase.rows.contains($0) })
+                let indices = MLXArray(kept.map { Int32($0) })
+                batchCache = batchCache.map { cache -> KVCache in
+                    if let packed = cache as? ArraysCache {
+                        packed.filter(batchIndices: indices)
+                        return packed
+                    }
+                    let batch = cache as! Qwen4ExpAttentionCacheBatch
+                    return Qwen4ExpAttentionCacheBatch(rowCaches: kept.map { batch.rowCaches[$0] })
+                }
+                order = kept.map { order[$0] }
+                tokens = kept.map { tokens[$0] }
+            }
+            // Join: prefill each new row alone, then append it to the batch.
+            for r in phase.rows where !order.contains(r) {
+                XCTAssertFalse(
+                    left.contains(r), "\(label): row \(r) rejoins", file: file, line: line)
+                let (cache, token) = try prefill(prompts[r])
+                if batchCache.isEmpty {
+                    batchCache = cache.map { layer -> KVCache in
+                        if layer is ArraysCache { return layer }
+                        return Qwen4ExpAttentionCacheBatch(
+                            rowCaches: [layer as! any Qwen4ExpSparseCache])
+                    }
+                } else {
+                    batchCache = zip(batchCache, cache).map { existing, joining -> KVCache in
+                        if let packed = existing as? ArraysCache {
+                            packed.extend(other: joining as! ArraysCache)
+                            return packed
+                        }
+                        let batch = existing as! Qwen4ExpAttentionCacheBatch
+                        return Qwen4ExpAttentionCacheBatch(
+                            rowCaches: batch.rowCaches + [joining as! any Qwen4ExpSparseCache])
+                    }
+                }
+                order.append(r)
+                tokens.append(token)
+            }
+
+            var maxDiff: Float = 0
+            for step in 0 ..< phase.steps {
+                let out = model(MLXArray(tokens).reshaped(order.count, 1), cache: batchCache)
+                eval(out)
+                tokens = greedy(out)
+                for (position, r) in order.enumerated() {
+                    let s = decoded[r]
+                    let diff = abs(out[position, 0] - serialLogits[r][s]).max().item(Float.self)
+                    maxDiff = max(maxDiff, diff)
+                    let at =
+                        "\(label) phase \(p) rows \(order) step \(step): row \(r) decode step \(s)"
+                    XCTAssertEqual(diff, 0, "\(at) |logit diff|", file: file, line: line)
+                    XCTAssertEqual(tokens[position], serialTokens[r][s], at, file: file, line: line)
+                    decoded[r] += 1
+                }
+            }
+            phaseDiffs.append(maxDiff)
+        }
+        XCTAssertEqual(
+            decoded, decodeSteps, "\(label): every row decoded its serial run", file: file,
+            line: line)
+        return phaseDiffs
+    }
+
+    /// Rows 0 and 1 (prompts 3 and 21: one on each side of the indexer
+    /// budget) decode together; row 2 (prompt 9) is prefilled and joins at a
+    /// different offset; all three decode on.
+    private static let joinPhases: [(rows: [Int], steps: Int)] = [([0, 1], 6), ([0, 1, 2], 8)]
+
+    /// Three rows decode together; the middle one leaves (2 rows), then the
+    /// first one leaves (1 row), and the last decodes on alone in the batch.
+    private static let leavePhases: [(rows: [Int], steps: Int)] = [
+        ([0, 1, 2], 6), ([0, 2], 6), ([2], 4),
+    ]
+
+    private func quantizedTinyModel() throws -> Qwen4ExpTextModel {
         let model = Qwen4ExpTextModel(try tinyConfiguration())
         randomize(model)
         quantize(model: model, groupSize: 32, bits: 4) { path, module in
@@ -554,10 +695,26 @@ final class Qwen4ExpTests: XCTestCase {
             return module is SwitchLinear && !path.hasSuffix("down_proj")
         }
         eval(model)
-        for rows in [2, 8, 16] {
-            let diff = try checkBatchedDecodeMatchesSerial(model, rows: rows, steps: 32)
-            print("Qwen4Exp batched decode quantized B=\(rows): max |logit diff| \(diff)")
-            XCTAssertEqual(diff, 0, "B=\(rows)")
+        return model
+    }
+
+    func testRowJoiningADecodingBatchMatchesSerial() throws {
+        let float = Qwen4ExpTextModel(try tinyConfiguration())
+        randomize(float)
+        for (name, model) in [("float32", float), ("quantized", try quantizedTinyModel())] {
+            let diffs = try checkMembershipChangesMatchSerial(
+                model, phases: Self.joinPhases, label: "join \(name)")
+            print("Qwen4Exp join \(name): max |logit diff| per phase \(diffs)")
+        }
+    }
+
+    func testRowLeavingADecodingBatchMatchesSerial() throws {
+        let float = Qwen4ExpTextModel(try tinyConfiguration())
+        randomize(float)
+        for (name, model) in [("float32", float), ("quantized", try quantizedTinyModel())] {
+            let diffs = try checkMembershipChangesMatchSerial(
+                model, phases: Self.leavePhases, label: "leave \(name)")
+            print("Qwen4Exp leave \(name): max |logit diff| per phase \(diffs)")
         }
     }
 
