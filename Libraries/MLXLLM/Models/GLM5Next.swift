@@ -315,7 +315,29 @@ final class GLM5NextMLP: Module, UnaryLayer {
         glm5NextProject(
             downProj, activation(glm5NextProject(gateProj, x), glm5NextProject(upProj, x)))
     }
+
+    /// Prefill slices `[1, n_i, D]` as one `[1, sum n_i, D]` call: quantized
+    /// matmuls (qmm above the small-M rows) and the activation are row-local,
+    /// so each slice's rows equal its own call (`glm5NextPrefillJoinsWideFFN`).
+    func wide(_ xs: [MLXArray]) -> [MLXArray] {
+        glm5NextSplitRows(self(concatenated(xs, axis: 1)), like: xs)
+    }
 }
+
+/// `y` `[1, sum n_i, ...]` cut back into the `n_i` rows of `xs`, in order.
+func glm5NextSplitRows(_ y: MLXArray, like xs: [MLXArray]) -> [MLXArray] {
+    var start = 0
+    return xs.map { x in
+        defer { start += x.dim(1) }
+        return y[0..., start ..< (start + x.dim(1))]
+    }
+}
+
+/// Smallest prefill slice whose feed-forward joins a wider call. From 64
+/// rows every quantized matmul of the slice is MLX `qmm` alone and inside the
+/// wider call (the small-M routes end at 33 rows, the largest qmv batch
+/// limit), and `qmm` reduces K in one order for any row count.
+let glm5NextWideFFNMinRows = 64
 
 final class GLM5NextMoEGate: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
@@ -394,6 +416,7 @@ final class GLM5NextMoE: Module, UnaryLayer {
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_experts") var sharedExperts: GLM5NextMLP?
     let limit: Float?
+    let numExperts: Int
 
     /// Lab knob (off): several-token decode reads each routed expert's
     /// weights once for every token routed to it (bitwise equal to the
@@ -403,6 +426,7 @@ final class GLM5NextMoE: Module, UnaryLayer {
     init(_ config: GLM5NextConfiguration) {
         _gate.wrappedValue = GLM5NextMoEGate(config)
         self.limit = config.swigluLimit
+        self.numExperts = config.nRoutedExperts
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
@@ -429,6 +453,38 @@ final class GLM5NextMoE: Module, UnaryLayer {
             y = y + sharedExperts(x)
         }
         return y
+    }
+
+    /// Whether a prefill slice of `rows` tokens takes the same kernels inside
+    /// a wider expert call as alone: its expert assignments are sorted (64 or
+    /// more) and take MLX `gather_qmm_rhs` (`B >= 16`, `B / E >= 4`, the
+    /// pinned core's GatherQMM route), whose rows are bit-identical whatever
+    /// the tile composition and row count (Studio M3 Ultra, run
+    /// 20261120T101648Z); a smaller call takes `gather_qmm`/`gather_qmv`,
+    /// which differ. Shared-expert projections need `glm5NextWideFFNMinRows`.
+    func joinsWide(rows: Int) -> Bool {
+        let assignments = rows * gate.topK
+        return rows >= glm5NextWideFFNMinRows && assignments >= 64
+            && assignments / max(numExperts, 1) >= 4
+    }
+
+    /// Prefill slices `[1, n_i, D]`: the router (an fp32 GEMM whose split-K
+    /// partition follows the row count), the expert-weighted sum and the
+    /// shared-expert add run per slice as in its own call; the routed experts
+    /// and the shared expert run once over every slice's rows.
+    func wide(_ xs: [MLXArray]) -> [MLXArray] {
+        let routes = xs.map { gate($0) }
+        let x = concatenated(xs, axis: 1)
+        let routed = glm5NextSplitRows(
+            switchMLP(x, concatenated(routes.map(\.0), axis: 1)), like: xs)
+        let shared = sharedExperts.map { glm5NextSplitRows($0(x), like: xs) }
+        return xs.indices.map { i in
+            var y = weightedExpertSum(routed[i], routes[i].1).asType(xs[i].dtype)
+            if let shared {
+                y = y + shared[i]
+            }
+            return y
+        }
     }
 
     private func fusedDecodeStep(_ x: MLXArray) -> MLXArray? {
@@ -1292,6 +1348,66 @@ final class GLM5NextDecoderLayer: Module {
         return (glm5NextHCExpand(ffnOut, h, ffnPost, ffnComb), topk)
     }
 
+    /// Wide prefill of one row: `xs` are consecutive prompt slices `[1, n_i,
+    /// hc, D]` that would otherwise be separate forwards, in order. Every
+    /// slice runs `callAsFunction`'s arithmetic in its own call except the
+    /// feed-forward's row-local core (`prefillFFN`): the mHC mixes (fp32
+    /// split-K GEMMs whose partition follows the row count), attention, the
+    /// KDA conv and recurrence and their caches see exactly the slice they
+    /// see as a separate forward, in prompt order.
+    func prefillSlices(_ xs: [MLXArray], cache: KVCache?, previousTopk: [[MLXArray?]]) -> (
+        [MLXArray], [[MLXArray?]]
+    ) {
+        var residuals = [MLXArray]()
+        var ffnInputs = [MLXArray]()
+        var ffnPosts = [MLXArray]()
+        var ffnCombs = [MLXArray]()
+        var topks = [[MLXArray?]]()
+        for (index, x) in xs.enumerated() {
+            let (normed, post, comb) = attnHC.normalizedBranchInput(x, norm: inputLayerNorm)
+            let attention: MLXArray
+            var topk = index < previousTopk.count ? previousTopk[index] : []
+            if isLinear {
+                attention = (selfAttn as! GLM5NextLinearAttention)(normed, cache: linearCache(cache))
+            } else {
+                (attention, topk) = (selfAttn as! GLM5NextAttention)(
+                    normed, cache: cache, previousTopk: topk)
+            }
+            let h = glm5NextHCExpand(attention, x, post, comb)
+            let (ffnNormed, ffnPost, ffnComb) = ffnHC.normalizedBranchInput(
+                h, norm: postAttentionLayerNorm)
+            residuals.append(h)
+            ffnInputs.append(ffnNormed)
+            ffnPosts.append(ffnPost)
+            ffnCombs.append(ffnComb)
+            topks.append(topk)
+        }
+        let ffnOutputs = prefillFFN(ffnInputs)
+        let outputs = xs.indices.map {
+            glm5NextHCExpand(ffnOutputs[$0], residuals[$0], ffnPosts[$0], ffnCombs[$0])
+        }
+        return (outputs, topks)
+    }
+
+    /// The feed-forward of every slice: the slices that join
+    /// (`glm5NextPrefillJoinsWideFFN`) in one wide call, each other slice alone.
+    func prefillFFN(_ xs: [MLXArray]) -> [MLXArray] {
+        let unary = mlp as! UnaryLayer
+        let joining = xs.indices.filter { glm5NextPrefillJoinsWideFFN(mlp, rows: xs[$0].dim(1)) }
+        var outputs = xs.map { _ -> MLXArray? in nil }
+        if joining.count > 1 {
+            let parts = joining.map { xs[$0] }
+            let ys: [MLXArray]
+            switch mlp {
+            case let moe as GLM5NextMoE: ys = moe.wide(parts)
+            case let dense as GLM5NextMLP: ys = dense.wide(parts)
+            default: ys = parts.map { unary($0) }
+            }
+            for (index, y) in zip(joining, ys) { outputs[index] = y }
+        }
+        return xs.indices.map { outputs[$0] ?? unary(xs[$0]) }
+    }
+
     func deferredDecodeSupported(dtype: DType) -> Bool {
         attnHC.deferredDecodeSupported(dtype: dtype, norm: inputLayerNorm)
             && ffnHC.deferredDecodeSupported(dtype: dtype, norm: postAttentionLayerNorm)
@@ -1329,6 +1445,17 @@ final class GLM5NextDecoderLayer: Module {
             fatalError("GLM5Next linear layer needs MambaCache, got \(type(of: cache))")
         }
         return mamba
+    }
+}
+
+/// Whether a prefill slice of `rows` tokens may run its feed-forward inside a
+/// wider call with the same bits as alone (`GLM5NextMoE.joinsWide`,
+/// `glm5NextWideFFNMinRows`).
+func glm5NextPrefillJoinsWideFFN(_ mlp: Module, rows: Int) -> Bool {
+    switch mlp {
+    case let moe as GLM5NextMoE: moe.joinsWide(rows: rows)
+    case is GLM5NextMLP: rows >= glm5NextWideFFNMinRows
+    default: false
     }
 }
 
@@ -1449,7 +1576,47 @@ public final class GLM5NextModelInner: Module {
         }
         return h.mean(axis: 2)
     }
+
+    /// One row's prefill of consecutive slices `slices` (summing to the input
+    /// length), each the forward `hidden` would run on its own, with the
+    /// feed-forward's row-local core of every layer run once over the slices
+    /// (`GLM5NextDecoderLayer.prefillSlices`). Caches end bit-identical to
+    /// running the slices as separate forwards in order; returns the last
+    /// slice's hidden state, as that slice's own forward would. Slices of up
+    /// to 8 tokens (the decode routes) or a batch of rows run as separate
+    /// forwards.
+    func prefillHidden(_ inputs: MLXArray, cache: [KVCache]?, slices: [Int]) -> MLXArray {
+        var start = 0
+        let tokens = slices.map { n -> MLXArray in
+            defer { start += n }
+            return inputs[0..., start ..< (start + n)]
+        }
+        guard inputs.dim(0) == 1, slices.allSatisfy({ $0 > 8 }) else {
+            var last = MLXArray()
+            for t in tokens { last = hidden(t, cache: cache) }
+            return last
+        }
+        var hs = tokens.map {
+            repeated(expandedDimensions(embedTokens($0), axis: 2), count: hcMult, axis: 2)
+        }
+        var topks = [[MLXArray?]](repeating: [], count: slices.count)
+        for (index, layer) in layers.enumerated() {
+            (hs, topks) = layer.prefillSlices(hs, cache: cache?[index], previousTopk: topks)
+        }
+        return hs[hs.count - 1].mean(axis: 2)
+    }
 }
+
+/// `[Int]` prefill slice lengths of one row's forward (`LMOutput.State`): the
+/// forwards the caller would otherwise run one after another, in order,
+/// summing to the input length. A `glm5_next` model then runs the slices' row-
+/// local feed-forward work as one wide call and everything whose arithmetic
+/// depends on the row count per slice (`GLM5NextModelInner.prefillHidden`):
+/// caches and logits are bit-identical to the separate forwards, and the
+/// logits cover only the last slice's tokens, as its own forward's. Ignored
+/// with `mtpEmitFlagKey` or when the lengths do not sum to the input length
+/// (the logits then cover every token, which a caller can check).
+public let glm5NextPrefillSlicesKey = LMOutput.Key<[Int]>("glm5next.prefillSlices")
 
 /// Text model for `glm5_next_text` checkpoints (`model.*`, `lm_head.*`, `mtp.*`).
 public final class GLM5NextTextModel: Module, LLMModel {
@@ -1503,6 +1670,13 @@ public final class GLM5NextTextModel: Module, LLMModel {
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
         guard state?[mtpEmitFlagKey] ?? false else {
+            if let slices = state?[glm5NextPrefillSlicesKey], slices.count > 1,
+                input.tokens.ndim == 2, slices.allSatisfy({ $0 > 0 }), slices.reduce(0, +) == input.tokens.dim(-1)
+            {
+                return LMOutput(
+                    logits: logits(
+                        model.norm(model.prefillHidden(input.tokens, cache: cache, slices: slices))))
+            }
             return LMOutput(logits: self(input.tokens, cache: cache))
         }
         let hidden = model.hidden(

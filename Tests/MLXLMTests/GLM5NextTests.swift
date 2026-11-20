@@ -1048,6 +1048,81 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
+    // MARK: - Wide prefill slices (#2451)
+
+    /// `glm5NextPrefillSlicesKey`: one forward over consecutive prompt
+    /// slices, with each layer's feed-forward core run once over the joining
+    /// slices, ends bit-identical to the same slices as separate forwards in
+    /// order: the last slice's logits, every layer's cache state, and the
+    /// logits of decode steps that follow. Artifact-like quantization (4-bit
+    /// experts through `gather_qmm_rhs`, 8-bit qmm elsewhere), DSA past
+    /// `index_topk`. Cases: several 512 slices with a joining tail, a tail
+    /// below the join bound (runs alone), a balanced two-chunk split (the
+    /// batching route's partition) and a tail of up to 8 tokens (every slice
+    /// then runs as its own forward). Needs Metal; runs on the lab Mac.
+    func testWidePrefillSlicesMatchSeparateForwardsBitwise() throws {
+        let model = try fusedShapesModel(seed: 2451)
+        let moe = try XCTUnwrap(model.model.layers.compactMap { $0.mlp as? GLM5NextMoE }.first)
+        XCTAssertTrue(moe.joinsWide(rows: 141))
+        XCTAssertFalse(moe.joinsWide(rows: 40))
+        let cases: [[Int]] = [[512, 512, 512, 141], [512, 512, 40], [700, 699], [512, 5]]
+        for (caseIndex, slices) in cases.enumerated() {
+            let total = slices.reduce(0, +)
+            let input = tokens(total, seed: UInt64(2451 + caseIndex))
+            let steps = tokens(3, seed: UInt64(4512 + caseIndex))
+
+            let separate = try model.newCache(parameters: nil)
+            var start = 0
+            var separateLogits = MLXArray()
+            for n in slices {
+                separateLogits = model(input[0..., start ..< (start + n)], cache: separate)
+                start += n
+            }
+            eval(separateLogits)
+            eval(separate.flatMap(\.state))
+
+            let wide = try model.newCache(parameters: nil)
+            var state = LMOutput.State()
+            state[glm5NextPrefillSlicesKey] = slices
+            let wideLogits = model(LMInput.Text(tokens: input), cache: wide, state: state).logits
+            eval(wideLogits)
+            eval(wide.flatMap(\.state))
+
+            let label = "slices \(slices)"
+            XCTAssertEqual(wideLogits.dim(1), slices[slices.count - 1], label)
+            assertBitwiseEqual(wideLogits, separateLogits, "\(label): last slice logits")
+            for (layer, (a, b)) in zip(wide, separate).enumerated() {
+                XCTAssertEqual(a.offset, b.offset, "\(label): layer \(layer) offset")
+                XCTAssertEqual(a.state.count, b.state.count, "\(label): layer \(layer) state count")
+                for (index, (x, y)) in zip(a.state, b.state).enumerated() {
+                    assertBitwiseEqual(x, y, "\(label): layer \(layer) state \(index)")
+                }
+            }
+            for t in 0 ..< steps.dim(1) {
+                let token = steps[0..., t ..< (t + 1)]
+                assertBitwiseEqual(
+                    model(token, cache: wide), model(token, cache: separate),
+                    "\(label): decode step \(t)")
+            }
+        }
+    }
+
+    /// Lengths that do not sum to the input, or one slice, leave the forward
+    /// unsliced: logits for every token (what the provider bridge checks).
+    func testWidePrefillSlicesIgnoredUnlessTheyCoverTheInput() throws {
+        let model = GLM5NextTextModel(try configuration())
+        randomize(model)
+        let input = tokens(40)
+        for slices in [[20, 10], [40], [30, 10, 0]] {
+            var state = LMOutput.State()
+            state[glm5NextPrefillSlicesKey] = slices
+            let logits = model(
+                LMInput.Text(tokens: input), cache: try model.newCache(parameters: nil), state: state
+            ).logits
+            XCTAssertEqual(logits.dim(1), 40, "slices \(slices)")
+        }
+    }
+
     // MARK: - Exact trim and batched rows
 
     /// `GLM5NextAttentionCache.trim` restores the latent, the pooled keys and
