@@ -1541,18 +1541,24 @@ private final class GLM5NextHCDeferredKernels: Sendable {
 /// Whether MLX computes the expand's fp32 comb product without NAX here
 /// (`metal::is_nax_available()` and `MLX_ENABLE_TF32`), the GEMM
 /// `glm5NextHCPost` replays. False on NAX GPUs with TF32 enabled.
-let glm5NextHCDeferredExact: Bool = {
+let glm5NextHCDeferredExact: Bool = !(glm5NextNAXAvailable && glm5NextTF32Enabled)
+
+/// `metal::is_nax_available()` as MLX decides it: an Apple GPU of generation
+/// 17 (18 for `p` parts) or later on macOS / iOS 26.2 or later.
+let glm5NextNAXAvailable: Bool = {
     let architecture = GPU.deviceInfo().architecture
     guard let range = architecture.range(of: #"applegpu_g(\d+)"#, options: .regularExpression)
-    else { return true }
+    else { return false }
     let gen = Int(architecture[range].dropFirst("applegpu_g".count)) ?? 0
     let kind = architecture.last
     var naxOS = false
     if #available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *) { naxOS = true }
-    let nax = naxOS && gen >= (kind == "p" ? 18 : 17)
-    let tf32 = (ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"].flatMap { Int($0) } ?? 1) != 0
-    return !(nax && tf32)
+    return naxOS && gen >= (kind == "p" ? 18 : 17)
 }()
+
+/// `env::enable_tf32()`: `MLX_ENABLE_TF32`, on unless set to 0.
+let glm5NextTF32Enabled: Bool =
+    (ProcessInfo.processInfo.environment["MLX_ENABLE_TF32"].flatMap { Int($0) } ?? 1) != 0
 
 /// Shapes the deferred kernels cover: one token, HC = 4, mix = 24,
 /// HC * D a multiple of 4096 and D <= 4096, bf16/fp16 activations.

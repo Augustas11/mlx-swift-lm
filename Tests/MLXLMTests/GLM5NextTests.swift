@@ -1065,6 +1065,12 @@ final class GLM5NextTests: XCTestCase {
         let moe = try XCTUnwrap(model.model.layers.compactMap { $0.mlp as? GLM5NextMoE }.first)
         XCTAssertTrue(moe.joinsWide(rows: 141))
         XCTAssertFalse(moe.joinsWide(rows: 40))
+        // NAX `gather_qmm_rhs` row tile: slices whose tile class differs from the
+        // wide call's never join there; other GPUs keep one tile for every M.
+        let edge = (64 * moe.numExperts + moe.gate.topK - 1) / moe.gate.topK
+        XCTAssertFalse(moe.wideKeepsGatherTile(rows: [edge - 1, edge - 1], dtype: .bfloat16, nax: true))
+        XCTAssertTrue(moe.wideKeepsGatherTile(rows: [edge, edge], dtype: .bfloat16, nax: true))
+        XCTAssertTrue(moe.wideKeepsGatherTile(rows: [edge - 1, edge - 1], dtype: .bfloat16, nax: false))
         let cases: [[Int]] = [[512, 512, 512, 141], [512, 512, 40], [700, 699], [512, 5]]
         for (caseIndex, slices) in cases.enumerated() {
             let total = slices.reduce(0, +)

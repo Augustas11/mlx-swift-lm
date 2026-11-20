@@ -468,6 +468,19 @@ final class GLM5NextMoE: Module, UnaryLayer {
             && assignments / max(numExperts, 1) >= 4
     }
 
+    /// Whether the wide routed-expert call keeps each slice's `gather_qmm` tile.
+    /// On NAX GPUs MLX's `gather_qmm_rhs_nax` picks its row tile from the whole
+    /// call, `bm = (M / E < 64) ? 32 : 64` with M the call's assignments, so a
+    /// slice may join only when it and the wide call fall on the same side.
+    /// Other GPUs use one tile for every M.
+    func wideKeepsGatherTile(rows: [Int], dtype: DType, nax: Bool = glm5NextNAXAvailable) -> Bool {
+        guard nax, glm5NextTF32Enabled || dtype != .float32 else { return true }
+        let experts = max(numExperts, 1)
+        func smallTile(_ r: Int) -> Bool { r * gate.topK / experts < 64 }
+        let wide = smallTile(rows.reduce(0, +))
+        return rows.allSatisfy { smallTile($0) == wide }
+    }
+
     /// Prefill slices `[1, n_i, D]`: the router (an fp32 GEMM whose split-K
     /// partition follows the row count), the expert-weighted sum and the
     /// shared-expert add run per slice as in its own call; the routed experts
@@ -1393,7 +1406,11 @@ final class GLM5NextDecoderLayer: Module {
     /// (`glm5NextPrefillJoinsWideFFN`) in one wide call, each other slice alone.
     func prefillFFN(_ xs: [MLXArray]) -> [MLXArray] {
         let unary = mlp as! UnaryLayer
-        let joining = xs.indices.filter { glm5NextPrefillJoinsWideFFN(mlp, rows: xs[$0].dim(1)) }
+        var joining = xs.indices.filter { glm5NextPrefillJoinsWideFFN(mlp, rows: xs[$0].dim(1)) }
+        if let moe = mlp as? GLM5NextMoE, let first = joining.first,
+           !moe.wideKeepsGatherTile(rows: joining.map { xs[$0].dim(1) }, dtype: xs[first].dtype) {
+            joining = []
+        }
         var outputs = xs.map { _ -> MLXArray? in nil }
         if joining.count > 1 {
             let parts = joining.map { xs[$0] }
