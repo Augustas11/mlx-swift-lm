@@ -411,12 +411,73 @@ final class GLM5NextMoEGate: Module {
     }
 }
 
+/// `MLX_GLM5_FUSED_GATE_UP`: on unless set to 0 / false / off. Off keeps the
+/// routed experts' separate gate and up gathered matmuls.
+let glm5NextFusedGateUpEnabled: Bool = {
+    let raw = ProcessInfo.processInfo.environment["MLX_GLM5_FUSED_GATE_UP"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return raw != "0" && raw != "false" && raw != "off"
+}()
+
+/// The routed experts' gate and up weights stacked on the expert axis,
+/// `[2E, H, packed]` (gate experts `0..<E`, then up experts `E..<2E`), and the
+/// two storage-sharing views installed as `gate_proj` / `up_proj`. Axis-0
+/// views stay row-contiguous, so the decode kernels and the unfused path read
+/// them without a copy and the weights are held once.
+final class GLM5NextFusedGateUp {
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray?
+    let experts: Int
+    let groupSize: Int
+    let bits: Int
+    let mode: QuantizationMode
+    private let views:
+        [(module: QuantizedSwitchLinear, weight: MLXArray, scales: MLXArray, biases: MLXArray?)]
+
+    init(
+        weight: MLXArray, scales: MLXArray, biases: MLXArray?, experts: Int, groupSize: Int,
+        bits: Int, mode: QuantizationMode, gate: QuantizedSwitchLinear, up: QuantizedSwitchLinear
+    ) {
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.experts = experts
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+        self.views = [gate, up].map {
+            let parts = $0.quantizedParts
+            return ($0, parts.weight, parts.scales, parts.biases)
+        }
+    }
+
+    /// Whether `switchMLP` still holds the installed views (no later update
+    /// replaced a projection or one of its arrays).
+    func installed(in switchMLP: SwitchGLU) -> Bool {
+        zip([switchMLP.gateProjection, switchMLP.upProjection], views).allSatisfy {
+            module, view in
+            guard let current = module as? QuantizedSwitchLinear, current === view.module else {
+                return false
+            }
+            let parts = current.quantizedParts
+            return parts.weight === view.weight && parts.scales === view.scales
+                && parts.biases === view.biases && parts.bias == nil
+        }
+    }
+}
+
 final class GLM5NextMoE: Module, UnaryLayer {
     @ModuleInfo(key: "gate") var gate: GLM5NextMoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
     @ModuleInfo(key: "shared_experts") var sharedExperts: GLM5NextMLP?
     let limit: Float?
     let numExperts: Int
+    let hiddenSize: Int
+    let activationProduct: @Sendable (MLXArray, MLXArray) -> MLXArray
+
+    /// Built by `prepareFusedGateUp` at load; nil keeps `switchMLP`'s path.
+    private(set) var fusedGateUp: GLM5NextFusedGateUp?
 
     /// Lab knob (off): several-token decode reads each routed expert's
     /// weights once for every token routed to it (bitwise equal to the
@@ -427,11 +488,14 @@ final class GLM5NextMoE: Module, UnaryLayer {
         _gate.wrappedValue = GLM5NextMoEGate(config)
         self.limit = config.swigluLimit
         self.numExperts = config.nRoutedExperts
+        self.hiddenSize = config.hiddenSize
+        let activationProduct = makeLimitedSwiGLU(limit: config.swigluLimit)
+        self.activationProduct = activationProduct
         _switchMLP.wrappedValue = SwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.moeIntermediateSize,
             numExperts: config.nRoutedExperts,
-            activationProduct: makeLimitedSwiGLU(limit: config.swigluLimit))
+            activationProduct: activationProduct)
         if config.nSharedExperts > 0 {
             _sharedExperts.wrappedValue = GLM5NextMLP(
                 config, intermediateSize: config.moeIntermediateSize * config.nSharedExperts)
@@ -447,12 +511,115 @@ final class GLM5NextMoE: Module, UnaryLayer {
             return fused
         }
         let (indices, scores) = gate(x)
-        let routed = switchMLP(x, indices)
+        let routed = routedExperts(x, indices)
         var y = weightedExpertSum(routed, scores).asType(x.dtype)
         if let sharedExperts {
             y = y + sharedExperts(x)
         }
         return y
+    }
+
+    /// Stack the quantized routed gate and up weights on the expert axis and
+    /// install axis-0 views of the result as `gate_proj` / `up_proj`, so the
+    /// weights stay resident once. Load-time only (exclusive access). Peak
+    /// memory rises by one layer's gate + up while the stack is realized,
+    /// then the separate arrays are emptied in place: any holder of the old
+    /// modules or arrays keeps no bytes, so the full model never holds gate
+    /// and up twice (GLM-5.3-Flash: about 114 GB of routed gate + up).
+    func prepareFusedGateUp() throws {
+        fusedGateUp = nil
+        guard glm5NextFusedGateUpEnabled,
+            let gate = switchMLP.gateProjection as? QuantizedSwitchLinear,
+            let up = switchMLP.upProjection as? QuantizedSwitchLinear,
+            ObjectIdentifier(type(of: gate)) == ObjectIdentifier(QuantizedSwitchLinear.self),
+            ObjectIdentifier(type(of: up)) == ObjectIdentifier(QuantizedSwitchLinear.self),
+            (gate.bits, gate.groupSize, gate.mode) == (up.bits, up.groupSize, up.mode)
+        else { return }
+        let g = gate.quantizedParts
+        let u = up.quantizedParts
+        guard g.bias == nil, u.bias == nil, g.weight.ndim == 3,
+            g.weight.shape == u.weight.shape, g.weight.dtype == u.weight.dtype,
+            g.scales.shape == u.scales.shape, g.scales.dtype == u.scales.dtype,
+            g.biases?.shape == u.biases?.shape, g.biases?.dtype == u.biases?.dtype,
+            g.weight.dim(0) == numExperts
+        else { return }
+        let weight = concatenated([g.weight, u.weight], axis: 0)
+        let scales = concatenated([g.scales, u.scales], axis: 0)
+        let biases = g.biases.flatMap { gb in u.biases.map { concatenated([gb, $0], axis: 0) } }
+        // Realize the stack before the separate arrays go: emptied while the
+        // concatenation is still lazy, the stack would read empty inputs.
+        eval([weight, scales] + (biases.map { [$0] } ?? []))
+        func view(_ rows: Range<Int>) -> QuantizedSwitchLinear {
+            QuantizedSwitchLinear(
+                weight: weight[rows], scales: scales[rows], biases: biases?[rows],
+                inputDims: hiddenSize, groupSize: gate.groupSize, bits: gate.bits,
+                mode: gate.mode)
+        }
+        let gateView = view(0 ..< numExperts)
+        let upView = view(numExperts ..< 2 * numExperts)
+        try switchMLP.update(
+            modules: ModuleChildren(values: [
+                "gate_proj": .value(gateView), "up_proj": .value(upView),
+            ]), verify: [])
+        fusedGateUp = GLM5NextFusedGateUp(
+            weight: weight, scales: scales, biases: biases, experts: numExperts,
+            groupSize: gate.groupSize, bits: gate.bits, mode: gate.mode, gate: gateView,
+            up: upView)
+        // Empty the replaced projections' arrays in place (MLXArray is a
+        // reference type and `update(parameters:)` swaps each array's storage),
+        // so no reference left to `gate`, `up` or their arrays keeps them.
+        for (module, parts) in [(gate, g), (up, u)] {
+            var released = [
+                ("weight", MLXArray.zeros([0], dtype: parts.weight.dtype)),
+                ("scales", MLXArray.zeros([0], dtype: parts.scales.dtype)),
+            ]
+            if let biases = parts.biases {
+                released.append(("biases", MLXArray.zeros([0], dtype: biases.dtype)))
+            }
+            _ = try module.update(
+                parameters: ModuleParameters.unflattened(released), verify: .none)
+        }
+    }
+
+    /// `switchMLP(x, indices)`, with gate and up as one gathered quantized
+    /// matmul when `prepareFusedGateUp` stacked them. Each assignment appears
+    /// twice, as expert `e` (gate) and `E + e` (up); sorted assignments stay
+    /// sorted. The call keeps `switchMLP`'s route, kernel and tile: MLX's
+    /// GatherQMM picks them from the row count and expert count only through
+    /// `B / E` and `M / E` (both unchanged by doubling), from `N` = H
+    /// (unchanged), and never splits K, so every output element is the same
+    /// full-K reduction of the same x row and weight row as unfused.
+    func routedExperts(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        guard let fused = fusedGateUp, fused.installed(in: switchMLP) else {
+            return switchMLP(x, indices)
+        }
+        var rows = MLX.expandedDimensions(x, axes: [-2, -3])
+        let doSort = indices.size >= 64
+        var idx = indices
+        var inverseOrder = MLXArray()
+        if doSort {
+            let flat = indices.flattened()
+            let order = argSort(flat)
+            inverseOrder = argSort(order)
+            idx = flat[order]
+            let source = order.floorDivide(indices.dim(-1))
+            rows = rows.flattened(start: 0, end: -3)[concatenated([source, source])]
+        } else {
+            rows = concatenated([rows, rows], axis: 0)
+        }
+        let offset = MLXArray(fused.experts).asType(idx.dtype)
+        let gateUp = MLX.gatherQuantizedMM(
+            rows, fused.weight, scales: fused.scales, biases: fused.biases,
+            rhsIndices: concatenated([idx, idx + offset], axis: 0), transpose: true,
+            groupSize: fused.groupSize, bits: fused.bits, mode: fused.mode,
+            sortedIndices: doSort)
+        let half = gateUp.dim(0) / 2
+        let activated = activationProduct(gateUp[..<half], gateUp[half...])
+        var out = switchMLP.downProjection(activated, idx, sortedIndices: doSort)
+        if doSort {
+            out = scatterUnsort(x: out, invOrder: inverseOrder, shape: indices.shape)
+        }
+        return MLX.squeezed(out, axis: -2)
     }
 
     /// Whether a prefill slice of `rows` tokens takes the same kernels inside
@@ -489,7 +656,7 @@ final class GLM5NextMoE: Module, UnaryLayer {
         let routes = xs.map { gate($0) }
         let x = concatenated(xs, axis: 1)
         let routed = glm5NextSplitRows(
-            switchMLP(x, concatenated(routes.map(\.0), axis: 1)), like: xs)
+            routedExperts(x, concatenated(routes.map(\.0), axis: 1)), like: xs)
         let shared = sharedExperts.map { glm5NextSplitRows($0(x), like: xs) }
         return xs.indices.map { i in
             var y = weightedExpertSum(routed[i], routes[i].1).asType(xs[i].dtype)
@@ -1723,6 +1890,17 @@ public final class GLM5NextTextModel: Module, LLMModel {
         }
     }
 
+    /// Stack each MoE layer's routed gate and up weights (`prepareFusedGateUp`).
+    public func prepare() throws {
+        for case let (_, moe as GLM5NextMoE) in namedModules() {
+            try moe.prepareFusedGateUp()
+            // The emptied gate/up buffers return to MLX's buffer cache, whose
+            // default bound sits past physical memory: across the layers they
+            // would hold a second copy of every projection the stack replaced.
+            Memory.clearCache()
+        }
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var weights = GLM5NextWeights.sanitize(weights, configuration: configuration)
         if configuration.tieWordEmbeddings {
@@ -1804,6 +1982,10 @@ public final class GLM5NextModel: Module, LLMModel {
 
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         try languageModel.newCache(parameters: parameters)
+    }
+
+    public func prepare() throws {
+        try languageModel.prepare()
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
