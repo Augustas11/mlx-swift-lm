@@ -94,7 +94,7 @@ let package = Package(
         // and core v0.32.4-macprovider.16: .15 plus ml-explore/mlx #4883 (do not
         // wire user-provided buffers), #4881 (MetalAllocator::malloc(0)) and
         // #4930 (no allocation inside quantize_impl).
-        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "f0095e28e408685552afaf2b1fbe9ab436ca1132"),
+        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "efaafd2d33d4b5200e0e92f1c8b2b55dcb77f67a"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
