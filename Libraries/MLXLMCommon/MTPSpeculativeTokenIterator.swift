@@ -199,7 +199,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 mainCache ?? (try mainModel.newCache(parameters: parameters)), plan: kvCachePlan),
             parameters: parameters,
             blockSize: blockSize,
-            components: components)
+            components: components,
+            adaptiveDepth: adaptiveDepth)
     }
 
     package init(
@@ -211,7 +212,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         mtpContinuation: MTPDrafterContinuation? = nil,
         parameters: GenerateParameters,
         blockSize: Int,
-        components: GenerationComponents = .init()
+        components: GenerationComponents = .init(),
+        adaptiveDepth: MTPAdaptiveDepth? = nil
     ) throws {
         try drafter.validateCompatibility(with: mainModel)
 

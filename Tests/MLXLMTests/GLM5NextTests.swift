@@ -2570,6 +2570,8 @@ final class GLM5NextTests: XCTestCase {
     /// third round, so the iterator exercises the target's accept path
     /// (both verify columns kept) and its in-place rewind.
     private final class OracleDrafter: Module, MTPDrafterModel {
+        func validateCompatibility(with target: any LanguageModel) throws {}
+
         let expected: [Int]
         let promptLength: Int
         let maximumBlockSize: Int? = 2
@@ -2619,6 +2621,8 @@ final class GLM5NextTests: XCTestCase {
     /// per round at a cycling position (none every D + 1 rounds), so every
     /// accept count 0...D occurs.
     private final class DepthOracleDrafter: Module, MTPDrafterModel {
+        func validateCompatibility(with target: any LanguageModel) throws {}
+
         let expected: [Int]
         let promptLength: Int
         let maximumBlockSize: Int? = 8

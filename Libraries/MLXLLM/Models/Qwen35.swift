@@ -1250,6 +1250,7 @@ public class Qwen35TextModelInner: Module {
             let split = checkpointAfter, split > 0, split < width
         else { return nil }
         // Padded rows need the SSM mask: general path.
+        guard let ssmIdx, let faIdx else { return nil }
         if createSSMMask(h: inputs, cache: cache[ssmIdx] as? MambaCache) != nil { return nil }
         guard let faCache = cache[faIdx] else { return nil }
 
