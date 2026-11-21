@@ -496,6 +496,26 @@ open class QuantizedSwitchLinear: SwitchLinear, Quantized {
         self.freeze()
     }
 
+    /// Wrap already-quantized `[numExperts, outputDims, packed]` parts, e.g.
+    /// storage-sharing views of a fused weight, without re-quantizing.
+    public init(
+        weight: MLXArray, scales: MLXArray, biases: MLXArray?, bias: MLXArray? = nil,
+        inputDims: Int, groupSize: Int, bits: Int, mode: QuantizationMode
+    ) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+
+        self._scales.wrappedValue = scales
+        self._biases.wrappedValue = biases
+
+        super.init(
+            inputDims: inputDims, outputDims: weight.dim(1), numExperts: weight.dim(0),
+            weight: weight, bias: bias)
+
+        self.freeze()
+    }
+
     /// Packed weight, scales, biases and expert bias for fused-kernel callers.
     public var quantizedParts:
         (weight: MLXArray, scales: MLXArray, biases: MLXArray?, bias: MLXArray?)

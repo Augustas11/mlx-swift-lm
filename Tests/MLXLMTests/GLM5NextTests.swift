@@ -732,6 +732,129 @@ final class GLM5NextTests: XCTestCase {
             "the fused experts must cover this layer")
     }
 
+    /// A routed-expert layer at `hidden` x `intermediate` x `experts`, top 8,
+    /// with seeded random 4-bit group-64 affine parts installed directly (no
+    /// float weights are materialized). The router and shared expert stay
+    /// lazy; these tests call `routedExperts` with their own selections.
+    private func quantizedExpertsMoE(
+        hidden: Int, intermediate: Int, experts: Int, seed: UInt64
+    ) throws -> GLM5NextMoE {
+        var json = textConfigJSON()
+        for (from, to) in [
+            (#""hidden_size": 64"#, #""hidden_size": \#(hidden)"#),
+            (#""moe_intermediate_size": 32"#, #""moe_intermediate_size": \#(intermediate)"#),
+            (#""n_routed_experts": 4"#, #""n_routed_experts": \#(experts)"#),
+            (#""num_experts_per_tok": 2"#, #""num_experts_per_tok": 8"#),
+        ] {
+            json = json.replacingOccurrences(of: from, with: to)
+        }
+        let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+        let moe = GLM5NextMoE(config)
+        func projection(_ inputs: Int, _ outputs: Int, _ seed: UInt64) -> QuantizedSwitchLinear {
+            withRandomState(MLXRandom.RandomState(seed: seed)) {
+                // 4-bit: inputs / 2 random bytes per row, viewed as packed words.
+                let weight = MLXRandom.randInt(
+                    low: 0, high: 256, [experts, outputs, inputs / 2], type: UInt8.self
+                ).view(dtype: .uint32)
+                let groups = [experts, outputs, inputs / 64]
+                let scales = MLXRandom.uniform(low: 0.002, high: 0.02, groups).asType(.bfloat16)
+                let biases = MLXRandom.uniform(low: -0.12, high: -0.01, groups).asType(.bfloat16)
+                eval(weight, scales, biases)
+                return QuantizedSwitchLinear(
+                    weight: weight, scales: scales, biases: biases, inputDims: inputs,
+                    groupSize: 64, bits: 4, mode: .affine)
+            }
+        }
+        try moe.switchMLP.update(
+            modules: ModuleChildren(values: [
+                "gate_proj": .value(projection(hidden, intermediate, seed)),
+                "up_proj": .value(projection(hidden, intermediate, seed + 1)),
+                "down_proj": .value(projection(intermediate, hidden, seed + 2)),
+            ]), verify: [])
+        moe.train(false)
+        return moe
+    }
+
+    /// `[shape..., 8]` distinct experts per token, as the router selects them.
+    private func expertSelection(_ shape: [Int], experts: Int, seed: UInt64) -> MLXArray {
+        withRandomState(MLXRandom.RandomState(seed: seed)) {
+            argSort(MLXRandom.uniform(0 ..< 1, shape + [experts]), axis: -1)[.ellipsis, ..<8]
+                .asType(.uint32)
+        }
+    }
+
+    private func assertRawBitsEqual(_ a: MLXArray, _ b: MLXArray, _ message: String) {
+        eval(a, b)
+        XCTAssertEqual(a.shape, b.shape, message)
+        XCTAssertEqual(a.dtype, b.dtype, message)
+        XCTAssertTrue(
+            arrayEqual(a.view(dtype: .uint16), b.view(dtype: .uint16)).item(Bool.self),
+            "\(message): max |diff| \(maxAbsDifference(a, b))")
+    }
+
+    /// The fused gate/up routed experts equal the unfused SwitchGLU bit for bit
+    /// at GLM-5.3-Flash expert shapes (hidden 4096, moe_intermediate 2048, 288
+    /// experts, top 8, 4-bit group-64 affine, bf16): prefill slices `[1, n, D]`
+    /// of 1, 64, 512 and 2048 rows (unsorted gather_qmv, sorted gather_qmv, and
+    /// sorted gather_qmm_rhs at 512 / 2048), and decode batches `[B, 1, D]` of
+    /// 1 to 16 rows. The reference runs on the separate arrays before the
+    /// stack; the unfused path on the installed views must match it too.
+    func testFusedGateUpExpertsMatchUnfusedBitwiseAtFlashShapes() throws {
+        let (hidden, experts) = (4096, 288)
+        let moe = try quantizedExpertsMoE(
+            hidden: hidden, intermediate: 2048, experts: experts, seed: 501)
+        var cases: [(String, [Int], UInt64)] = []
+        for (i, rows) in [1, 64, 512, 2048].enumerated() {
+            cases.append(("prefill \(rows) rows", [1, rows], UInt64(600 + i)))
+        }
+        for rows in 1 ... 16 {
+            cases.append(("decode \(rows) rows", [rows, 1], UInt64(700 + rows)))
+        }
+        let inputs = cases.map { name, shape, seed -> (String, MLXArray, MLXArray) in
+            let x = withRandomState(MLXRandom.RandomState(seed: seed)) {
+                MLXRandom.normal(shape + [hidden]).asType(.bfloat16)
+            }
+            return (name, x, expertSelection(shape, experts: experts, seed: seed + 1000))
+        }
+        XCTAssertNil(moe.fusedGateUp)
+        let references = inputs.map { _, x, indices in
+            let y = moe.routedExperts(x, indices)
+            eval(y)
+            return y
+        }
+        try moe.prepareFusedGateUp()
+        let fused = try XCTUnwrap(moe.fusedGateUp, "4-bit affine experts must fuse")
+        XCTAssertEqual(fused.weight.shape, [2 * experts, 2048, hidden / 8])
+        XCTAssertTrue(fused.installed(in: moe.switchMLP))
+        for ((name, x, indices), reference) in zip(inputs, references) {
+            assertRawBitsEqual(moe.routedExperts(x, indices), reference, "fused, \(name)")
+            assertRawBitsEqual(moe.switchMLP(x, indices), reference, "unfused views, \(name)")
+        }
+    }
+
+    /// Unquantized experts keep the SwitchGLU path; a later replacement of an
+    /// installed view drops the fused call back to SwitchGLU.
+    func testFusedGateUpOnlyForInstalledQuantizedViews() throws {
+        let config = try configuration()
+        let dense = GLM5NextMoE(config)
+        try dense.prepareFusedGateUp()
+        XCTAssertNil(dense.fusedGateUp)
+
+        let moe = try quantizedExpertsMoE(hidden: 256, intermediate: 128, experts: 16, seed: 801)
+        try moe.prepareFusedGateUp()
+        let fused = try XCTUnwrap(moe.fusedGateUp)
+        XCTAssertTrue(fused.installed(in: moe.switchMLP))
+        let x = MLXRandom.normal([1, 16, 256]).asType(.bfloat16)
+        let indices = expertSelection([1, 16], experts: 16, seed: 802)
+        assertRawBitsEqual(moe.routedExperts(x, indices), moe.switchMLP(x, indices), "small")
+        let other = try quantizedExpertsMoE(hidden: 256, intermediate: 128, experts: 16, seed: 803)
+        try moe.switchMLP.update(
+            modules: ModuleChildren(values: ["up_proj": .value(other.switchMLP.upProjection)]),
+            verify: [])
+        XCTAssertFalse(fused.installed(in: moe.switchMLP))
+        assertRawBitsEqual(moe.routedExperts(x, indices), moe.switchMLP(x, indices), "replaced")
+    }
+
     /// `glm5NextMoERouter` reproduces the router op path bit for bit: the
     /// selected experts in argPartition's order (ties to the lower expert),
     /// and the normalized, scaled scores.
