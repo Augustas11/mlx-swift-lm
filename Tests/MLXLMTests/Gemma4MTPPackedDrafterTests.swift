@@ -49,9 +49,12 @@ struct Gemma4MTPPackedDrafterTests {
               }
             }
             """
-        MLXRandom.seed(seed)
-        let model = MLXLLM.Gemma4Model(
-            try JSONDecoder().decode(MLXLLM.Gemma4Configuration.self, from: Data(json.utf8)))
+        // A task-local state: MLXRandom.seed is process-global, and suites
+        // running in parallel reseed it between this model's initializers.
+        let model = try withRandomState(MLXRandom.RandomState(seed: seed)) {
+            MLXLLM.Gemma4Model(
+                try JSONDecoder().decode(MLXLLM.Gemma4Configuration.self, from: Data(json.utf8)))
+        }
         eval(model)
         return model
     }
@@ -92,13 +95,14 @@ struct Gemma4MTPPackedDrafterTests {
     static func drafter(
         slidingWindow: Int, vocabularySize: Int = vocabularySize, seed: UInt64 = 11
     ) throws -> Gemma4AssistantDraftModel {
-        MLXRandom.seed(seed)
-        let model = Gemma4AssistantDraftModel(
-            try JSONDecoder().decode(
-                Gemma4AssistantConfiguration.self,
-                from: Data(
-                    drafterConfigJSON(slidingWindow: slidingWindow, vocabularySize: vocabularySize)
-                        .utf8)))
+        let model = try withRandomState(MLXRandom.RandomState(seed: seed)) {
+            Gemma4AssistantDraftModel(
+                try JSONDecoder().decode(
+                    Gemma4AssistantConfiguration.self,
+                    from: Data(
+                        drafterConfigJSON(slidingWindow: slidingWindow, vocabularySize: vocabularySize)
+                            .utf8)))
+        }
         eval(model)
         return model
     }
