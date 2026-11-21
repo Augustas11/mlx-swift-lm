@@ -202,10 +202,24 @@ public final class Gemma4AssistantDraftModel: Module, MTPDrafterModel {
     }
 
     public func validateCompatibility(with target: any LanguageModel) throws {
+        if !(target is any Gemma4BackboneProviding),
+            let textTarget = target as? MTPTargetInputEmbeddingProvider
+        {
+            // The MLXLLM text-only Gemma 4 target exposes only its token
+            // embeddings; check the width the pre-projection consumes.
+            let width = textTarget.mtpInputEmbeddings(MLXArray([Int32(0)])).dim(-1)
+            guard width == config.backboneHiddenSize else {
+                throw MTPDrafterCompatibilityError.incompatibleTarget(
+                    drafter: "Gemma4AssistantDraftModel",
+                    expected: "hiddenSize \(config.backboneHiddenSize)",
+                    actual: "\(type(of: target)) with hiddenSize \(width)")
+            }
+            return
+        }
         guard let provider = target as? any Gemma4BackboneProviding else {
             throw MTPDrafterCompatibilityError.incompatibleTarget(
                 drafter: "Gemma4AssistantDraftModel",
-                expected: "a Gemma 4 VLM target",
+                expected: "a Gemma 4 target",
                 actual: String(describing: type(of: target))
             )
         }
