@@ -343,7 +343,7 @@ public class GatedDeltaTests: XCTestCase {
 
         let (yFast, stateFast) = gatedDeltaUpdate(
             q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
-            aLog: inputs.aLog, dtBias: inputs.dtBias, state: state)
+            aLog: inputs.aLog, dtBias: inputs.dtBias, state: state, useKernel: false)
         let (yKernel, stateKernel) = gatedDeltaUpdate(
             q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
             aLog: inputs.aLog, dtBias: inputs.dtBias, state: state, mask: keepAll(inputs))
@@ -367,7 +367,7 @@ public class GatedDeltaTests: XCTestCase {
 
         let (_, stateFast) = gatedDeltaUpdate(
             q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
-            aLog: inputs.aLog, dtBias: inputs.dtBias)
+            aLog: inputs.aLog, dtBias: inputs.dtBias, useKernel: false)
         let (_, stateKernel) = gatedDeltaUpdate(
             q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
             aLog: inputs.aLog, dtBias: inputs.dtBias, mask: keepAll(inputs))
@@ -377,6 +377,24 @@ public class GatedDeltaTests: XCTestCase {
             drift, MatmulPrecision.tolerance(float32: 1e-3, reduced: 1e-2),
             "A decay of 0.999 was rounded to 1 before the MLXFast kernel (drift \(drift))."
         )
+    }
+
+    /// Inference must give a row the same output with and without a mask
+    /// that keeps every step: a decode row computes alone or inside a masked
+    /// batch, and continuous batching requires both to give the same tokens.
+    func testGatedDeltaInferenceIsBitwiseEqualWithAndWithoutMask() throws {
+        let inputs = makeQwen35Inputs(T: 1)
+        let (_, state) = gatedDeltaUpdate(
+            q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
+            aLog: inputs.aLog, dtBias: inputs.dtBias)
+        let (yAlone, stateAlone) = gatedDeltaUpdate(
+            q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
+            aLog: inputs.aLog, dtBias: inputs.dtBias, state: state)
+        let (yMasked, stateMasked) = gatedDeltaUpdate(
+            q: inputs.q, k: inputs.k, v: inputs.v, a: inputs.a, b: inputs.b,
+            aLog: inputs.aLog, dtBias: inputs.dtBias, state: state, mask: keepAll(inputs))
+        XCTAssertTrue(arrayEqual(yAlone, yMasked).item(Bool.self), "decode output depends on the mask")
+        XCTAssertTrue(arrayEqual(stateAlone, stateMasked).item(Bool.self), "decode state depends on the mask")
     }
 
     /// Training must differentiate through the MLXFast kernel and get the

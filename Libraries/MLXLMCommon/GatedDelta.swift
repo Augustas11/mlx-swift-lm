@@ -427,9 +427,13 @@ public func gatedDeltaUpdate(
     // kernel and has no gradient, so a model in training mode passes
     // `!training` here, as the Python model does with `use_kernel`.
     //
-    // The MLXFast kernel has a gradient and is faster than both, so the
-    // layouts it supports take it in training and in inference.
-    if hasFastGatedDelta(q: q, v: v, mask: mask) {
+    // The MLXFast kernel has a gradient, so the layouts it supports take it in
+    // training. Inference keeps the custom kernel: MLXFast runs only without a
+    // mask, so a decode row would take it alone and a batched row (masked)
+    // would not, and the two kernels round differently. A row's tokens would
+    // then depend on whether it was batched, which continuous batching's
+    // shared-forward parity check rejects.
+    if !useKernel, hasFastGatedDelta(q: q, v: v, mask: mask) {
         return fastGatedDelta(q: q, k: k, v: v, g: g, beta: beta, state: state)
     }
     if useKernel, GatedDeltaKernelManager.shared.kernel != nil, Dk % 32 == 0 {
