@@ -41,6 +41,19 @@ public struct PrefillParameters: Sendable {
     /// needs the Metal allocator; a caller that drives the chunk loop without
     /// MLX arrays on a host with no default metallib sets this to `false`.
     public var clearsBufferCache = true
+    /// Called once, before the first prefill forward, with the positions the
+    /// cache already holds.
+    ///
+    /// A prefill resumes on a reused prefix whenever the cache already
+    /// represents the prompt's leading positions, as ``ChatSession`` arranges
+    /// between turns, and ``progress`` counts only what the prefill adds on
+    /// top. This reports the other half, so a consumer tracking how full a
+    /// cache is while a prompt is prefilled holds `prefix + processed`; a cold
+    /// cache reports `0`. The figure is the one the turn's
+    /// ``GenerateCompletionInfo/cachedPromptTokenCount`` confirms once it ends.
+    ///
+    /// The closure is retained like ``progress``.
+    public var prefix: (@Sendable (_ positions: Int) -> Void)?
 
     /// Strategy dividing the prompt into prefill forwards.
     public enum Chunking: Sendable {
@@ -65,11 +78,13 @@ public struct PrefillParameters: Sendable {
     public init(
         stepSize: Int? = nil,
         chunking: Chunking = .balanced,
-        progress: (@Sendable (_ processed: Int, _ total: Int) -> Void)? = nil
+        progress: (@Sendable (_ processed: Int, _ total: Int) -> Void)? = nil,
+        prefix: (@Sendable (_ positions: Int) -> Void)? = nil
     ) {
         self.stepSize = stepSize
         self.chunking = chunking
         self.progress = progress
+        self.prefix = prefix
     }
 
     /// The step size used when neither ``stepSize`` nor a model default applies.

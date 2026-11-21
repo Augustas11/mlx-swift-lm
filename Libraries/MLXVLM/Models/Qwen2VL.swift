@@ -654,8 +654,7 @@ private enum Vision {
 
             q = applyMultimodalRotaryPositionEmbedding(q, freqs: rotaryPositionEmbedding)
             k = applyMultimodalRotaryPositionEmbedding(k, freqs: rotaryPositionEmbedding)
-            // The rotary embedding broadcasts in a leading batch axis; the
-            // segmented attention indexes patch rows on axis 0.
+            // Rotary adds a leading batch axis. Segmented attention indexes rows on axis 0.
             q = q.reshaped(sequenceLength, numHeads, -1)
             k = k.reshaped(sequenceLength, numHeads, -1)
 

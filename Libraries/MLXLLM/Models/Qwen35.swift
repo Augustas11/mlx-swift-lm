@@ -20,35 +20,38 @@ private enum RopeParametersCodingKey: String, CodingKey {
 
 public struct Qwen35TextConfiguration: Codable, Sendable {
     var modelType: String = ""
-    var hiddenSize: Int = 4096
-    var hiddenLayers: Int = 32
-    var intermediateSize: Int = 14336
-    var attentionHeads: Int = 32
-    var kvHeads: Int = 8
-    var linearNumValueHeads: Int = 64
-    var linearNumKeyHeads: Int = 16
-    var linearKeyHeadDim: Int = 192
-    var linearValueHeadDim: Int = 128
-    var linearConvKernelDim: Int = 4
+    public internal(set) var hiddenSize: Int = 4096
+    public internal(set) var hiddenLayers: Int = 32
+    public internal(set) var intermediateSize: Int = 14336
+    public internal(set) var attentionHeads: Int = 32
+    public internal(set) var kvHeads: Int = 8
+    public internal(set) var linearNumValueHeads: Int = 64
+    public internal(set) var linearNumKeyHeads: Int = 16
+    public internal(set) var linearKeyHeadDim: Int = 192
+    public internal(set) var linearValueHeadDim: Int = 128
+    public internal(set) var linearConvKernelDim: Int = 4
     var rmsNormEps: Float = 1e-6
-    var vocabularySize: Int = 151_936
+    public internal(set) var vocabularySize: Int = 151_936
     var ropeTheta: Float = 100000.0
     var partialRotaryFactor: Float = 0.25
     var maxPositionEmbeddings: Int = 131072
     var tieWordEmbeddings: Bool = false
     var attentionBias: Bool = false
-    var headDim: Int?
+    public internal(set) var headDim: Int?
     var ropeScaling: [String: StringOrNumber]?
     var fullAttentionInterval: Int = 4
-    var mtpNumHiddenLayers: Int = 0
+    var layerTypes: [String]?
+    /// The attention kind of each layer, `"linear_attention"` or `"full_attention"`.
+    public internal(set) var resolvedLayerTypes: [String] = []
+    public internal(set) var mtpNumHiddenLayers: Int = 0
     var mtpUseDedicatedEmbeddings: Bool = false
 
     // MoE fields
-    var numExperts: Int = 0
-    var numExpertsPerTok: Int = 0
+    public internal(set) var numExperts: Int = 0
+    public internal(set) var numExpertsPerTok: Int = 0
     var decoderSparseStep: Int = 1
-    var sharedExpertIntermediateSize: Int = 0
-    var moeIntermediateSize: Int = 0
+    public internal(set) var sharedExpertIntermediateSize: Int = 0
+    public internal(set) var moeIntermediateSize: Int = 0
     var normTopkProb: Bool = true
 
     enum CodingKeys: String, CodingKey {
@@ -73,6 +76,7 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         case headDim = "head_dim"
         case ropeScaling = "rope_scaling"
         case fullAttentionInterval = "full_attention_interval"
+        case layerTypes = "layer_types"
         case mtpNumHiddenLayers = "mtp_num_hidden_layers"
         case mtpUseDedicatedEmbeddings = "mtp_use_dedicated_embeddings"
         case numExperts = "num_experts"
@@ -121,6 +125,13 @@ public struct Qwen35TextConfiguration: Codable, Sendable {
         self.headDim = try container.decodeIfPresent(Int.self, forKey: .headDim)
         self.fullAttentionInterval =
             try container.decodeIfPresent(Int.self, forKey: .fullAttentionInterval) ?? 4
+        self.layerTypes = try container.decodeIfPresent([String].self, forKey: .layerTypes)
+        let layerSchedule = try HybridAttentionSchedule(
+            hiddenLayerCount: hiddenLayers,
+            fullAttentionInterval: fullAttentionInterval,
+            explicitLayerTypes: layerTypes
+        )
+        self.resolvedLayerTypes = layerSchedule.layerTypes
         self.mtpNumHiddenLayers =
             try container.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) ?? 0
         self.mtpUseDedicatedEmbeddings =
@@ -407,12 +418,15 @@ final class Qwen35GatedDeltaNet: Module {
 
         let dtype = q.dtype
         let invScale = pow(Float(headKDim), -0.5)
+        // rmsNorm adds eps to mean(x^2). The reference l2norm adds 1e-6 to
+        // sum(x^2), so divide the eps by the head dim.
+        let qkEps = 1e-6 / Float(headKDim)
         let qNormed =
             MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: qkEps)
         let kNormed =
             MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: qkEps)
 
         let out: MLXArray
         let newRecState: MLXArray
@@ -734,7 +748,8 @@ final class Qwen35DecoderLayer: Module {
 
     init(_ args: Qwen35TextConfiguration, layerIdx: Int, forceFullAttention: Bool = false) {
         self.isLinear =
-            forceFullAttention ? false : (layerIdx + 1) % args.fullAttentionInterval != 0
+            forceFullAttention
+            ? false : args.resolvedLayerTypes[layerIdx] == HybridAttentionSchedule.linearAttention
 
         if isLinear {
             _linearAttn.wrappedValue = Qwen35GatedDeltaNet(args)
@@ -917,11 +932,11 @@ final class Qwen35DecoderLayer: Module {
 public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    fileprivate let layers: [Qwen35DecoderLayer]
+    let layers: [Qwen35DecoderLayer]
     let norm: RMSNorm
 
-    let ssmIdx: Int
-    let faIdx: Int
+    let ssmIdx: Int?
+    let faIdx: Int?
 
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
@@ -938,8 +953,8 @@ public class Qwen35TextModelInner: Module {
 
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
-        self.ssmIdx = 0
-        self.faIdx = args.fullAttentionInterval - 1
+        self.ssmIdx = layers.firstIndex(where: { $0.isLinear })
+        self.faIdx = layers.firstIndex(where: { !$0.isLinear })
 
         let segments = CompiledDecodeSegment.schedule(
             linearLayers: layers.map(\.isLinear))
@@ -1017,8 +1032,13 @@ public class Qwen35TextModelInner: Module {
             cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
         }
 
-        let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
-        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        let faMask =
+            faIdx.map {
+                createAttentionMask(h: hiddenStates, cache: cacheArray?[$0])
+            } ?? .none
+        let ssmMask = ssmIdx.flatMap {
+            createSSMMask(h: hiddenStates, cache: cacheArray?[$0] as? MambaCache)
+        }
 
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
@@ -1098,10 +1118,16 @@ public class Qwen35TextModelInner: Module {
         guard cache.count == layers.count else { return nil }
         // The schedule is only valid when the masks the general path would
         // build both come out empty.
-        if createSSMMask(h: inputs, cache: cache[ssmIdx] as? MambaCache) != nil { return nil }
-        guard let faCache = cache[faIdx],
-            case .none = createAttentionMask(h: inputs, cache: faCache)
-        else { return nil }
+        if let ssmIdx,
+            createSSMMask(h: inputs, cache: cache[ssmIdx] as? MambaCache) != nil
+        {
+            return nil
+        }
+        if let faIdx {
+            guard let faCache = cache[faIdx],
+                case .none = createAttentionMask(h: inputs, cache: faCache)
+            else { return nil }
+        }
 
         // Cache kinds can change mid-generation (`maybeQuantizeKVCache` swaps
         // array entries), so eligibility is re-checked every step.
@@ -1334,7 +1360,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let kvHeads: [Int]
 
     public let model: Qwen35TextModelInner
-    let configuration: Qwen35TextConfiguration
+    /// The text model's geometry.
+    public let configuration: Qwen35TextConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
@@ -1362,6 +1389,18 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func callAsFunction(
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
+        forward(input, cache: cache, state: state, lastTokenOnly: false)
+    }
+
+    public func nextTokenLogits(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        forward(input, cache: cache, state: state, lastTokenOnly: true)
+    }
+
+    private func forward(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?, lastTokenOnly: Bool
+    ) -> LMOutput {
         let emitDrafterState = state?[mtpEmitFlagKey] ?? false
         let hiddenStates: MLXArray
         if emitDrafterState {
@@ -1375,11 +1414,16 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             hiddenStates = model(input.tokens, cache: cache)
         }
 
+        let projection: Module = lmHead ?? model.embedTokens
+        let projectionInput =
+            lastTokenOnly && !emitDrafterState
+            ? quantizedVocabularyProjectionInput(hiddenStates, projection: projection)
+            : hiddenStates
         let logits: MLXArray
         if let lmHead {
-            logits = lmHead(hiddenStates)
+            logits = lmHead(projectionInput)
         } else {
-            logits = model.embedTokens.asLinear(hiddenStates)
+            logits = model.embedTokens.asLinear(projectionInput)
         }
 
         guard emitDrafterState else {
@@ -1392,7 +1436,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             cache: cache, fullAttentionIndex: model.faIdx)
         outState[mtpSharedKVOffsetsKey] = qwen35SharedKVOffsets(
             cache: cache, fullAttentionIndex: model.faIdx)
-        outState[mtpSharedKVSourceIndicesKey] = ["full_attention": model.faIdx]
+        outState[mtpSharedKVSourceIndicesKey] =
+            model.faIdx.map {
+                ["full_attention": $0]
+            } ?? [:]
         return LMOutput(logits: logits, state: outState)
     }
 
@@ -1415,6 +1462,18 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    public var excludedCheckpointNamespaces: [String] {
+        Qwen35CheckpointPolicy.excludedTargetNamespaces
+    }
+
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        var checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
+            checkpoint, layout: .text, tiedWordEmbeddings: configuration.tieWordEmbeddings)
+        checkpoint.weights = try sanitize(
+            weights: checkpoint.weights, metadata: checkpoint.metadata)
+        return checkpoint
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         let hasUnsanitizedConv1d = weights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
@@ -1425,7 +1484,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // layout is the reliable signal on its own.
         let shouldShiftNormWeights = hasUnsanitizedConv1d
 
-        var weights = weights.filter { !$0.key.contains("mtp.") }
+        var weights = Qwen35CheckpointPolicy.targetWeights(weights)
 
         weights = filterLMHeadWeights(
             from: weights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
@@ -1458,9 +1517,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
 private func qwen35SharedKVState(
     cache: [KVCache]?,
-    fullAttentionIndex: Int
+    fullAttentionIndex: Int?
 ) -> [String: (MLXArray, MLXArray)] {
-    guard let cache, fullAttentionIndex < cache.count else {
+    guard let cache, let fullAttentionIndex, fullAttentionIndex < cache.count else {
         return [:]
     }
     let state = cache[fullAttentionIndex].state
@@ -1472,9 +1531,9 @@ private func qwen35SharedKVState(
 
 private func qwen35SharedKVOffsets(
     cache: [KVCache]?,
-    fullAttentionIndex: Int
+    fullAttentionIndex: Int?
 ) -> [String: Int]? {
-    guard let cache, fullAttentionIndex < cache.count else {
+    guard let cache, let fullAttentionIndex, fullAttentionIndex < cache.count else {
         return nil
     }
     return ["full_attention": cache[fullAttentionIndex].offset]
@@ -1483,6 +1542,12 @@ private func qwen35SharedKVOffsets(
 extension Qwen35TextModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
+    }
+}
+
+extension Qwen35TextModel: ModelComponentsProviding {
+    public var modelComponents: [ModelComponent: [CheckpointComponent]] {
+        Qwen35CheckpointPolicy.components
     }
 }
 
@@ -1497,6 +1562,9 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     public let kvHeads: [Int]
 
     @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
+
+    /// The text backbone's geometry.
+    public var configuration: Qwen35TextConfiguration { languageModel.configuration }
 
     public init(_ args: Qwen35Configuration) {
         let textModel = Qwen35TextModel(args.textConfig)
@@ -1515,6 +1583,12 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         languageModel(input, cache: cache, state: state)
     }
 
+    public func nextTokenLogits(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        languageModel.nextTokenLogits(input, cache: cache, state: state)
+    }
+
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         try languageModel.newCache(parameters: parameters)
     }
@@ -1523,30 +1597,36 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         try languageModel.prepare()
     }
 
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var sanitized = [String: MLXArray]()
-        for (key, value) in weights {
-            if key.hasPrefix("vision_tower") || key.hasPrefix("model.visual") {
-                continue
-            }
+    public var excludedCheckpointNamespaces: [String] {
+        Qwen35CheckpointPolicy.excludedTargetNamespaces
+    }
 
-            var key = key
-            if key.hasPrefix("model.language_model") {
-                key = key.replacingOccurrences(
-                    of: "model.language_model", with: "language_model.model")
-            } else if !key.hasPrefix("language_model.") {
-                key = "language_model." + key
-            }
-            sanitized[key] = value
-        }
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        var checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
+            checkpoint, layout: .wrappedText,
+            tiedWordEmbeddings: languageModel.configuration.tieWordEmbeddings)
+        checkpoint.weights = try sanitize(
+            weights: checkpoint.weights, metadata: checkpoint.metadata)
+        return checkpoint
+    }
 
-        return languageModel.sanitize(weights: sanitized)
+    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        let checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
+            .init(weights: weights), layout: .wrappedText,
+            tiedWordEmbeddings: languageModel.configuration.tieWordEmbeddings)
+        return languageModel.sanitize(weights: checkpoint.weights)
     }
 }
 
 extension Qwen35Model: LoRAModel {
     public var loraLayers: [Module] {
         languageModel.model.layers
+    }
+}
+
+extension Qwen35Model: ModelComponentsProviding {
+    public var modelComponents: [ModelComponent: [CheckpointComponent]] {
+        Qwen35CheckpointPolicy.components
     }
 }
 
@@ -1559,10 +1639,10 @@ extension Qwen35Model: SpeculativeCacheRewindModel {
 // `Qwen35MoEModel` subclasses `Qwen35Model` and inherits both declarations.
 extension Qwen35Model {
     public var toolCallFormat: ToolCallFormat? { .qwen35 }
-    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
+    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.qwen35 }
 }
 
 extension Qwen35TextModel {
     public var toolCallFormat: ToolCallFormat? { .qwen35 }
-    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
+    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.qwen35 }
 }

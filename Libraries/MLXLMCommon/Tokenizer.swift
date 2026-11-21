@@ -9,6 +9,10 @@ public protocol Tokenizer: Sendable {
     func convertTokenToId(_ token: String) -> Int?
     func convertIdToToken(_ id: Int) -> String?
 
+    /// Creates independent decoding state for one generated sequence.
+    /// Override to supply a tokenizer-specific incremental implementation.
+    func makeStreamingDetokenizer() -> any StreamingDetokenizer
+
     var bosToken: String? { get }
     var eosToken: String? { get }
     var unknownToken: String? { get }
@@ -21,6 +25,10 @@ public protocol Tokenizer: Sendable {
 }
 
 extension Tokenizer {
+    public func makeStreamingDetokenizer() -> any StreamingDetokenizer {
+        NaiveStreamingDetokenizer(tokenizer: self)
+    }
+
     public func encode(text: String) -> [Int] {
         encode(text: text, addSpecialTokens: true)
     }
@@ -53,6 +61,19 @@ extension Tokenizer {
     }
 }
 
+extension Tokenizer {
+    /// The id of `text` when it is exactly one known token, or `nil`.
+    package func singleTokenID(for text: String) -> Int? {
+        if let id = convertTokenToId(text) {
+            guard id != unknownTokenId else { return nil }
+            return id
+        }
+        let encoded = encode(text: text, addSpecialTokens: false)
+        guard encoded.count == 1, encoded[0] != unknownTokenId else { return nil }
+        return encoded[0]
+    }
+}
+
 public enum TokenizerError: LocalizedError {
     case missingChatTemplate
 
@@ -64,8 +85,21 @@ public enum TokenizerError: LocalizedError {
     }
 }
 
+/// Decodes one generated sequence. Preserve special tokens for downstream protocol parsing.
+/// `next()` returns available text, or nil until more tokens arrive. Custom implementations
+/// should emit stable text, holding incomplete bytes or context-dependent suffixes as needed.
 public protocol StreamingDetokenizer: IteratorProtocol<String> {
     mutating func append(token: Int)
+
+    /// Ends the sequence and returns all remaining text, including any unread output.
+    /// Call after the last token and before finishing downstream parsers. Repeated calls
+    /// return nil. Create a new decoder before appending another sequence.
+    mutating func finish() -> String?
+}
+
+extension StreamingDetokenizer {
+    /// Preserves the legacy behavior for decoders without a final flush operation.
+    public mutating func finish() -> String? { nil }
 }
 
 public struct NaiveStreamingDetokenizer: StreamingDetokenizer {
@@ -94,6 +128,22 @@ public struct NaiveStreamingDetokenizer: StreamingDetokenizer {
     }
 
     public mutating func next() -> String? {
+        next(isFinal: false)
+    }
+
+    /// Flushes remaining text, including replacement characters for incomplete bytes.
+    /// Repeated calls return nil. Create a new detokenizer for the next sequence.
+    public mutating func finish() -> String? {
+        guard !segmentTokens.isEmpty else { return nil }
+        defer {
+            segmentTokens.removeAll()
+            segment = ""
+        }
+        guard let text = next(isFinal: true), !text.isEmpty else { return nil }
+        return text
+    }
+
+    private mutating func next(isFinal: Bool) -> String? {
         let newSegment = tokenizer.decode(tokenIds: segmentTokens)
 
         // Emit the part of `newSegment` beyond its common prefix with the text
@@ -131,7 +181,7 @@ public struct NaiveStreamingDetokenizer: StreamingDetokenizer {
 
         // if the new segment ends with REPLACEMENT CHARACTER this means
         // that the token didn't produce a complete unicode character
-        if new.last == "\u{fffd}" {
+        if !isFinal, new.last == "\u{fffd}" {
             return nil
         }
 

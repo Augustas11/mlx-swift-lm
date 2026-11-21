@@ -295,6 +295,79 @@ struct HarmonyOutputRouterTests {
         #expect(rejections.map(\.reason) == [.undeclaredTool, .invalidArguments])
         #expect(adapter.rejectedToolCallCount == 2)
     }
+
+    @Test("the stream adapter can end for steering only after analysis or public text")
+    func adapterEndsForSteeringOnlyAfterFrameText() throws {
+        func check(_ script: [(piece: String, canEnd: Bool)]) throws {
+            let tokenizer = RouterDeterministicTokenizer(
+                tokens: script.map(\.piece) + routerControlTokens)
+            var adapter = try #require(
+                HarmonyStreamAdapter(tokenizer: tokenizer, tools: nil, stopStrings: []))
+            for (piece, canEnd) in script {
+                _ = adapter.push(try #require(tokenizer.convertTokenToId(piece))) { _ in true }
+                #expect(adapter.canEndForSteering == canEnd, "after \(piece.debugDescription)")
+            }
+        }
+        try check([
+            ("<|channel|>", false), ("analysis", false), ("<|message|>", false),
+            ("Plan", true), (" it\n", false), ("<|end|>", false),
+            ("<|start|>", false), ("assistant", false), ("<|channel|>", false), ("final", false),
+            ("<|message|>", false), ("Done", true), (".\n", false), ("<|return|>", false),
+        ])
+        try check([
+            ("<|channel|>", false), ("commentary to=functions.search", false),
+            ("<|message|>", false), (#"{"q":"x"}"#, false), ("<|call|>", false),
+        ])
+    }
+
+    @Test("markers spelled out in the middle of analysis stay private reasoning")
+    func literalMarkersInsideAnalysis() throws {
+        let thought = "a frame ends with <|end|> and <|channel|>final<|message|> opens the answer"
+        let events = try route(
+            [
+                "<|channel|>", "analysis", "<|message|>", thought, "<|end|>",
+                "<|channel|>", "final", "<|message|>", "public", "<|return|>",
+            ],
+            allowed: ["search"])
+
+        #expect(events.compactMap(\.reasoning).joined() == thought)
+        #expect(events.compactMap(\.response).joined() == "public")
+    }
+
+    @Test("markers spelled out in the middle of the answer stay in the answer")
+    func literalMarkersInsideFinal() throws {
+        let answer = "write <|channel|>analysis<|message|> to start a thought"
+        let events = try route(
+            ["<|channel|>", "final", "<|message|>", answer, "<|return|>"],
+            allowed: ["search"])
+
+        #expect(events.compactMap(\.response).joined() == answer)
+        #expect(events.compactMap(\.reasoning).isEmpty)
+    }
+
+    @Test("analysis that never closes is not shown as the answer")
+    func unclosedAnalysisStaysPrivate() throws {
+        let events = try route(
+            ["<|channel|>", "analysis", "<|message|>", "unfinished"],
+            allowed: ["search"])
+
+        #expect(events.compactMap(\.reasoning).joined() == "unfinished")
+        #expect(events.compactMap(\.response).isEmpty)
+    }
+
+    @Test("a channel opened inside unclosed analysis does not leak the analysis")
+    func channelOpenedInsideUnclosedAnalysis() throws {
+        let events = try route(
+            [
+                "<|channel|>", "analysis", "<|message|>", "first",
+                "<|channel|>", "analysis", "<|message|>", "second",
+                "<|channel|>", "final", "<|message|>", "public", "<|return|>",
+            ],
+            allowed: ["search"])
+
+        #expect(events.compactMap(\.reasoning).joined() == "firstsecond")
+        #expect(events.compactMap(\.response).joined() == "public")
+    }
 }
 
 // MARK: - Helpers

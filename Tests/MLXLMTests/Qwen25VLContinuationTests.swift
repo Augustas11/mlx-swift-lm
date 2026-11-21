@@ -165,6 +165,10 @@ final class Qwen25VLContinuationTests: XCTestCase {
         try continuation.assertWarmImageContinuation(makeTinyQwen25VL())
     }
 
+    func testQwen25VLSplitMediaSuffixContinuationMatchesFullPrefill() throws {
+        try continuation.assertSplitMediaSuffixContinuation(makeTinyQwen25VL())
+    }
+
     func testQwen25VLImageMidContinuationResumeState() throws {
         try continuation.assertImageMidContinuationResumeState(makeTinyQwen25VL())
     }
@@ -428,10 +432,8 @@ final class Qwen25VLContinuationTests: XCTestCase {
         try assertImagePromptKeepsCacheDtype(makeTinyQwen2VL())
     }
 
-    /// `Qwen2VL` does not conform, so the split runs through `QwenVL` directly
-    /// with this model's ids. Its vision attention stays inside each image
-    /// (macprovider #2016), so, as for Qwen2.5-VL, the split must match the
-    /// full prefill.
+    /// `Qwen2VL` vision attention stays inside each image, so the split is exact.
+    /// `Qwen2VL` does not conform, so the split runs through `QwenVL` directly.
     func testQwen2VLAppendOnlyMediaSplitMatchesFullPrefill() throws {
         let model = try makeTinyQwen2VL()
         try continuation.assertAppendOnlyMediaSplit(

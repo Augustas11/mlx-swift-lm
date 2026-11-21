@@ -135,6 +135,12 @@ extension Gemma4TextModel: MTPTargetInputEmbeddingProvider {
     public var mtpInputEmbeddingScale: Float { model.embedScale }
 }
 
+extension Gemma4Model: ModelComponentsProviding {
+    public var modelComponents: [ModelComponent: [CheckpointComponent]] {
+        Gemma4Checkpoint.components
+    }
+}
+
 // MARK: - LoRA
 
 extension Gemma4Model: LoRAModel {
@@ -147,4 +153,8 @@ extension Gemma4Model: LoRAModel {
 
 extension Gemma4Model {
     public var toolCallFormat: ToolCallFormat? { .gemma4 }
+
+    /// Gemma 4 brackets its thinking in labeled channels rather than a delimiter
+    /// pair (see `ReasoningConfig.gemma4`).
+    public var reasoningConfig: ReasoningConfig? { .gemma4 }
 }

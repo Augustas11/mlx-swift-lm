@@ -6,6 +6,7 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 import MLXOptimizers
+import MLXScriptedLM
 import XCTest
 
 final class LoRADropoutTests: XCTestCase {
@@ -280,12 +281,12 @@ final class LoRADropoutTests: XCTestCase {
 
         _ = LoRATrain.evaluate(
             model: model,
-            dataset: ["sample"],
+            dataset: ["one sample"],
             loss: { model, _, _, _ in
                 observedTraining = model.training
                 return (MLXArray(0.0), MLXArray(1))
             },
-            tokenizer: TestTokenizer(),
+            tokenizer: PseudoWordTokenizer(),
             batchSize: 1,
             batchCount: 1)
 
@@ -300,15 +301,15 @@ final class LoRADropoutTests: XCTestCase {
 
         try LoRATrain.train(
             model: model,
-            train: ["sample"],
-            validate: ["sample"],
+            train: ["one sample"],
+            validate: ["one sample"],
             optimizer: SGD(learningRate: 0.01),
             loss: { model, _, _, _ in
                 observedModes.insert(model.training)
                 let prediction = (model as! Linear)(MLXArray.ones([1, 1]))
                 return ((prediction * prediction).mean(), MLXArray(1))
             },
-            tokenizer: TestTokenizer(),
+            tokenizer: PseudoWordTokenizer(),
             parameters: .init(
                 batchSize: 1, iterations: 1, stepsPerReport: 1, stepsPerEval: 1,
                 validationBatches: 1),
@@ -327,14 +328,14 @@ final class LoRADropoutTests: XCTestCase {
 
         try LoRATrain.train(
             model: model,
-            train: ["sample"],
-            validate: ["sample"],
+            train: ["one sample"],
+            validate: ["one sample"],
             optimizer: SGD(learningRate: 0.01),
             loss: { model, _, _, _ in
                 let prediction = (model as! Linear)(MLXArray.ones([1, 1]))
                 return ((prediction * prediction).mean(), MLXArray(1))
             },
-            tokenizer: TestTokenizer(),
+            tokenizer: PseudoWordTokenizer(),
             parameters: .init(
                 batchSize: 1, iterations: 4, stepsPerReport: 1, stepsPerEval: 100,
                 validationBatches: 1, completedIterations: 2),

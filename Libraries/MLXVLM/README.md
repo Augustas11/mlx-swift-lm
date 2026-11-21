@@ -12,13 +12,16 @@
 Using LLMs and VLMs from MLXLMCommon is as easy as:
 
 ```swift
+import Foundation
 import MLXVLM
 import MLXLMCommon
-import MLXLMHuggingFace
-import MLXLMTokenizers
+import MLXHuggingFace
+import HuggingFace
+import Tokenizers
 
 let model = try await loadModel(
-    using: TokenizersLoader(),
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
     id: "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"
 )
 let session = ChatSession(model)
@@ -80,6 +83,25 @@ Currently supported model types are:
 - gemma3
 - smolvlm
 - muse_glimmer
+- diffusion_gemma
+
+## DiffusionGemma
+
+DiffusionGemma loads through `VLMModelFactory` and supports text, images, video
+frames, and Gemma 4 tool-call parsing. `ChatSession` and the `generate` APIs select
+block diffusion automatically. Audio and speculative decoding are unsupported.
+
+Set `GenerateParameters.diffusion` to control denoiser temperature, canvas size,
+and the entropy-bound or confidence-threshold sampler. `maxTokens` limits emitted
+tokens; `seed` also controls canvas initialization. Autoregressive sampling and
+penalty settings do not affect diffusion. Custom autoregressive logit processors
+are rejected because their state cannot be applied safely to provisional canvas
+tokens. Generation component validators still run before prefill.
+
+Checkpoint preparation maps text and vision tensors together with their file
+metadata and per-layer quantization settings. Conflicting aliases fail loading,
+and unknown tensors remain visible to strict parameter validation. Untied output
+projections require their own checkpoint weights.
 
 See [llm-tool](../../Tools/llm-tool)
 

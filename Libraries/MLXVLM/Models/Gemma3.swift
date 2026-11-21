@@ -66,6 +66,46 @@ public struct Gemma3TextConfiguration: Codable, Sendable {
         case _headDim = "head_dim"
         case _queryPreAttnScalar = "query_pre_attn_scalar"
     }
+
+    // Kept out of `CodingKeys` so the synthesized `Encodable` is unchanged.
+    private enum RopeParametersCodingKeys: String, CodingKey {
+        case ropeParameters = "rope_parameters"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        modelType = try container.decode(String.self, forKey: .modelType)
+        hiddenSize = try container.decode(Int.self, forKey: .hiddenSize)
+        hiddenLayers = try container.decode(Int.self, forKey: .hiddenLayers)
+        intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
+        slidingWindow = try container.decode(Int.self, forKey: .slidingWindow)
+        ropeScaling =
+            try container.decodeIfPresent([String: StringOrNumber].self, forKey: .ropeScaling)
+            ?? Self.fullAttentionRopeParameters(from: decoder)
+        finalLogitSoftcapping = try container.decodeIfPresent(
+            Float.self, forKey: .finalLogitSoftcapping)
+        _attentionHeads = try container.decodeIfPresent(Int.self, forKey: ._attentionHeads)
+        _kvHeads = try container.decodeIfPresent(Int.self, forKey: ._kvHeads)
+        _headDim = try container.decodeIfPresent(Int.self, forKey: ._headDim)
+        _queryPreAttnScalar = try container.decodeIfPresent(
+            Float.self, forKey: ._queryPreAttnScalar)
+    }
+
+    /// Newer `transformers` exports set `rope_scaling` to null and write `rope_parameters`
+    /// instead, either keyed by layer type or flat.
+    private static func fullAttentionRopeParameters(
+        from decoder: Decoder
+    ) -> [String: StringOrNumber]? {
+        guard let container = try? decoder.container(keyedBy: RopeParametersCodingKeys.self)
+        else { return nil }
+        if let byLayerType = try? container.decodeIfPresent(
+            [String: [String: StringOrNumber]].self, forKey: .ropeParameters)
+        {
+            return byLayerType["full_attention"]
+        }
+        return try? container.decodeIfPresent(
+            [String: StringOrNumber].self, forKey: .ropeParameters)
+    }
 }
 
 // MARK: - Vision Configuration
@@ -1086,6 +1126,11 @@ public struct Gemma3Processor: UserInputProcessor {
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
+
+        if input.images.isEmpty {
+            // No mask: one unpadded sequence needs none, and a mask stops prompt-cache reuse.
+            return LMInput(tokens: MLXArray(promptTokens).expandedDimensions(axis: 0))
+        }
 
         // Process images if any
         var processedImage: LMInput.ProcessedImage?

@@ -23,7 +23,7 @@ struct Gemma3nSharedKVTests {
             for reserve in [0, 3] {
                 let cache = try caches(model, reserve: reserve)
                 let output = forward(model, tokens: tokens, chunks: chunks, cache: cache)
-                #expect(allClose(output, expected, rtol: 2e-4, atol: 2e-5).item(Bool.self))
+                expectClose(output, expected, rtol: 2e-4, atol: 2e-5, reducedAtol: 2e-2)
                 #expect(cache.count == 4)
                 #expect(cache.allSatisfy { $0.offset == 12 })
             }
@@ -47,7 +47,7 @@ struct Gemma3nSharedKVTests {
                 MLXArray(Array(1 ... 10) + [13, 14, 15]).reshaped(1, 13), cache: nil)
             let expected = fresh[0..., 10..., 0...]
             eval(output, expected)
-            #expect(allClose(output, expected, rtol: 2e-4, atol: 2e-5).item(Bool.self))
+            expectClose(output, expected, rtol: 2e-4, atol: 2e-5, reducedAtol: 2e-2)
             #expect(cache.allSatisfy { $0.offset == 13 })
         }
     }
@@ -78,7 +78,7 @@ struct Gemma3nSharedKVTests {
                 MLXArray(Array(1 ... 12) + [13, 14, 16]).reshaped(1, 15), cache: nil)
             let fresh = freshLogits[0..., 14..., 0...]
             eval(next, fresh)
-            #expect(allClose(next, fresh, rtol: 2e-4, atol: 2e-5).item(Bool.self))
+            expectClose(next, fresh, rtol: 2e-4, atol: 2e-5, reducedAtol: 2e-2)
         }
     }
 
@@ -115,7 +115,7 @@ struct Gemma3nSharedKVTests {
                 )
                 .transposed(0, 2, 1, 3).reshaped(1, count, -1))
             eval(output, expected)
-            #expect(allClose(output, expected, rtol: 2e-4, atol: 2e-5).item(Bool.self))
+            expectClose(output, expected, rtol: 2e-4, atol: 2e-5, reducedAtol: 2e-2)
             #expect(cache.offset == count)
         }
     }
@@ -208,11 +208,16 @@ struct Gemma3nSharedKVTests {
         var legacy = weights
         legacy["language_model.layers.4.self_attn.k_proj.weight"] = MLXArray.zeros([32, 32])
         legacy["language_model.layers.5.self_attn.k_norm.weight"] = MLXArray.ones([32])
-        // macprovider fork: no ModelCheckpoint API yet; sanitize drops the
-        // unused shared-layer K/V modules instead of prepareCheckpoint.
-        let prepared = model.sanitize(weights: legacy)
-        #expect(prepared.count == weights.count)
-        for checkpoint in [weights, prepared] {
+        let settings = BaseConfiguration.PerLayerQuantization(
+            quantization: nil,
+            perLayerQuantization: [
+                "language_model.layers.4.self_attn.k_proj": .quantize(.init(groupSize: 32, bits: 4))
+            ])
+        let prepared = try model.prepareCheckpoint(
+            .init(weights: legacy, perLayerQuantization: settings))
+        #expect(prepared.weights.count == weights.count)
+        #expect(prepared.perLayerQuantization?.perLayerQuantization.isEmpty == true)
+        for checkpoint in [weights, prepared.weights] {
             let loaded = Gemma3nTextModel(config: try configuration())
             try loaded.update(parameters: ModuleParameters.unflattened(checkpoint), verify: [.all])
         }

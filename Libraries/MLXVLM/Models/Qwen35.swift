@@ -80,6 +80,10 @@ enum Qwen35BatchDecodeState {
     }
 }
 
+private func supportsExactCompiledDecode(_ dtype: DType) -> Bool {
+    dtype == .float16 || dtype == .bfloat16
+}
+
 // MARK: - Configuration
 
 public struct Qwen35Configuration: Codable, Sendable {
@@ -106,6 +110,8 @@ public struct Qwen35Configuration: Codable, Sendable {
         public var headDim: Int?
         public var ropeParameters: [String: StringOrNumber]?
         public var fullAttentionInterval: Int = 4
+        public var layerTypes: [String]?
+        var resolvedLayerTypes: [String] = []
         public var mtpNumHiddenLayers: Int = 0
         public var mtpUseDedicatedEmbeddings: Bool = false
 
@@ -139,6 +145,7 @@ public struct Qwen35Configuration: Codable, Sendable {
             case headDim = "head_dim"
             case ropeParameters = "rope_parameters"
             case fullAttentionInterval = "full_attention_interval"
+            case layerTypes = "layer_types"
             case mtpNumHiddenLayers = "mtp_num_hidden_layers"
             case mtpUseDedicatedEmbeddings = "mtp_use_dedicated_embeddings"
             case numExperts = "num_experts"
@@ -182,6 +189,13 @@ public struct Qwen35Configuration: Codable, Sendable {
             self.headDim = try container.decodeIfPresent(Int.self, forKey: .headDim)
             self.fullAttentionInterval =
                 try container.decodeIfPresent(Int.self, forKey: .fullAttentionInterval) ?? 4
+            self.layerTypes = try container.decodeIfPresent([String].self, forKey: .layerTypes)
+            let layerSchedule = try HybridAttentionSchedule(
+                hiddenLayerCount: hiddenLayers,
+                fullAttentionInterval: fullAttentionInterval,
+                explicitLayerTypes: layerTypes
+            )
+            self.resolvedLayerTypes = layerSchedule.layerTypes
             self.mtpNumHiddenLayers =
                 try container.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) ?? 0
             self.mtpUseDedicatedEmbeddings =
@@ -291,12 +305,27 @@ public enum Qwen35Language {
     final class RotaryEmbedding {
         private let invFreq: MLXArray
         private let mropeIndices: MLXArray
+        let attentionScaling: Float
 
-        init(dim: Int, base: Float, mropeSection: [Int]) {
+        init(
+            dim: Int, base: Float, mropeSection: [Int],
+            ropeParameters: [String: StringOrNumber]? = nil, maxPositionEmbeddings: Int = 131_072
+        ) {
             let safeDim = max(1, dim)
             var freq = MLXArray(stride(from: 0, to: safeDim, by: 2)).asType(.float32)
             freq = freq / Float(safeDim)
-            self.invFreq = 1.0 / pow(MLXArray(base), freq)
+
+            let ropeType = ropeParameters?["type"] ?? ropeParameters?["rope_type"]
+            if let ropeParameters, case .string("yarn") = ropeType {
+                let yarn = Qwen35Language.yarnParameters(
+                    dim: safeDim, base: base, maxPositionEmbeddings: maxPositionEmbeddings,
+                    ropeParameters)
+                self.invFreq = MLXArray(yarn.invFreq)
+                self.attentionScaling = yarn.attentionFactor
+            } else {
+                self.invFreq = 1.0 / pow(MLXArray(base), freq)
+                self.attentionScaling = 1
+            }
 
             let sections = mropeSection.count >= 3 ? mropeSection : [11, 11, 10]
             var indices = [Int32](repeating: 0, count: freq.dim(0))
@@ -328,8 +357,69 @@ public enum Qwen35Language {
             freqs = applyInterleavedMRope(freqs)
 
             let emb = concatenated([freqs, freqs], axis: -1)
-            return (cos(emb).asType(x.dtype), sin(emb).asType(x.dtype))
+            var cosEmb = cos(emb)
+            var sinEmb = sin(emb)
+            // YaRN scales only the rotary slice of q and k, as in HF.
+            if attentionScaling != 1 {
+                cosEmb = cosEmb * attentionScaling
+                sinEmb = sinEmb * attentionScaling
+            }
+            return (cosEmb.asType(x.dtype), sinEmb.asType(x.dtype))
         }
+    }
+
+    /// HF `_compute_yarn_parameters`: blended inverse frequencies and the attention factor.
+    static func yarnParameters(
+        dim: Int, base: Float, maxPositionEmbeddings: Int,
+        _ ropeParameters: [String: StringOrNumber]
+    ) -> (invFreq: [Float], attentionFactor: Float) {
+        let base = Double(base)
+        let factor = Double(ropeParameters["factor"]?.asFloat() ?? 1)
+        let originalMax = Double(
+            ropeParameters["original_max_position_embeddings"]?.asFloat()
+                ?? Float(maxPositionEmbeddings))
+        let betaFast = Double(ropeParameters["beta_fast"]?.asFloat() ?? 32)
+        let betaSlow = Double(ropeParameters["beta_slow"]?.asFloat() ?? 1)
+
+        func mscale(_ scale: Double, _ mscale: Double = 1) -> Double {
+            scale <= 1 ? 1 : 0.1 * mscale * Foundation.log(scale) + 1
+        }
+
+        let attentionFactor: Double
+        if let value = ropeParameters["attention_factor"]?.asFloat() {
+            attentionFactor = Double(value)
+        } else if let m = ropeParameters["mscale"]?.asFloat(),
+            let mAll = ropeParameters["mscale_all_dim"]?.asFloat(), m != 0, mAll != 0
+        {
+            attentionFactor = mscale(factor, Double(m)) / mscale(factor, Double(mAll))
+        } else {
+            attentionFactor = mscale(factor)
+        }
+
+        func correctionDim(_ rotations: Double) -> Double {
+            Double(dim) * Foundation.log(originalMax / (rotations * 2 * .pi))
+                / (2 * Foundation.log(base))
+        }
+        var low = correctionDim(betaFast)
+        var high = correctionDim(betaSlow)
+        if case .bool(false) = ropeParameters["truncate"] {
+            // HF keeps the fractional correction range when truncate is false.
+        } else {
+            low = low.rounded(.down)
+            high = high.rounded(.up)
+        }
+        low = max(low, 0)
+        high = min(high, Double(dim - 1))
+        if low == high { high += 0.001 }
+
+        let invFreq = (0 ..< dim / 2).map { i -> Float in
+            let posFreq = Foundation.pow(base, Double(2 * i) / Double(dim))
+            let ramp = min(max((Double(i) - low) / (high - low), 0), 1)
+            let extrapolation = 1 - ramp
+            return Float(
+                (1 / (factor * posFreq)) * (1 - extrapolation) + (1 / posFreq) * extrapolation)
+        }
+        return (invFreq, Float(attentionFactor))
     }
 
     static func applyMultimodalRotaryPosEmb(
@@ -424,7 +514,9 @@ public enum Qwen35Language {
             let mrope = args.ropeParameters?["mrope_section"]?.asInts() ?? [11, 11, 10]
             let rotaryDim = Int(Float(headDim) * args.partialRotaryFactor)
             self.rotaryEmbedding = RotaryEmbedding(
-                dim: rotaryDim, base: args.ropeTheta, mropeSection: mrope)
+                dim: rotaryDim, base: args.ropeTheta, mropeSection: mrope,
+                ropeParameters: args.ropeParameters,
+                maxPositionEmbeddings: args.maxPositionEmbeddings)
             super.init()
         }
 
@@ -434,6 +526,21 @@ public enum Qwen35Language {
             cache: KVCache?,
             positionIds: MLXArray?
         ) -> MLXArray {
+            let (queries, gate, keys, values) = projectPreRope(x)
+            let attention = attend(
+                queries: queries,
+                keys: keys,
+                values: values,
+                mask: mask,
+                cache: cache,
+                positionIds: positionIds)
+            return mergeHeadsAndProject(attention: attention, gate: gate)
+        }
+
+        /// Projections up to M-RoPE, which remains outside compiled traces.
+        func projectPreRope(
+            _ x: MLXArray
+        ) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
             let B = x.dim(0)
             let L = x.dim(1)
 
@@ -449,7 +556,24 @@ public enum Qwen35Language {
             keys = kNorm(keys.reshaped(B, L, numKeyValueHeads, -1)).transposed(0, 2, 1, 3)
             values = values.reshaped(B, L, numKeyValueHeads, -1).transposed(0, 2, 1, 3)
 
-            var positionIds = positionIds
+            return (queries, gate, keys, values)
+        }
+
+        /// Dynamic M-RoPE, cache mutation, and SDPA stay eager.
+        func attend(
+            queries initialQueries: MLXArray,
+            keys initialKeys: MLXArray,
+            values: MLXArray,
+            mask: MLXArray?,
+            cache: KVCache?,
+            positionIds providedPositionIds: MLXArray?
+        ) -> MLXArray {
+            let B = initialQueries.dim(0)
+            let L = initialQueries.dim(2)
+            var queries = initialQueries
+            var keys = initialKeys
+
+            var positionIds = providedPositionIds
 
             if positionIds == nil {
                 let offset = cache?.offset ?? 0
@@ -469,7 +593,7 @@ public enum Qwen35Language {
             let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode =
                 mask.map { .array($0) } ?? .none
 
-            let output = attentionWithCacheUpdate(
+            return attentionWithCacheUpdate(
                 queries: queries,
                 keys: keys,
                 values: values,
@@ -477,9 +601,13 @@ public enum Qwen35Language {
                 scale: scale,
                 mask: attentionMask
             )
-            .transposed(0, 2, 1, 3)
-            .reshaped(B, L, -1)
+        }
 
+        func mergeHeadsAndProject(attention: MLXArray, gate: MLXArray) -> MLXArray {
+            let output =
+                attention
+                .transposed(0, 2, 1, 3)
+                .reshaped(attention.dim(0), attention.dim(2), -1)
             return oProj(output * sigmoid(gate))
         }
     }
@@ -522,6 +650,13 @@ public enum Qwen35Language {
         // remain as views so checkpoint and adapter paths stay unchanged.
         private let fusedInputProjection = FusedQuantizedLinearProjectionCache()
         var fusedInputProjectionEnabled = qwen35FourGDNEnabled
+
+        private struct ProjectionTrace {
+            weak var value: (any CompiledTraceInvalidating)?
+        }
+        // Submodule updates must also drop traces owned by parent decoders.
+        private let fusedProjectionTracesLock = NSLock()
+        private var fusedProjectionTraces: [ObjectIdentifier: ProjectionTrace] = [:]
 
         @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
         @ParameterInfo(key: "A_log") var aLog: MLXArray
@@ -583,7 +718,7 @@ public enum Qwen35Language {
             }
             defer {
                 if replacesInputProjection {
-                    fusedInputProjection.invalidate()
+                    invalidateFusedInputProjection()
                 }
             }
             return try super.update(
@@ -596,13 +731,39 @@ public enum Qwen35Language {
                 || key == "in_proj_b" || key == "in_proj_a"
             defer {
                 if replacesInputProjection {
-                    fusedInputProjection.invalidate()
+                    invalidateFusedInputProjection()
                 }
             }
             try super.updateModule(key: key, value)
         }
 
         var hasFusedInputProjection: Bool { fusedInputProjection.isPrepared }
+
+        func registerFusedProjectionTrace(_ trace: any CompiledTraceInvalidating) {
+            fusedProjectionTracesLock.withLock {
+                fusedProjectionTraces[ObjectIdentifier(trace)] = ProjectionTrace(value: trace)
+            }
+        }
+
+        private func invalidateFusedInputProjection() {
+            fusedInputProjection.invalidate()
+            let traces = fusedProjectionTracesLock.withLock {
+                let traces = fusedProjectionTraces.values.compactMap(\.value)
+                fusedProjectionTraces.removeAll()
+                return traces
+            }
+            // Trace setup takes its own lock first, so invalidate after unlocking.
+            for trace in traces {
+                trace.invalidate()
+            }
+        }
+
+        /// The fused projection as compile state for a trace that runs this
+        /// layer. It is not a registered child because the four source
+        /// projections retain the checkpoint topology.
+        var fusedProjectionTraceState: [Module] {
+            fusedInputProjection.fused.map { [$0] } ?? []
+        }
 
         @discardableResult
         func prepareFusedInputProjection() throws -> Bool {
@@ -654,27 +815,64 @@ public enum Qwen35Language {
             cache: MambaCache? = nil,
             checkpointAfter: Int? = nil
         ) -> MLXArray {
-            let B = inputs.dim(0)
-            let S = inputs.dim(1)
-
-            var (mixedQKV, z, b, a) = projectInputs(
-                inputs, batch: B, sequence: S)
-
-            let convState: MLXArray
-            if let cacheState = cache?[0] {
-                convState = cacheState
-            } else {
-                convState = MLXArray.zeros(
-                    [B, max(0, convKernelSize - 1), convDim], dtype: inputs.dtype)
+            let convState =
+                cache?[0] ?? zeroStates(batch: inputs.dim(0), dtype: inputs.dtype).conv
+            let result = forward(
+                inputs, convState: convState, recState: cache?[1], mask: mask,
+                checkpointAfter: checkpointAfter)
+            if let cache {
+                if convKernelSize > 1 {
+                    cache[0] = result.convState
+                }
+                cache[1] = result.recurrentState
+                if let checkpoint = result.checkpoint, let checkpointAfter {
+                    cache.saveSpeculativeCheckpoint(
+                        convState: checkpoint.conv,
+                        recurrentState: checkpoint.recurrent,
+                        advancedBy: checkpointAfter)
+                }
+                cache.advance(inputs.dim(1))
             }
+            return result.output
+        }
 
+        func zeroStates(batch: Int, dtype: DType) -> (conv: MLXArray, rec: MLXArray) {
+            (
+                MLXArray.zeros(
+                    [batch, max(0, convKernelSize - 1), convDim], dtype: dtype),
+                MLXArray.zeros(
+                    [batch, numVHeads, headVDim, headKDim], dtype: .float32)
+            )
+        }
+
+        /// The GDN body with cache state passed explicitly for compiled decode.
+        func forward(
+            _ x: MLXArray,
+            convState: MLXArray,
+            recState: MLXArray?,
+            mask: MLXArray?,
+            checkpointAfter: Int? = nil
+        ) -> (
+            output: MLXArray,
+            convState: MLXArray,
+            recurrentState: MLXArray,
+            checkpoint: (conv: MLXArray, recurrent: MLXArray)?
+        ) {
+            let B = x.dim(0)
+            let S = x.dim(1)
+
+            var (mixedQKV, z, b, a) = projectInputs(x, batch: B, sequence: S)
             if let mask {
                 mixedQKV = MLX.where(mask[.ellipsis, .newAxis], mixedQKV, 0)
             }
 
             let convInput = concatenated([convState, mixedQKV], axis: 1)
-            if let cache, convKernelSize > 1 {
-                cache[0] = contiguous(convInput[0..., (-(convKernelSize - 1))..., 0...])
+            let newConvState: MLXArray
+            if convKernelSize > 1 {
+                newConvState = contiguous(
+                    convInput[0..., (-(convKernelSize - 1))..., 0...])
+            } else {
+                newConvState = MLXArray.zeros([B, 0, convDim], dtype: mixedQKV.dtype)
             }
 
             let convOut = silu(conv1d(convInput))
@@ -683,17 +881,21 @@ public enum Qwen35Language {
             let k = split[1].reshaped(B, S, numKHeads, headKDim)
             let v = split[2].reshaped(B, S, numVHeads, headVDim)
 
-            var state = cache?[1]
             let dtype = q.dtype
             let invScale = pow(Float(headKDim), -0.5)
+            // rmsNorm adds eps to mean(x^2). The reference l2norm adds 1e-6 to
+            // sum(x^2), so divide the eps by the head dim.
+            let qkEps = 1e-6 / Float(headKDim)
             let qNormed =
                 MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: qkEps)
             let kNormed =
                 MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: qkEps)
 
             let out: MLXArray
+            let newRecState: MLXArray
+            let checkpoint: (conv: MLXArray, recurrent: MLXArray)?
             if let split = checkpointAfter, split > 0, split < S {
                 let prefixMask = mask.map { $0[0..., ..<split] }
                 let suffixMask = mask.map { $0[0..., split...] }
@@ -705,7 +907,7 @@ public enum Qwen35Language {
                     b: b[0..., ..<split, 0...],
                     aLog: aLog,
                     dtBias: dtBias,
-                    state: state,
+                    state: recState,
                     mask: prefixMask,
                     useKernel: !training)
                 let (suffixOut, suffixState) = gatedDeltaUpdate(
@@ -720,25 +922,20 @@ public enum Qwen35Language {
                     mask: suffixMask,
                     useKernel: !training)
                 out = concatenated([prefixOut, suffixOut], axis: 1)
-                state = suffixState
+                newRecState = suffixState
 
-                if let cache {
-                    let checkpointConv: MLXArray
-                    if convKernelSize > 1 {
-                        checkpointConv = contiguous(
-                            convInput[
-                                0..., split ..< (split + convKernelSize - 1), 0...])
-                    } else {
-                        checkpointConv = MLXArray.zeros(
-                            [B, 0, convDim], dtype: mixedQKV.dtype)
-                    }
-                    cache.saveSpeculativeCheckpoint(
-                        convState: checkpointConv,
-                        recurrentState: prefixState,
-                        advancedBy: split)
+                let checkpointConv: MLXArray
+                if convKernelSize > 1 {
+                    checkpointConv = contiguous(
+                        convInput[
+                            0..., split ..< (split + convKernelSize - 1), 0...])
+                } else {
+                    checkpointConv = MLXArray.zeros(
+                        [B, 0, convDim], dtype: mixedQKV.dtype)
                 }
+                checkpoint = (checkpointConv, prefixState)
             } else {
-                (out, state) = gatedDeltaUpdate(
+                (out, newRecState) = gatedDeltaUpdate(
                     q: qNormed,
                     k: kNormed,
                     v: v,
@@ -746,18 +943,16 @@ public enum Qwen35Language {
                     b: b,
                     aLog: aLog,
                     dtBias: dtBias,
-                    state: state,
+                    state: recState,
                     mask: mask,
                     useKernel: !training)
-            }
-
-            if let cache {
-                cache[1] = state
-                cache.advance(S)
+                checkpoint = nil
             }
 
             let gated = norm(out, gate: z)
-            return outProj(gated.reshaped(B, S, -1))
+            return (
+                outProj(gated.reshaped(B, S, -1)), newConvState, newRecState, checkpoint
+            )
         }
     }
 
@@ -793,6 +988,26 @@ public enum Qwen35Language {
         }
 
         open func callAsFunction(_ x: MLXArray) -> MLXArray {
+            guard x.dim(1) == 1, !training, supportsExactCompiledDecode(x.dtype),
+                supportsCompiledDecode
+            else {
+                return forward(x)
+            }
+            return compiledForward(self, x)
+        }
+
+        private let compiledForward = CompiledTrace<SparseMoeBlock> { block, arguments in
+            [block.forward(arguments[0])]
+        }
+
+        var compiledDecodeIsCompiled: Bool { compiledForward.isCompiled }
+
+        var supportsCompiledDecode: Bool {
+            type(of: self) == SparseMoeBlock.self && type(of: switchMLP) == SwitchGLU.self
+        }
+
+        /// The eager body, also inlined by an enclosing decoder trace.
+        func forward(_ x: MLXArray) -> MLXArray {
             var gates = gate(x)
             gates = MLX.softmax(gates, axis: -1, precise: true)
 
@@ -811,6 +1026,7 @@ public enum Qwen35Language {
 
     open class DecoderLayer: Module {
         let isLinear: Bool
+        let allowsCompiledDecode: Bool
 
         @ModuleInfo(key: "self_attn") var selfAttn: Attention?
         @ModuleInfo(key: "linear_attn") var linearAttn: GatedDeltaNet?
@@ -824,9 +1040,11 @@ public enum Qwen35Language {
             _ args: Qwen35Configuration.TextConfiguration, layerIdx: Int,
             forceFullAttention: Bool = false
         ) {
+            self.allowsCompiledDecode = !forceFullAttention
             self.isLinear =
                 forceFullAttention
-                ? false : (layerIdx + 1) % args.fullAttentionInterval != 0
+                ? false
+                : args.resolvedLayerTypes[layerIdx] == HybridAttentionSchedule.linearAttention
 
             if isLinear {
                 _linearAttn.wrappedValue = GatedDeltaNet(args)
@@ -857,6 +1075,38 @@ public enum Qwen35Language {
             positionIds: MLXArray?,
             checkpointAfter: Int? = nil
         ) -> MLXArray {
+            forward(
+                x,
+                attentionMask: attentionMask,
+                ssmMask: ssmMask,
+                cache: cache,
+                positionIds: positionIds,
+                checkpointAfter: checkpointAfter,
+                allowCompiledDecode: allowsCompiledDecode)
+        }
+
+        func forward(
+            _ x: MLXArray,
+            attentionMask: MLXArray?,
+            ssmMask: MLXArray?,
+            cache: KVCache?,
+            positionIds: MLXArray?,
+            checkpointAfter: Int?,
+            allowCompiledDecode: Bool
+        ) -> MLXArray {
+            let canCompile =
+                allowCompiledDecode && allowsCompiledDecode && !training
+                && supportsExactCompiledDecode(x.dtype)
+                && x.dim(0) == 1 && x.dim(1) == 1
+                && attentionMask == nil && ssmMask == nil && checkpointAfter == nil
+                && supportsCompiledDecode
+
+            if canCompile, isLinear, let mambaCache = cache as? MambaCache,
+                mambaCache[0] != nil, mambaCache[1] != nil
+            {
+                return decodeLinearLayer(x, cache: mambaCache)
+            }
+
             let r: MLXArray
             if isLinear {
                 r = linearAttn!(
@@ -868,7 +1118,98 @@ public enum Qwen35Language {
             }
 
             let h = x + r
-            return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+            return h
+                + mlpForward(
+                    postAttentionLayerNorm(h), allowCompiledDecode: canCompile)
+        }
+
+        private let compiledLinearLayer: CompiledTrace<DecoderLayer> = CompiledTrace(
+            state: { layer in
+                layer.linearAttn?.registerFusedProjectionTrace(layer.compiledLinearLayer)
+                return [layer] + (layer.linearAttn?.fusedProjectionTraceState ?? [])
+            },
+            body: { layer, arguments in
+                let result = layer.linearLayerBody(
+                    x: arguments[0], convState: arguments[1], recState: arguments[2])
+                return [result.output, result.convState, result.recurrentState]
+            })
+
+        var compiledGDNIsCompiled: Bool { compiledLinearLayer.isCompiled }
+
+        var supportsCompiledDecode: Bool {
+            guard type(of: self) == DecoderLayer.self, !training else { return false }
+            if isLinear {
+                guard let linearAttn, type(of: linearAttn) == GatedDeltaNet.self,
+                    !linearAttn.training
+                else {
+                    return false
+                }
+            } else if selfAttn == nil {
+                return false
+            }
+
+            if let moe = mlp as? SparseMoeBlock {
+                return moe.supportsCompiledDecode
+            }
+            return mlp is MLP
+        }
+
+        private func decodeLinearLayer(_ x: MLXArray, cache: MambaCache) -> MLXArray {
+            let outputs = compiledLinearLayer(self, [x, cache[0]!, cache[1]!])
+            cache[0] = outputs[1]
+            cache[1] = outputs[2]
+            cache.advance(1)
+            return outputs[0]
+        }
+
+        func linearLayerBody(
+            x: MLXArray, convState: MLXArray, recState: MLXArray
+        ) -> (output: MLXArray, convState: MLXArray, recurrentState: MLXArray) {
+            let result = linearAttn!.forward(
+                inputLayerNorm(x), convState: convState, recState: recState, mask: nil)
+            let h = x + result.output
+            return (
+                h + mlpForward(postAttentionLayerNorm(h), allowCompiledDecode: false),
+                result.convState,
+                result.recurrentState
+            )
+        }
+
+        func attentionPreBody(
+            x: MLXArray
+        ) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+            selfAttn!.projectPreRope(inputLayerNorm(x))
+        }
+
+        func attentionCacheStep(
+            queries: MLXArray,
+            keys: MLXArray,
+            values: MLXArray,
+            cache: KVCache,
+            positionIds: MLXArray?
+        ) -> MLXArray {
+            selfAttn!.attend(
+                queries: queries,
+                keys: keys,
+                values: values,
+                mask: nil,
+                cache: cache,
+                positionIds: positionIds)
+        }
+
+        func attentionPostBody(
+            x: MLXArray, attention: MLXArray, gate: MLXArray
+        ) -> MLXArray {
+            let r = selfAttn!.mergeHeadsAndProject(attention: attention, gate: gate)
+            let h = x + r
+            return h + mlpForward(postAttentionLayerNorm(h), allowCompiledDecode: false)
+        }
+
+        private func mlpForward(_ x: MLXArray, allowCompiledDecode: Bool) -> MLXArray {
+            if let moe = mlp as? SparseMoeBlock, type(of: moe) == SparseMoeBlock.self {
+                return allowCompiledDecode ? moe(x) : moe.forward(x)
+            }
+            return (mlp as! UnaryLayer)(x)
         }
     }
 
@@ -877,20 +1218,40 @@ public enum Qwen35Language {
         @ModuleInfo(key: "layers") fileprivate var layers: [DecoderLayer]
         @ModuleInfo(key: "norm") var norm: RMSNorm
 
-        let ssmIdx: Int
-        let faIdx: Int
+        let ssmIdx: Int?
+        let faIdx: Int?
+
+        private let decodeSegments: [CompiledDecodeSegment]
+        private let compiledSegments: CompiledDecodeSegmentCache<Model>
 
         public init(_ args: Qwen35Configuration.TextConfiguration) {
             precondition(args.vocabularySize > 0)
             _embedTokens.wrappedValue = Embedding(
                 embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
-            _layers.wrappedValue = (0 ..< args.hiddenLayers).map {
+            let layers = (0 ..< args.hiddenLayers).map {
                 DecoderLayer(args, layerIdx: $0)
             }
+            _layers.wrappedValue = layers
             _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
-            self.ssmIdx = 0
-            self.faIdx = args.fullAttentionInterval - 1
+            self.ssmIdx = layers.firstIndex(where: { $0.isLinear })
+            self.faIdx = layers.firstIndex(where: { !$0.isLinear })
+
+            let segments = CompiledDecodeSegment.schedule(
+                linearLayers: layers.map(\.isLinear))
+            self.decodeSegments = segments
+            self.compiledSegments = CompiledDecodeSegmentCache(
+                count: segments.count,
+                state: { model, index in
+                    var modules = model.traceState(forLayers: segments[index].layerIndices)
+                    if index == segments.count - 1 {
+                        modules.append(model.norm)
+                    }
+                    return modules
+                },
+                body: { model, index, arguments in
+                    model.segmentBody(at: index, arguments)
+                })
             super.init()
         }
 
@@ -902,6 +1263,33 @@ public enum Qwen35Language {
             applyFinalNorm: Bool = true,
             checkpointAfter: Int? = nil
         ) -> MLXArray {
+            forward(
+                inputs,
+                inputsEmbeds: inputsEmbeds,
+                cache: cache,
+                positionIds: positionIds,
+                applyFinalNorm: applyFinalNorm,
+                checkpointAfter: checkpointAfter,
+                useCompiledDecode: true)
+        }
+
+        func forward(
+            _ inputs: MLXArray,
+            inputsEmbeds: MLXArray? = nil,
+            cache: [KVCache?]? = nil,
+            positionIds: MLXArray? = nil,
+            applyFinalNorm: Bool = true,
+            checkpointAfter: Int? = nil,
+            useCompiledDecode: Bool = true
+        ) -> MLXArray {
+            if useCompiledDecode, type(of: self) == Model.self, !training,
+                inputsEmbeds == nil, applyFinalNorm, checkpointAfter == nil,
+                inputs.dim(0) == 1, inputs.dim(1) == 1, let cache,
+                let step = decodeStep(inputs, cache, positionIds: positionIds)
+            {
+                return step
+            }
+
             var hiddenStates: MLXArray
             if let inputsEmbeds {
                 hiddenStates = inputsEmbeds
@@ -914,29 +1302,184 @@ public enum Qwen35Language {
                 cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
             }
 
-            let faMaskMode = createAttentionMask(
-                h: hiddenStates, cache: cacheArray?[faIdx], returnArray: true)
             let faMask: MLXArray?
-            if case .array(let arrayMask) = faMaskMode {
-                faMask = arrayMask
+            if let faIdx {
+                let faMaskMode = createAttentionMask(
+                    h: hiddenStates, cache: cacheArray?[faIdx], returnArray: true)
+                if case .array(let arrayMask) = faMaskMode {
+                    faMask = arrayMask
+                } else {
+                    faMask = nil
+                }
             } else {
                 faMask = nil
             }
-            let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+            let ssmMask = ssmIdx.flatMap {
+                createSSMMask(h: hiddenStates, cache: cacheArray?[$0] as? MambaCache)
+            }
+
+            let allowLayerCompilation =
+                useCompiledDecode && type(of: self) == Model.self && !training
+                && inputsEmbeds == nil && applyFinalNorm
+                && supportsExactCompiledDecode(hiddenStates.dtype)
+                && hiddenStates.dim(0) == 1 && hiddenStates.dim(1) == 1
+                && faMask == nil && ssmMask == nil && checkpointAfter == nil
+                && layers.enumerated().allSatisfy { index, layer in
+                    guard layer.supportsCompiledDecode else { return false }
+                    if layer.isLinear {
+                        guard let mambaCache = cacheArray?[index] as? MambaCache else {
+                            return false
+                        }
+                        return mambaCache[0] != nil && mambaCache[1] != nil
+                    }
+                    guard let kvCache = cacheArray?[index] else { return false }
+                    return kvCache is QuantizedKVCacheProtocol
+                        || kvCache is TurboQuantKVCache
+                }
 
             for (index, layer) in layers.enumerated() {
                 let layerSSMMask = layer.isLinear ? ssmMask : nil
-                hiddenStates = layer(
-                    hiddenStates,
-                    attentionMask: faMask,
-                    ssmMask: layerSSMMask,
-                    cache: cacheArray?[index],
-                    positionIds: positionIds,
-                    checkpointAfter: checkpointAfter
-                )
+                if type(of: layer) == DecoderLayer.self {
+                    hiddenStates = layer.forward(
+                        hiddenStates,
+                        attentionMask: faMask,
+                        ssmMask: layerSSMMask,
+                        cache: cacheArray?[index],
+                        positionIds: positionIds,
+                        checkpointAfter: checkpointAfter,
+                        allowCompiledDecode: allowLayerCompilation)
+                } else {
+                    hiddenStates = layer(
+                        hiddenStates,
+                        attentionMask: faMask,
+                        ssmMask: layerSSMMask,
+                        cache: cacheArray?[index],
+                        positionIds: positionIds,
+                        checkpointAfter: checkpointAfter)
+                }
             }
 
             return applyFinalNorm ? norm(hiddenStates) : hiddenStates
+        }
+
+        var compiledDecodeSegmentCount: Int { compiledSegments.compiledCount }
+
+        var compiledGDNTraceCount: Int {
+            layers.filter(\.compiledGDNIsCompiled).count
+        }
+
+        var compiledMoETraceCount: Int {
+            layers.compactMap { $0.mlp as? SparseMoeBlock }
+                .filter(\.compiledDecodeIsCompiled).count
+        }
+
+        private func traceState(forLayers indices: [Int]) -> [Module] {
+            indices.flatMap { index in
+                let layer = layers[index]
+                layer.linearAttn?.registerFusedProjectionTrace(compiledSegments)
+                return [layer] + (layer.linearAttn?.fusedProjectionTraceState ?? [])
+            }
+        }
+
+        private func segmentBody(at index: Int, _ args: [MLXArray]) -> [MLXArray] {
+            let segment = decodeSegments[index]
+            var hiddenStates = args[0]
+
+            if let post = segment.attentionPostLayer {
+                hiddenStates = layers[post].attentionPostBody(
+                    x: hiddenStates, attention: args[1], gate: args[2])
+            }
+
+            var states: [MLXArray] = []
+            for (stateIndex, layerIndex) in segment.linearLayers.enumerated() {
+                let slot = segment.stateInputOffset + 2 * stateIndex
+                let result = layers[layerIndex].linearLayerBody(
+                    x: hiddenStates, convState: args[slot], recState: args[slot + 1])
+                hiddenStates = result.output
+                states.append(result.convState)
+                states.append(result.recurrentState)
+            }
+
+            if let pre = segment.attentionPreLayer {
+                let (queries, gate, keys, values) = layers[pre].attentionPreBody(
+                    x: hiddenStates)
+                return [hiddenStates] + states + [queries, gate, keys, values]
+            }
+
+            if index == decodeSegments.count - 1 {
+                hiddenStates = norm(hiddenStates)
+            }
+            return [hiddenStates] + states
+        }
+
+        private func decodeStep(
+            _ inputs: MLXArray, _ cache: [KVCache?], positionIds: MLXArray?
+        ) -> MLXArray? {
+            let embedded = embedTokens(inputs)
+            guard supportsExactCompiledDecode(embedded.dtype) else { return nil }
+            guard cache.count == layers.count else { return nil }
+            if let ssmIdx,
+                createSSMMask(h: embedded, cache: cache[ssmIdx] as? MambaCache) != nil
+            {
+                return nil
+            }
+            if let faIdx {
+                guard let faCache = cache[faIdx],
+                    case .none = createAttentionMask(
+                        h: embedded, cache: faCache, returnArray: true)
+                else { return nil }
+            }
+
+            var mambaCaches = [MambaCache?](repeating: nil, count: layers.count)
+            for (index, layer) in layers.enumerated() {
+                guard layer.supportsCompiledDecode else { return nil }
+                if layer.isLinear {
+                    guard let mambaCache = cache[index] as? MambaCache,
+                        mambaCache[0] != nil, mambaCache[1] != nil
+                    else { return nil }
+                    mambaCaches[index] = mambaCache
+                } else {
+                    guard let kvCache = cache[index], usesPlainAttentionCacheRoute(kvCache) else {
+                        return nil
+                    }
+                }
+            }
+
+            var carry = embedded
+            var pendingAttention: [MLXArray] = []
+
+            for (segmentIndex, segment) in decodeSegments.enumerated() {
+                var args = [carry] + pendingAttention
+                for layerIndex in segment.linearLayers {
+                    let mambaCache = mambaCaches[layerIndex]!
+                    args.append(mambaCache[0]!)
+                    args.append(mambaCache[1]!)
+                }
+
+                let outputs = compiledSegments(self, at: segmentIndex, args)
+                carry = outputs[0]
+
+                for (stateIndex, layerIndex) in segment.linearLayers.enumerated() {
+                    let mambaCache = mambaCaches[layerIndex]!
+                    mambaCache[0] = outputs[1 + 2 * stateIndex]
+                    mambaCache[1] = outputs[2 + 2 * stateIndex]
+                    mambaCache.advance(1)
+                }
+
+                pendingAttention = []
+                if let pre = segment.attentionPreLayer {
+                    let head = segment.attentionOutputOffset
+                    let attention = layers[pre].attentionCacheStep(
+                        queries: outputs[head],
+                        keys: outputs[head + 2],
+                        values: outputs[head + 3],
+                        cache: cache[pre]!,
+                        positionIds: positionIds)
+                    pendingAttention = [attention, outputs[head + 1]]
+                }
+            }
+
+            return carry
         }
     }
 
@@ -977,7 +1520,8 @@ public enum Qwen35Language {
             positionIds providedPositionIds: MLXArray? = nil,
             pixelValues: MLXArray? = nil,
             imageGridTHW: [THW]? = nil,
-            videoGridTHW: [THW]? = nil
+            videoGridTHW: [THW]? = nil,
+            lastTokenOnly: Bool = false
         ) -> LMOutput {
             var state = state ?? .init()
 
@@ -992,11 +1536,16 @@ public enum Qwen35Language {
             let precomputedPositionIds = state[precomputedPositionIdsKey]
             let ropeDeltas = state[ropeDeltasKey]
 
+            let cacheAnchorIndex = model.faIdx ?? model.ssmIdx
             var cacheOffset = 0
+            var hasCacheAnchor = false
             var batchCacheOffsets: MLXArray?
-            if let cache, let faCache = cache[model.faIdx] {
-                cacheOffset = faCache.offset
-                if case .batch(let offsets) = faCache.ropeOffset {
+            if let cache, let cacheAnchorIndex, cache.indices.contains(cacheAnchorIndex),
+                let cacheAnchor = cache[cacheAnchorIndex]
+            {
+                cacheOffset = cacheAnchor.offset
+                hasCacheAnchor = true
+                if case .batch(let offsets) = cacheAnchor.ropeOffset {
                     // Capture before the first layer mutates the packed cache.
                     batchCacheOffsets = offsets + 0
                 }
@@ -1009,7 +1558,7 @@ public enum Qwen35Language {
 
             var positionIds = providedPositionIds
             if positionIds == nil && (ropeMask == nil || ropeMask?.ndim == 2) {
-                if (cache != nil && cache?[model.faIdx] != nil && cacheOffset == 0)
+                if (hasCacheAnchor && cacheOffset == 0)
                     || ropeDeltas == nil
                     || cache == nil
                 {
@@ -1073,7 +1622,11 @@ public enum Qwen35Language {
             )
             let hiddenStates = emitDrafterState ? model.norm(preNormHidden) : preNormHidden
 
-            var out = hiddenStates
+            let projection: Module = lmHead ?? model.embedTokens
+            var out =
+                lastTokenOnly && !emitDrafterState
+                ? quantizedVocabularyProjectionInput(hiddenStates, projection: projection)
+                : hiddenStates
             if let lmHead {
                 out = lmHead(out)
             } else {
@@ -1086,7 +1639,10 @@ public enum Qwen35Language {
                     cache: cache, fullAttentionIndex: model.faIdx)
                 state[mtpSharedKVOffsetsKey] = qwen35VLMSharedKVOffsets(
                     cache: cache, fullAttentionIndex: model.faIdx)
-                state[mtpSharedKVSourceIndicesKey] = ["full_attention": model.faIdx]
+                state[mtpSharedKVSourceIndicesKey] =
+                    model.faIdx.map {
+                        ["full_attention": $0]
+                    } ?? [:]
                 state[mtpPositionDeltasKey] = state[ropeDeltasKey]
             }
 
@@ -1114,9 +1670,9 @@ public enum Qwen35Language {
 
 private func qwen35VLMSharedKVState(
     cache: [KVCache?]?,
-    fullAttentionIndex: Int
+    fullAttentionIndex: Int?
 ) -> [String: (MLXArray, MLXArray)] {
-    guard let cache,
+    guard let cache, let fullAttentionIndex,
         fullAttentionIndex < cache.count,
         let faCache = cache[fullAttentionIndex]
     else {
@@ -1131,9 +1687,9 @@ private func qwen35VLMSharedKVState(
 
 private func qwen35VLMSharedKVOffsets(
     cache: [KVCache?]?,
-    fullAttentionIndex: Int
+    fullAttentionIndex: Int?
 ) -> [String: Int]? {
-    guard let cache,
+    guard let cache, let fullAttentionIndex,
         fullAttentionIndex < cache.count,
         let faCache = cache[fullAttentionIndex]
     else {
@@ -1144,16 +1700,28 @@ private func qwen35VLMSharedKVOffsets(
 
 // MARK: - Model
 
+/// The vision tower at the path it has in ``Qwen35`` when it loads separately.
+private final class Qwen35Vision: Module {
+    @ModuleInfo(key: "vision_tower") var model: Qwen3VLVision.VisionModel
+
+    init(_ config: Qwen35Configuration) {
+        _model.wrappedValue = Qwen3VLVision.VisionModel(config.visionConfiguration)
+        super.init()
+    }
+}
+
 public class Qwen35: Module, VLMModel {
-    @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
+    @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel?
     @ModuleInfo(key: "language_model") var languageModel: Qwen35Language.LanguageModel
 
     public let config: Qwen35Configuration
+    private let onDemandVision: OnDemandComponent<Qwen35Vision>
 
     public init(_ config: Qwen35Configuration) {
         self.config = config
         _visionModel.wrappedValue = Qwen3VLVision.VisionModel(config.visionConfiguration)
         _languageModel.wrappedValue = Qwen35Language.LanguageModel(config)
+        onDemandVision = OnDemandComponent(.vision) { Qwen35Vision(config) }
         super.init()
     }
 
@@ -1170,6 +1738,11 @@ public class Qwen35: Module, VLMModel {
 
     public func prepare() throws {
         try languageModel.prepare()
+    }
+
+    private func vision() throws -> Qwen3VLVision.VisionModel {
+        if let visionModel { return visionModel }
+        return try onDemandVision.load().model
     }
 
     private func mergeInputIdsWithImageFeatures(
@@ -1243,30 +1816,29 @@ public class Qwen35: Module, VLMModel {
         var imageFrames: [THW]?
         var videoFrames: [THW]?
 
-        let visionDType = visionModel.patchEmbed.proj.weight.dtype
         var pixelParts: [MLXArray] = []
 
         if let image = input.image {
-            pixelParts.append(image.pixels.asType(visionDType))
+            pixelParts.append(image.pixels)
             imageFrames = image.frames
         }
         if let video = input.video {
-            pixelParts.append(video.pixels.asType(visionDType))
+            pixelParts.append(video.pixels)
             videoFrames = video.frames
-        }
-        if !pixelParts.isEmpty {
-            pixelValues = concatenated(pixelParts)
         }
 
         var inputEmbeddings: MLXArray?
 
-        if let pixelValues,
+        if !pixelParts.isEmpty,
             let frames = combinedFrames(imageFrames: imageFrames, videoFrames: videoFrames)
                 .nilIfEmpty
         {
+            let vision = try vision()
+            let typedPixels = concatenated(pixelParts).asType(vision.patchEmbed.proj.weight.dtype)
+            pixelValues = typedPixels
             let inputIds = input.text.tokens
             let textEmbeds = languageModel.model.embedTokens(inputIds)
-            let (visionHidden, _) = visionModel(pixelValues, gridTHW: frames)
+            let (visionHidden, _) = vision(typedPixels, gridTHW: frames)
             let visionFeatures = visionHidden.asType(textEmbeds.dtype)
 
             let (mergedEmbeds, _) = try mergeInputIdsWithImageFeatures(
@@ -1290,7 +1862,7 @@ public class Qwen35: Module, VLMModel {
     ) throws -> PrepareResult {
         let inputIds = input.text.tokens
         let inputIds2D = inputIds.ndim == 1 ? inputIds[.newAxis, 0...] : inputIds
-        let cacheOffset = faCacheOffset(cache)
+        let cacheOffset = anchorCacheOffset(cache)
         // Resolved before the routing decision so a warm cache fails closed on either path.
         let positionOffset = try QwenVL.continuationAnchor(
             model: "Qwen35", key: ropeDeltasKey, cacheOffset: cacheOffset,
@@ -1311,7 +1883,7 @@ public class Qwen35: Module, VLMModel {
         {
             return try prepareContinuation(
                 input, inputIds: inputIds2D, cache: cache, cacheOffset: cacheOffset,
-                positionOffset: positionOffset, prefill: prefill)
+                positionOffset: positionOffset, state: state, prefill: prefill)
         }
 
         let (pixelValues, imageFrames, videoFrames, inputEmbeddings) =
@@ -1328,7 +1900,8 @@ public class Qwen35: Module, VLMModel {
                 positionIds: nil,
                 pixelValues: pixelValues,
                 imageGridTHW: imageFrames,
-                videoGridTHW: videoFrames
+                videoGridTHW: videoFrames,
+                lastTokenOnly: true
             )
         }
 
@@ -1337,11 +1910,14 @@ public class Qwen35: Module, VLMModel {
         return .logits(output)
     }
 
-    /// Offset of the first full-attention layer's cache — the model's notion
-    /// of "how many tokens are already cached".
-    private func faCacheOffset(_ cache: [any KVCache]) -> Int {
-        let faIdx = languageModel.model.faIdx
-        return cache.indices.contains(faIdx) ? cache[faIdx].offset : 0
+    /// Cached token count from a full-attention layer, or a linear layer when no full attention exists.
+    private func anchorCacheOffset(_ cache: [any KVCache]) -> Int {
+        guard let index = languageModel.model.faIdx ?? languageModel.model.ssmIdx,
+            cache.indices.contains(index)
+        else {
+            return 0
+        }
+        return cache[index].offset
     }
 
     /// Warm, windowed continuation through an image-bearing remainder — the
@@ -1361,13 +1937,17 @@ public class Qwen35: Module, VLMModel {
     /// image-free prefix). The returned state carries the rope delta the
     /// post-image text tail resumes with (`getRopeIndex` delta − `P`), so a
     /// caller threading state end-to-end continues that tail with the ordinary
-    /// flat-continuation branch. Decode stays caller-owned.
+    /// flat-continuation branch. When the caller requests MTP state, each
+    /// chunk's target hidden rows are retained and joined while the final
+    /// chunk supplies the cache metadata, so a warm drafter can resume over
+    /// the complete remainder. Decode stays caller-owned.
     private func prepareContinuation(
         _ input: LMInput,
         inputIds: MLXArray,
         cache: [any KVCache],
         cacheOffset: Int,
         positionOffset: Int,
+        state: LMOutput.State?,
         prefill: PrefillParameters
     ) throws -> PrepareResult {
         let remainderLength = inputIds.dim(-1)
@@ -1402,14 +1982,16 @@ public class Qwen35: Module, VLMModel {
         // un-evaluated graph while letting the GPU run window i as the CPU
         // builds window i+1 (same shape as the sibling chunked prefills).
         let typedCache = castCache(cache)
+        let emitDrafterState = state?[mtpEmitFlagKey] ?? false
+        var emittedHiddenStates: [MLXArray] = []
 
         /// One forward over `range`, slicing positions and embeddings in lockstep.
         func forward(_ range: Range<Int>) -> LMOutput {
-            languageModel(
+            let output = languageModel(
                 inputIds[0..., range],
                 inputsEmbeds: inputEmbeddings.map { $0[0..., range, 0...] },
                 cache: typedCache,
-                state: nil,
+                state: state,
                 mask: nil,
                 positionIds: positionIds[0..., 0..., range],
                 // Never the pixels: a non-nil value here clears the carried
@@ -1418,6 +2000,10 @@ public class Qwen35: Module, VLMModel {
                 imageGridTHW: nil,
                 videoGridTHW: nil
             )
+            if emitDrafterState, let hidden = output.state?[mtpLastHiddenStatesKey] {
+                emittedHiddenStates.append(hidden)
+            }
+            return output
         }
 
         let processed = try prefill.forEachChunk(total: remainderLength) { range in
@@ -1430,7 +2016,7 @@ public class Qwen35: Module, VLMModel {
             eval(typedCache)
         }
 
-        let lastLogits = forward(processed ..< remainderLength).logits
+        let lastOutput = forward(processed ..< remainderLength)
         prefill.progress?(remainderLength, remainderLength)
 
         // Seed the post-image text tail's anchor. The vendor's flat-continuation
@@ -1438,18 +2024,26 @@ public class Qwen35: Module, VLMModel {
         // after this remainder `tailCacheOffset = P + remainderLength`, so the
         // delta the tail needs is the offset-frame `getRopeIndex` delta minus
         // `P` (which `getRopeIndex` implicitly counted into `remainderLength`).
-        return .logits(
-            LMOutput(
-                logits: lastLogits,
-                state: QwenVL.continuationResumeState(
-                    ropeDeltas: ropeDeltas, cacheOffset: cacheOffset, key: ropeDeltasKey)))
+        let resumeDelta = ropeDeltas - MLXArray(Int32(cacheOffset))
+        var resumeState = lastOutput.state ?? state ?? LMOutput.State()
+        resumeState[precomputedPositionIdsKey] = nil
+        resumeState[ropeDeltasKey] = resumeDelta
+        if emitDrafterState, !emittedHiddenStates.isEmpty {
+            resumeState[mtpLastHiddenStatesKey] =
+                emittedHiddenStates.count == 1
+                ? emittedHiddenStates[0]
+                : concatenated(emittedHiddenStates, axis: 1)
+            resumeState[mtpPositionDeltasKey] = resumeDelta
+        }
+
+        return .logits(LMOutput(logits: lastOutput.logits, state: resumeState))
     }
 
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
         precondition(
-            faCacheOffset(cache ?? []) == 0 || state?[ropeDeltasKey] != nil,
+            anchorCacheOffset(cache ?? []) == 0 || state?[ropeDeltasKey] != nil,
             "Qwen35 cannot continue a warm prompt cache without \(ropeDeltasKey.id)")
         let typedCache = castCacheOptional(cache)
         let result = languageModel(
@@ -1466,16 +2060,30 @@ public class Qwen35: Module, VLMModel {
         return result
     }
 
-    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
+    public var excludedCheckpointNamespaces: [String] {
+        Qwen35CheckpointPolicy.excludedTargetNamespaces
+    }
+
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        var checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
+            checkpoint, layout: .vision,
+            tiedWordEmbeddings: config.textConfiguration.tieWordEmbeddings)
+        checkpoint.weights = try sanitize(
+            weights: checkpoint.weights, metadata: checkpoint.metadata)
+        return checkpoint
+    }
+
+    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws -> [String:
         MLXArray]
     {
         if metadata["format"]?.lowercased() == "mlx" {
-            return weights
+            // Converted checkpoints can keep the MTP head; the drafter loads it, not this model.
+            return Qwen35CheckpointPolicy.targetWeights(weights)
         }
-        return sanitize(weights: weights)
+        return try sanitize(weights: weights)
     }
 
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
         // Whether the checkpoint stores RMSNorm weights in the raw (un-shifted)
         // convention that needs the `+1` offset. Mirrors the MLXLLM Qwen35 gate
         // so the VLM and text paths agree: a pre-converted MLX checkpoint
@@ -1492,11 +2100,10 @@ public class Qwen35: Module, VLMModel {
         // layout is the reliable signal on its own.
         let shouldShiftNormWeights = hasUnsanitizedConv1d
 
-        var weights = weights.filter { !$0.key.contains("mtp.") }
-
-        weights = filterLMHeadWeights(
-            from: weights,
+        let checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
+            .init(weights: weights), layout: .vision,
             tiedWordEmbeddings: config.textConfiguration.tieWordEmbeddings)
+        let weights = checkpoint.weights
 
         var sanitized: [String: MLXArray] = [:]
         sanitized.reserveCapacity(weights.count)
@@ -1510,24 +2117,7 @@ public class Qwen35: Module, VLMModel {
         ]
 
         for (key, originalValue) in weights {
-            var key = key
             var value = originalValue
-
-            if key.contains("model") {
-                if key.contains("model.language_model") {
-                    key = key.replacingOccurrences(
-                        of: "model.language_model", with: "language_model.model")
-                } else if key.contains("model.visual") {
-                    key = key.replacingOccurrences(of: "model.visual", with: "vision_tower")
-                } else if key.hasPrefix("model.") {
-                    // Unified Qwen 3.5 checkpoints (e.g. Qwen3.5-0.8B-MLX-4bit) ship
-                    // language model tensors at bare `model.*` paths instead of
-                    // `model.language_model.*`. Mirror the LLM-side fallback.
-                    key = "language_model." + key
-                }
-            } else if key.contains("lm_head") {
-                key = key.replacingOccurrences(of: "lm_head", with: "language_model.lm_head")
-            }
 
             if key.contains("conv1d.weight") && value.dim(-1) != 1 {
                 value = value.movedAxis(source: 2, destination: 1)
@@ -1541,8 +2131,17 @@ public class Qwen35: Module, VLMModel {
             sanitized[key] = value
         }
 
-        return visionModel.sanitize(weights: sanitized)
+        return Qwen3VLVision.VisionModel.sanitize(
+            weights: sanitized, config: config.visionConfiguration)
     }
+}
+
+extension Qwen35: ModelComponentsProviding {
+    public var modelComponents: [ModelComponent: [CheckpointComponent]] {
+        Qwen35CheckpointPolicy.components
+    }
+
+    public var onDemandComponents: [AnyOnDemandComponent] { [onDemandVision] }
 }
 
 extension Qwen35: SpeculativeCacheRewindModel {
@@ -1570,5 +2169,5 @@ extension Qwen35 {
 // `Qwen35MoE` subclasses `Qwen35` and inherits both declarations.
 extension Qwen35 {
     public var toolCallFormat: ToolCallFormat? { .qwen35 }
-    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
+    public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.qwen35 }
 }

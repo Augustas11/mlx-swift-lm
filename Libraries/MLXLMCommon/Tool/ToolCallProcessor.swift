@@ -39,6 +39,7 @@ public class ToolCallProcessor {
     private let tools: [[String: any Sendable]]?
     private let allowedToolNames: Set<String>?
     private let supportsBareJSONFallback: Bool
+    private let namedJSONScanner: NamedJSONCallScanner?
     private var recoveryScanner: TextToolCallRecoveryScanner?
     private let maxJSONFallbackBufferLength = 32_768
     private let maximumToolCallBufferByteCount = 65_536
@@ -114,6 +115,9 @@ public class ToolCallProcessor {
                 })
         }
         self.supportsBareJSONFallback = parser.supportsBareJSON
+        self.namedJSONScanner =
+            parser.supportsMarkerlessNamedJSON
+            ? allowedToolNames.flatMap(NamedJSONCallScanner.init(toolNames:)) : nil
         self.recoveryScanner = TextToolCallRecoveryScanner(
             primaryFormat: format,
             policy: toolCallPolicy.recovery,
@@ -122,6 +126,12 @@ public class ToolCallProcessor {
     }
 
     // MARK: - Computed Properties
+
+    var canEndForSteering: Bool {
+        state == .normal && toolCallBuffer.isEmpty && orderedOutputQueue.isEmpty
+            && toolCalls.isEmpty && rejectedToolCallCount == 0
+            && (recoveryScanner?.canEndForSteering ?? true)
+    }
 
     /// Whether this processor uses inline format (no start tag).
     private var isInlineFormat: Bool {
@@ -165,10 +175,31 @@ public class ToolCallProcessor {
 
     /// Sends text not claimed by recovery through the selected native parser.
     private func processNativeChunk(_ chunk: String) -> String? {
+        if state == .normal, let match = namedJSONCall(opening: chunk) {
+            appendToolCall(match.call, rawText: String(chunk[..<match.end]))
+            // The lexer already classified this text; do not lex it again.
+            return match.end == chunk.endIndex
+                ? nil : processNativeChunk(String(chunk[match.end...]))
+        }
         if isInlineFormat {
             return processInlineChunk(chunk)
         }
         return processTaggedChunk(chunk)
+    }
+
+    /// A markerless `name\n{json}` call at the start of `chunk`, with the
+    /// index where it ends.
+    ///
+    /// The recovery lexer holds such a candidate until its arguments object
+    /// closes and then delivers it whole, so no buffering happens here. The
+    /// scanner exists only with declared tools, which also means the lexer
+    /// exists, so every chunk seen here has already been lexed.
+    private func namedJSONCall(opening chunk: String) -> (call: ToolCall, end: String.Index)? {
+        guard let namedJSONScanner,
+            case .complete(_, let arguments) = namedJSONScanner.scan(chunk[...]),
+            let call = parser.parse(content: String(chunk[..<arguments.endIndex]), tools: tools)
+        else { return nil }
+        return (call, arguments.endIndex)
     }
 
     /// Processes a generated chunk and removes its output in source order.
@@ -696,6 +727,7 @@ public class ToolCallProcessor {
         toolCallBuffer += chunk
         var leadingToken: String?
         var leadingTokenWasRecorded = false
+        var enteredCollectingThisChunk = false
 
         switch state {
         case .normal:
@@ -734,6 +766,7 @@ public class ToolCallProcessor {
             leadingTokenWasRecorded = true
             guard toolCallBuffer.hasPrefix(startTag) else { return leadingToken }
             state = .collectingToolCall
+            enteredCollectingThisChunk = true
             fallthrough
 
         case .collectingToolCall:
@@ -746,6 +779,20 @@ public class ToolCallProcessor {
             guard let endTag = parser.endTag else {
                 return leadingToken
             }
+
+            // Only the text this chunk appended can complete the end tag: an
+            // earlier occurrence was already in the buffer when the previous
+            // chunk was scanned. Scanning the whole buffered call on every
+            // chunk is quadratic in the call's length — seconds for a call of
+            // ten thousand tokens. The chunk that completes the start tag
+            // scans the whole buffer, which then holds at most the start tag
+            // and that chunk.
+            guard
+                enteredCollectingThisChunk
+                    || ToolCallFrameScanner.marker(
+                        endTag, mayHaveArrivedIn: toolCallBuffer,
+                        appendedByteCount: chunk.utf8.count)
+            else { return leadingToken }
 
             // `<tool_call>` frames close only after a structurally complete
             // payload, so a literal close marker inside a JSON string argument

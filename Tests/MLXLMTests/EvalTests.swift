@@ -6,6 +6,7 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 import MLXOptimizers
+import MLXScriptedLM
 import XCTest
 
 public class EvalTests: XCTestCase {
@@ -168,6 +169,152 @@ public class EvalTests: XCTestCase {
         XCTAssertEqual(output.shape, [1, 5, 100])
     }
 
+    func testTokenIteratorReportsChosenAndTopLogProbabilities() throws {
+        let model = makeQualityGateLlamaModel()
+        var iterator = try TokenIterator(
+            input: LMInput(text: .init(tokens: MLXArray([1, 2, 3]))),
+            model: model,
+            parameters: .init(maxTokens: 2, temperature: 0, logProbabilities: 3))
+
+        let token = try XCTUnwrap(iterator.next())
+        let deferred = try XCTUnwrap(iterator.lastLogProbabilities)
+        let probabilities = deferred.materialize()
+
+        XCTAssertEqual(probabilities.chosen.token, token)
+        XCTAssertEqual(probabilities.topLogProbabilities.count, 3)
+        XCTAssertEqual(probabilities.topLogProbabilities.first?.token, token)
+        XCTAssertLessThanOrEqual(probabilities.chosen.logProbability, 0)
+        for (first, second) in zip(
+            probabilities.topLogProbabilities,
+            probabilities.topLogProbabilities.dropFirst()
+        ) {
+            XCTAssertGreaterThanOrEqual(first.logProbability, second.logProbability)
+        }
+
+        // Deferred values keep describing their token after the iterator moves on.
+        XCTAssertNotNil(iterator.next())
+        XCTAssertEqual(deferred.materialize(), probabilities)
+    }
+
+    func testLogProbabilitiesMatchProcessedLogitsBeforeSamplingFilters() throws {
+        let model = makeQualityGateLlamaModel()
+        let parameters = GenerateParameters(
+            maxTokens: 3, temperature: 0.6, topK: 1, logProbabilities: 100,
+            repetitionPenalty: 1.3, presencePenalty: 1.2, seed: 42)
+        let prompt = MLXArray([1, 2, 3])
+        var iterator = try TokenIterator(
+            input: LMInput(tokens: prompt), model: model, parameters: parameters)
+        let cache = try model.newCache(parameters: parameters)
+        var processor = parameters.processor()
+        processor?.prompt(prompt)
+        var previous = prompt
+
+        for _ in 0 ..< 3 {
+            let logits = model(previous[.newAxis, .ellipsis], cache: cache)[0..., -1, 0...]
+            let expected = logSoftmax(processor?.process(logits: logits) ?? logits).asArray(
+                Float.self)
+            let token = try XCTUnwrap(iterator.next())
+            let values = try XCTUnwrap(iterator.lastLogProbabilities).materialize()
+
+            XCTAssertEqual(values.chosen.token, token)
+            XCTAssertEqual(values.chosen.logProbability, expected[token], accuracy: 2e-5)
+            XCTAssertEqual(Set(values.topLogProbabilities.map(\.token)), Set(0 ..< 100))
+            for candidate in values.topLogProbabilities {
+                XCTAssertEqual(candidate.logProbability, expected[candidate.token], accuracy: 2e-5)
+            }
+            XCTAssertEqual(
+                values.topLogProbabilities.reduce(0) { $0 + exp(Double($1.logProbability)) },
+                1, accuracy: 2e-5)
+
+            previous = MLXArray([token])
+            processor?.didSample(token: previous)
+        }
+    }
+
+    func testSpeculativeLogProbabilitiesMatchTheMainModelDecodingAlone() throws {
+        // Two decodes of the same model are compared value for value and by top-k order, which
+        // TF32 matmuls (neural accelerators) perturb by up to ~3e-3 and reorder near-ties. CPU
+        // pins IEEE FP32; see MatmulPrecision.
+        try Device.withDefaultDevice(.cpu) {
+            try speculativeLogProbabilitiesMatchTheMainModelDecodingAlone()
+        }
+    }
+
+    private func speculativeLogProbabilitiesMatchTheMainModelDecodingAlone() throws {
+        let main = makeQualityGateLlamaModel()
+        let stranger = makeQualityGateLlamaModel(seed: 19)
+        let prompt = LMInput(tokens: MLXArray([1, 2, 3]))
+
+        let pairs: [(draft: LlamaModel, repetitionPenalty: Float?)] = [
+            (main, nil), (stranger, nil), (stranger, 1.3),
+        ]
+        for (draft, repetitionPenalty) in pairs {
+            let parameters = GenerateParameters(
+                maxTokens: 12, temperature: 0, logProbabilities: 5,
+                repetitionPenalty: repetitionPenalty)
+            var plain = try TokenIterator(input: prompt, model: main, parameters: parameters)
+            var speculative = try SpeculativeTokenIterator(
+                input: prompt, mainModel: main, draftModel: draft,
+                parameters: parameters, numDraftTokens: 3)
+
+            while let token = plain.next() {
+                let expected = try XCTUnwrap(plain.lastLogProbabilities).materialize()
+                XCTAssertEqual(speculative.next(), token)
+                let actual = try XCTUnwrap(speculative.lastLogProbabilities).materialize()
+
+                XCTAssertEqual(actual.chosen.token, token)
+                XCTAssertEqual(
+                    actual.chosen.logProbability, expected.chosen.logProbability, accuracy: 1e-4)
+                XCTAssertEqual(
+                    actual.topLogProbabilities.map(\.token),
+                    expected.topLogProbabilities.map(\.token))
+                for (a, e) in zip(actual.topLogProbabilities, expected.topLogProbabilities) {
+                    XCTAssertEqual(a.logProbability, e.logProbability, accuracy: 1e-4)
+                }
+            }
+            XCTAssertNil(speculative.next())
+
+            let telemetry = try XCTUnwrap(speculative.speculativeDecodingTelemetry)
+            if draft === main {
+                XCTAssertEqual(telemetry.acceptedDraftTokenCount, telemetry.draftTokenCount)
+            } else {
+                XCTAssertGreaterThan(telemetry.acceptedDraftTokenCount, 0)
+                XCTAssertLessThan(telemetry.acceptedDraftTokenCount, telemetry.draftTokenCount)
+            }
+        }
+    }
+
+    func testLogProbabilityReportingPreservesSeededSampling() throws {
+        let model = makeQualityGateLlamaModel()
+        let input = LMInput(text: .init(tokens: MLXArray([1, 2, 3])))
+
+        func generate(_ parameters: GenerateParameters, logProbabilities: Int?) throws -> [Int] {
+            var parameters = parameters
+            parameters.logProbabilities = logProbabilities
+            var iterator = try TokenIterator(
+                input: input,
+                model: model,
+                parameters: parameters)
+            var tokens: [Int] = []
+            while let token = iterator.next() {
+                tokens.append(token)
+                if logProbabilities == nil { XCTAssertNil(iterator.lastLogProbabilities) }
+            }
+            return tokens
+        }
+
+        for parameters in [
+            GenerateParameters(maxTokens: 16, temperature: 0, seed: 42),
+            GenerateParameters(maxTokens: 16, temperature: 0.6, seed: 42),
+            GenerateParameters(
+                maxTokens: 16, temperature: 0.6, topP: 0.8, topK: 5, minP: 0.02, seed: 42),
+        ] {
+            XCTAssertEqual(
+                try generate(parameters, logProbabilities: nil),
+                try generate(parameters, logProbabilities: 5))
+        }
+    }
+
     func testLlamaVarianceNormalizedKVCacheGenerationPath() throws {
         let config = LlamaConfiguration(
             hiddenSize: 64, hiddenLayers: 2, intermediateSize: 128, attentionHeads: 2,
@@ -305,22 +452,26 @@ public class EvalTests: XCTestCase {
         let rawKVBytes = keys.nbytes + values.nbytes
         let compactBytes = cache.state.reduce(0) { $0 + $1.nbytes }
 
-        let decodeQuery = MLXRandom.normal([1, 32, 1, 128]).asType(.float16)
-        let decodeKey = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
-        let decodeValue = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
-        let decodeStart = Date.timeIntervalSinceReferenceDate
-        let decodeOutput = cache.updateAndAttend(
-            queries: decodeQuery,
-            keys: decodeKey,
-            values: decodeValue,
-            scale: 1 / sqrt(Float(128)))
-        eval(decodeOutput)
-        let decodeElapsed = Date.timeIntervalSinceReferenceDate - decodeStart
+        func decodeStep() -> TimeInterval {
+            let query = MLXRandom.normal([1, 32, 1, 128]).asType(.float16)
+            let key = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
+            let value = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
+            eval(query, key, value)
+            let start = Date.timeIntervalSinceReferenceDate
+            let output = cache.updateAndAttend(
+                queries: query, keys: key, values: value, scale: 1 / sqrt(Float(128)))
+            eval(output)
+            return Date.timeIntervalSinceReferenceDate - start
+        }
+        // A step that first uses a kernel variant also builds its Metal pipeline, about 0.2 s
+        // on a cold shader cache. Assert on the fastest step, which times only the decode.
+        let decodeTimes = (0 ..< 8).map { _ in decodeStep() }
+        let decodeElapsed = decodeTimes.min()!
 
         print(
             "KVarN 32K ingest/decode smoke: elapsed=\(elapsed)s, raw=\(rawKVBytes) bytes, "
                 + "compact=\(compactBytes) bytes, peak workspace=\(peakWorkspaceBytes) bytes, "
-                + "one-layer decode=\(decodeElapsed)s")
+                + "one-layer decode=\(decodeTimes)s")
 
         XCTAssertEqual(output.shape, [1, 32, 1, 128])
         XCTAssertLessThan(compactBytes, rawKVBytes)
@@ -342,10 +493,10 @@ public class EvalTests: XCTestCase {
 
         let optimizer = Adam(learningRate: 1e-5)
 
-        let train = ["a", "b", "c"]
-        let valid = ["x", "y", "z"]
+        let train = ["the quick brown fox", "jumps over the", "lazy sleeping dog"]
+        let valid = ["a cat sat", "on the mat", "in the sun"]
 
-        let tokenizer = TestTokenizer()
+        let tokenizer = PseudoWordTokenizer()
         let parameters = LoRATrain.Parameters(iterations: 5)
 
         try LoRATrain.train(

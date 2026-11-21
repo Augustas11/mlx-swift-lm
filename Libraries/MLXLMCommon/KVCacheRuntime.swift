@@ -207,6 +207,7 @@ extension KVCacheLeaf {
     ) -> KVCacheLayerStatus {
         let requested = configuration.strategy.identifier
         let layerKind = CacheLayerKind(cache: cache)
+        let memoryBytes = cache.innerState().reduce(0) { $0 + $1.nbytes }
         let capacitySource: KVCacheLayerStatus.CapacitySource? =
             switch self.kind {
             case .recurrent:
@@ -228,7 +229,8 @@ extension KVCacheLeaf {
                 capacitySource: capacitySource,
                 state: state,
                 resolvedStrategy: resolvedStrategy,
-                reason: reason)
+                reason: reason,
+                memoryBytes: memoryBytes)
         }
 
         switch self.kind {

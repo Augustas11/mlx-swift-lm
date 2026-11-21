@@ -77,12 +77,19 @@ public struct ResolvedModelConfiguration: Sendable {
     public var toolCallFormat: ToolCallFormat?
     public var reasoningConfig: ReasoningConfig?
     public var messageGenerator: (any MessageGenerator)?
+    public var generationConfig: GenerationConfigFile?
 
     /// How to choose the safetensors files holding the model's weights.
     ///
     /// ## See Also
     /// - ``ModelConfiguration/weightFileSelection``
     public var weightFileSelection: WeightFileSelection
+
+    /// Components to load the model without.
+    ///
+    /// ## See Also
+    /// - ``ModelConfiguration/excludedComponents``
+    public var excludedComponents: Set<ModelComponent>
 
     public init(
         modelDirectory: URL,
@@ -95,7 +102,9 @@ public struct ResolvedModelConfiguration: Sendable {
         toolCallFormat: ToolCallFormat?,
         reasoningConfig: ReasoningConfig? = nil,
         messageGenerator: (any MessageGenerator)? = nil,
-        weightFileSelection: WeightFileSelection = .automatic
+        generationConfig: GenerationConfigFile? = nil,
+        weightFileSelection: WeightFileSelection = .automatic,
+        excludedComponents: Set<ModelComponent> = []
     ) {
         self.modelDirectory = modelDirectory
         self.tokenizerDirectory = tokenizerDirectory
@@ -107,7 +116,9 @@ public struct ResolvedModelConfiguration: Sendable {
         self.toolCallFormat = toolCallFormat
         self.reasoningConfig = reasoningConfig
         self.messageGenerator = messageGenerator
+        self.generationConfig = generationConfig
         self.weightFileSelection = weightFileSelection
+        self.excludedComponents = excludedComponents
     }
 }
 
@@ -125,6 +136,7 @@ extension ResolvedModelConfiguration {
             eosTokenIds: [],
             toolCallFormat: nil,
             reasoningConfig: nil,
-            messageGenerator: nil)
+            messageGenerator: nil,
+            generationConfig: nil)
     }
 }

@@ -282,6 +282,29 @@ final class LFM3Tests: XCTestCase {
         }
     }
 
+    /// The quantized fast path projects only the trailing rows, and the last row must stay
+    /// bitwise equal to the full forward pass, tied or untied.
+    func testNextTokenLogitsMatchFullForward() throws {
+        for (tied, bits) in [(true, 4), (true, 8), (false, 6)] {
+            let model = try tinyModel(
+                tinyConfiguration(tieWordEmbeddings: tied, intermediateSize: 64))
+            quantize(model: model, groupSize: 32, bits: bits)
+            for length in [1, 97, 200] {
+                let text = LMInput.Text(
+                    tokens: MLXArray((0 ..< length).map { Int32(($0 * 7 + 3) % 64) })
+                        .reshaped(1, length))
+                let expected = model(text.tokens, cache: nil)[0..., -1, 0...]
+                let actual = model.nextTokenLogits(text, cache: nil, state: nil).logits
+                if length > 96 {
+                    XCTAssertLessThan(actual.dim(1), length)
+                }
+                XCTAssertTrue(
+                    arrayEqual(actual[0..., -1, 0...], expected).item(Bool.self),
+                    "tied \(tied), bits \(bits), length \(length)")
+            }
+        }
+    }
+
     func testCacheTypesPerLayer() throws {
         let model = try tinyModel()
 
@@ -351,7 +374,7 @@ final class LFM3Tests: XCTestCase {
         }
 
         for weights in [mlx, transformers] {
-            let sanitized = model.sanitize(weights: weights)
+            let sanitized = try model.sanitize(weights: weights)
             XCTAssertEqual(Set(sanitized.keys), Set(parameters.keys))
             for (key, value) in sanitized {
                 XCTAssertEqual(value.shape, parameters[key]!.shape, key)
@@ -619,6 +642,40 @@ final class LFM3Tests: XCTestCase {
         XCTAssertNoThrow(try model.validate(tokenizer: ProbeTokenizer(hasProbeVocabulary: false)))
     }
 
+    func testNextTokenProjectionPreservesLastLogitsAndCache() throws {
+        for tied in [true, false] {
+            for bits: Int? in [nil, 4, 6, 8] {
+                let model = try tinyModel(
+                    tinyConfiguration(tieWordEmbeddings: tied, intermediateSize: 64))
+                if let bits { quantize(model: model, groupSize: 32, bits: bits) }
+                for length in [1, 33, 97, 129, 257, 511, 512, 513] {
+                    let tokens = MLXArray((0 ..< length).map { Int32(($0 * 7 + 3) % 64) }).reshaped(
+                        1, length)
+                    let expectedCache = try model.newCache(parameters: nil)
+                    let actualCache = try model.newCache(parameters: nil)
+                    let expected = model(tokens, cache: expectedCache)
+                    let output = model.nextTokenLogits(
+                        .init(tokens: tokens), cache: actualCache, state: nil)
+                    XCTAssertEqual(expected.shape, [1, length, 64])
+                    if bits == nil { XCTAssertEqual(output.logits.shape, expected.shape) }
+                    if bits != nil && length >= 97 {
+                        XCTAssertLessThanOrEqual(output.logits.dim(1), 96)
+                    }
+                    XCTAssertEqual(
+                        abs(output.logits[0..., -1, 0...] - expected[0..., -1, 0...]).max().item(
+                            Float.self), 0)
+                    for (a, b) in zip(actualCache, expectedCache) {
+                        XCTAssertEqual(a.offset, b.offset)
+                        XCTAssertEqual(a.state.count, b.state.count)
+                        for (x, y) in zip(a.state, b.state) {
+                            XCTAssertEqual(abs(x - y).max().item(Float.self), 0)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     func testRotaryFactorsAndLongOffsets() throws {
         let headDim = 16
         let x = MLXArray((0 ..< 3 * headDim).map { Float($0 % 17 - 8) / 8 })
@@ -765,6 +822,16 @@ final class LFM3Tests: XCTestCase {
                     }, axis: 0)
                 assertClose(conv(next, cache: cache), expected, atol: 1e-5, reducedAtol: 1e-4)
             }
+        }
+    }
+
+    func testMalformedConvolutionWeightsThrow() throws {
+        let model = try tinyModel()
+        for shape in [[], [32], [32, 3]] {
+            XCTAssertThrowsError(
+                try model.sanitize(weights: [
+                    "model.layers.0.conv.conv.weight": MLXArray.zeros(shape)
+                ]))
         }
     }
 

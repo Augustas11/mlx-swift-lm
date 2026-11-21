@@ -424,16 +424,7 @@ private enum Language {
         @ModuleInfo(key: "w3") var w3: Linear
 
         init(_ config: LFM2VLConfiguration.TextConfiguration) {
-            var adjustedFFDim = config.blockFFDim
-
-            if config.blockAutoAdjustFFDim {
-                adjustedFFDim = Int(Float(2 * adjustedFFDim) / 3.0)
-                adjustedFFDim = Int(config.blockFFNDimMultiplier * Float(adjustedFFDim))
-                adjustedFFDim =
-                    config.blockMultipleOf
-                    * ((adjustedFFDim + config.blockMultipleOf - 1) / config.blockMultipleOf)
-            }
-
+            let adjustedFFDim = config.feedForwardDimensions
             self._w1.wrappedValue = Linear(config.blockDim, adjustedFFDim, bias: false)
             self._w2.wrappedValue = Linear(adjustedFFDim, config.blockDim, bias: false)
             self._w3.wrappedValue = Linear(config.blockDim, adjustedFFDim, bias: false)
@@ -539,13 +530,19 @@ private enum Language {
         let modelType: String
         let model: LFM2ModelInner
 
+        @ModuleInfo(key: "lm_head") var lmHead: Linear?
+
         var kvHeads: [Int]
 
-        init(_ config: LFM2VLConfiguration.TextConfiguration) {
+        init(_ config: LFM2VLConfiguration.TextConfiguration, tieWordEmbeddings: Bool) {
             self.config = config
             self.modelType = config.modelType
 
             self.model = LFM2ModelInner(config)
+            if !tieWordEmbeddings {
+                self._lmHead.wrappedValue = Linear(
+                    config.hiddenSize, config.vocabularySize, bias: false)
+            }
 
             self.kvHeads = (0 ..< config.hiddenLayers).map { layerIdx in
                 config.fullAttnIdxs.contains(layerIdx) ? config.kvHeads : 0
@@ -558,28 +555,16 @@ private enum Language {
             cache: [KVCache]? = nil,
             inputsEmbeds: MLXArray? = nil
         ) -> LMOutput {
-            var out = model(
+            let out = model(
                 inputs ?? MLXArray([0]), cache: cache, inputEmbeddings: inputsEmbeds)
-            out = model.embedTokens.asLinear(out)
-            return LMOutput(logits: out)
+            return LMOutput(logits: vocabularyLogits(out))
         }
 
-        func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-            var sanitizedWeights = [String: MLXArray]()
-
-            for (name, param) in weights {
-                var sanitizedParam = param
-
-                if name.contains("conv.weight") {
-                    if param.shape[param.shape.count - 1] > param.dim(1) {
-                        sanitizedParam = param.transposed(0, 2, 1)
-                    }
-                }
-
-                sanitizedWeights[name] = sanitizedParam
+        func vocabularyLogits(_ hidden: MLXArray) -> MLXArray {
+            if let lmHead {
+                return lmHead(hidden)
             }
-
-            return sanitizedWeights
+            return model.embedTokens.asLinear(hidden)
         }
     }
 }
@@ -666,9 +651,14 @@ public struct LFM2VLProcessor: UserInputProcessor {
     private let config: LFM2VLProcessorConfiguration
     private let tokenizer: any Tokenizer
 
+    /// The image placeholder id in this checkpoint's vocabulary, or `nil` when the
+    /// tokenizer has no such token.
+    private let imageTokenId: Int?
+
     public init(_ config: LFM2VLProcessorConfiguration, tokenizer: any Tokenizer) {
         self.config = config
         self.tokenizer = tokenizer
+        self.imageTokenId = tokenizer.convertTokenToId(config.imageToken)
     }
 
     /// Preprocess a single image
@@ -784,14 +774,16 @@ public struct LFM2VLProcessor: UserInputProcessor {
 
         // Replace image placeholder tokens with the correct count.
         //
-        // The id is per-model, not per-family: 396 is LFM2-VL's, while
-        // LFM2.5-VL-3B declares 124907. Hardcoding it meant the expansion below
-        // scanned for a token the template never emitted, left the single
-        // placeholder in place, and the model then aborted the process in
-        // `mergeInputIdsWithImageFeatures` with "tokens: 1, features 1536".
-        // The vocabulary is the authority; the old constant stays as the
-        // fallback for a tokenizer with no `<image>` entry.
-        let imageTokenId = tokenizer.convertTokenToId("<image>") ?? 396
+        // The id is per-checkpoint: 396 on LFM2-VL, 124907 on LFM2.5-VL-3B. The
+        // vocabulary is the only authority the chat template and this processor
+        // share, and there is deliberately no numeric fallback: 396 is the
+        // ordinary BPE token "ab" in the LFM2.5 vocabulary, so a wrong guess
+        // would silently match prose instead of failing.
+        guard let imageTokenId else {
+            throw VLMError.processing(
+                "The tokenizer has no '\(config.imageToken)' token, so the image placeholder cannot be expanded."
+            )
+        }
         var newPromptTokens = [Int]()
         var imageIdx = 0
         var i = 0
@@ -840,6 +832,17 @@ public struct LFM2VLProcessor: UserInputProcessor {
     }
 }
 
+private final class LFM2VLVision: Module {
+    @ModuleInfo(key: "vision_tower") var tower: Vision.VisionModel
+    @ModuleInfo(key: "multi_modal_projector") var projector: Lfm2VlMultiModalProjector
+
+    init(_ config: LFM2VLConfiguration) {
+        _tower.wrappedValue = Vision.VisionModel(
+            config: config.visionConfiguration, visionFeatureLayer: config.visionFeatureLayer)
+        _projector.wrappedValue = Lfm2VlMultiModalProjector(config: config)
+    }
+}
+
 // MARK: - Model
 
 /// LFM2 VL VLM
@@ -847,13 +850,14 @@ public struct LFM2VLProcessor: UserInputProcessor {
 /// This is typically created by ``VLMModelFactory``.
 public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
 
-    @ModuleInfo(key: "vision_tower") private var visionModel: Vision.VisionModel
+    @ModuleInfo(key: "vision_tower") private var visionModel: Vision.VisionModel?
     @ModuleInfo(key: "multi_modal_projector") private var multiModalProjector:
-        Lfm2VlMultiModalProjector
+        Lfm2VlMultiModalProjector?
     @ModuleInfo(key: "language_model") private var languageModel: Language.LanguageModel
     @ModuleInfo(key: "pixel_unshuffle") private var pixelUnshuffle: PixelUnshuffleBlock?
 
     public let config: LFM2VLConfiguration
+    private let onDemandVision: OnDemandComponent<LFM2VLVision>
 
     public var vocabularySize: Int { config.textConfiguration.vocabularySize }
     public var kvHeads: [Int] { languageModel.kvHeads }
@@ -865,17 +869,25 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
     public init(_ config: LFM2VLConfiguration) {
         self.config = config
 
-        self._visionModel.wrappedValue = Vision.VisionModel(
-            config: config.visionConfiguration,
-            visionFeatureLayer: config.visionFeatureLayer
-        )
+        let vision = LFM2VLVision(config)
+        self._visionModel.wrappedValue = vision.tower
+        self._multiModalProjector.wrappedValue = vision.projector
+        self.onDemandVision = OnDemandComponent(.vision) { LFM2VLVision(config) }
 
         if config.downsampleFactor > 1 {
             self._pixelUnshuffle.wrappedValue = PixelUnshuffleBlock(factor: config.downsampleFactor)
         }
 
-        self._multiModalProjector.wrappedValue = Lfm2VlMultiModalProjector(config: config)
-        self._languageModel.wrappedValue = Language.LanguageModel(config.textConfiguration)
+        self._languageModel.wrappedValue = Language.LanguageModel(
+            config.textConfiguration, tieWordEmbeddings: config.tieWordEmbeddings)
+    }
+
+    private func vision() throws -> (Vision.VisionModel, Lfm2VlMultiModalProjector) {
+        if let visionModel, let multiModalProjector {
+            return (visionModel, multiModalProjector)
+        }
+        let vision = try onDemandVision.load()
+        return (vision.tower, vision.projector)
     }
 
     private func getInputEmbeddings(
@@ -901,9 +913,10 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
             return inputsEmbeds
         }
 
-        // Get the output hidden states from the vision model
-        let visionOutput = visionModel(
-            pixelValues, outputHiddenStates: true, spatialShapes: spatialShapes)
+        let (tower, projector) = try vision()
+        let dtype = tower.embeddings.patchEmbedding.weight.dtype
+        let visionOutput = tower(
+            pixelValues.asType(dtype), outputHiddenStates: true, spatialShapes: spatialShapes)
         let hiddenStates = visionOutput.lastHiddenState
 
         // Get feature lengths from attention mask
@@ -931,7 +944,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
             }
 
             // Project to language model dimension
-            var imgEmbedding = multiModalProjector(feature)
+            var imgEmbedding = projector(feature)
 
             // Flatten back
             imgEmbedding = imgEmbedding.reshaped(-1, imgEmbedding.dim(-1))
@@ -964,9 +977,9 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         }
 
         let nImageFeatures = imageFeatures.dim(0)
-        if imageIndices.count != nImageFeatures {
+        guard imageIndices.count == nImageFeatures else {
             throw VLMError.processing(
-                "Image features and image tokens do not match: tokens: \(imageIndices.count), features \(nImageFeatures)"
+                "Image features and image tokens do not match: tokens \(imageIndices.count), features \(nImageFeatures). The processor expanded the placeholder with the tokenizer's id while the model scans for image_token_id \(imageTokenIndex)."
             )
         }
 
@@ -992,10 +1005,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
     ) throws
         -> PrepareResult
     {
-        let dtype = visionModel.embeddings.patchEmbedding.weight.dtype
-
-        // Get image data if available
-        let pixelValues = input.image?.pixels.asType(dtype)
+        let pixelValues = input.image?.pixels
 
         var spatialShapes: MLXArray? = nil
         var pixelAttentionMask: MLXArray? = nil
@@ -1066,35 +1076,46 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         languageModel(inputs, cache: cache).logits
     }
 
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        func transformKey(_ key: String) -> String {
-            var key = key
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        var checkpoint = try checkpoint.mapNames(Self.checkpointName)
+        checkpoint.weights = sanitize(weights: checkpoint.weights)
+        return checkpoint
+    }
 
-            if key.contains("vision_tower") {
-                key =
-                    key
-                    .replacingOccurrences(of: "model.", with: "")
-                    .replacingOccurrences(of: "vision_encoder", with: "encoder")
-                    .replacingOccurrences(of: "vision_embeddings", with: "embeddings")
-                    .replacingOccurrences(of: "vision_post_layernorm", with: "post_layernorm")
-            }
+    private static func checkpointName(_ key: String) -> String {
+        var key = key
 
-            if key.contains("language_model") {
-                key = key.replacingOccurrences(
-                    of: "model.language_model", with: "language_model.model")
-            }
-
-            if key.contains("multi_modal_projector") {
-                key = key.replacingOccurrences(
-                    of: "model.multi_modal_projector", with: "multi_modal_projector")
-            }
-
-            return key
+        if key.contains("vision_tower") {
+            key =
+                key
+                .replacingOccurrences(of: "model.", with: "")
+                .replacingOccurrences(of: "vision_encoder", with: "encoder")
+                .replacingOccurrences(of: "vision_embeddings", with: "embeddings")
+                .replacingOccurrences(of: "vision_post_layernorm", with: "post_layernorm")
         }
 
+        if key.contains("language_model") {
+            key = key.replacingOccurrences(
+                of: "model.language_model", with: "language_model.model")
+        }
+
+        if key.contains("multi_modal_projector") {
+            key = key.replacingOccurrences(
+                of: "model.multi_modal_projector", with: "multi_modal_projector")
+        }
+
+        if key.hasPrefix("model.") || key.hasPrefix("lm_head.") {
+            key = "language_model." + key
+        }
+        return key
+    }
+
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let weights = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: config.tieWordEmbeddings)
         var sanitizedWeights = [String: MLXArray]()
         for (k, v) in weights {
-            let newKey = transformKey(k)
+            let newKey = Self.checkpointName(k)
 
             // Handle conv weight transposition
             var value = v
@@ -1122,6 +1143,19 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
     }
 }
 
+extension LFM2VL: ModelComponentsProviding {
+    public var modelComponents: [ModelComponent: [CheckpointComponent]] {
+        let modules = ["vision_tower", "multi_modal_projector"]
+        return [
+            .vision: modules.map {
+                CheckpointComponent(name: $0, namespaces: [$0, "model.\($0)"], destination: $0)
+            }
+        ]
+    }
+
+    public var onDemandComponents: [AnyOnDemandComponent] { [onDemandVision] }
+}
+
 // MARK: - Configuration
 
 /// Configuration for ``LFM2VL``
@@ -1143,13 +1177,34 @@ public struct LFM2VLConfiguration: Codable, Sendable {
         private let _blockDim: Int?
         public var blockDim: Int { _blockDim ?? hiddenSize }
         private let _blockFFDim: Int?
-        public var blockFFDim: Int { _blockFFDim ?? hiddenSize }
+        private let _intermediateSize: Int?
+        /// MLP width before auto-adjustment: `block_ff_dim`, else `intermediate_size`.
+        public var blockFFDim: Int { _blockFFDim ?? _intermediateSize ?? hiddenSize }
         private let _blockMultipleOf: Int?
         public var blockMultipleOf: Int { _blockMultipleOf ?? 256 }
-        private let _blockFFNDimMultiplier: Float?
-        public var blockFFNDimMultiplier: Float { _blockFFNDimMultiplier ?? 1.0 }
+        private let _blockFFNDimMultiplier: Double?
+        public var blockFFNDimMultiplier: Float { Float(_blockFFNDimMultiplier ?? 1.0) }
         private let _blockAutoAdjustFFDim: Bool?
         public var blockAutoAdjustFFDim: Bool { _blockAutoAdjustFFDim ?? true }
+        private let _tieWordEmbeddings: Bool?
+        private let _tieEmbedding: Bool?
+        /// `text_config`'s `tie_embedding`, else `tie_word_embeddings`, else true. ``LFM2VL``
+        /// uses `LFM2VLConfiguration.tieWordEmbeddings`, which reads the top level first.
+        var tieWordEmbeddings: Bool { _tieEmbedding ?? _tieWordEmbeddings ?? true }
+
+        /// MLP width after transformers' `block_auto_adjust_ff_dim` rule. transformers skips the
+        /// rounding when `block_ffn_dim_multiplier` is an explicit null; this rounds anyway.
+        var feedForwardDimensions: Int {
+            var width = blockFFDim
+            if blockAutoAdjustFFDim {
+                width = Int(Double(2 * width) / 3)
+                if let multiplier = _blockFFNDimMultiplier {
+                    width = Int(multiplier * Double(width))
+                }
+                width = blockMultipleOf * ((width + blockMultipleOf - 1) / blockMultipleOf)
+            }
+            return width
+        }
         private let _fullAttnIdxs: [Int]?
         private let layerTypes: [String]?
         public var fullAttnIdxs: [Int] {
@@ -1165,8 +1220,16 @@ public struct LFM2VLConfiguration: Codable, Sendable {
 
             return Array(0 ..< hiddenLayers)
         }
+        private struct RopeParameters: Codable, Sendable {
+            let ropeTheta: Float?
+            enum CodingKeys: String, CodingKey {
+                case ropeTheta = "rope_theta"
+            }
+        }
         private let _ropeTheta: Float?
-        public var ropeTheta: Float { _ropeTheta ?? 1000000.0 }
+        private let _ropeParameters: RopeParameters?
+        /// `rope_parameters.rope_theta`, else `rope_theta`, else 1e6.
+        public var ropeTheta: Float { _ropeParameters?.ropeTheta ?? _ropeTheta ?? 1000000.0 }
 
         enum CodingKeys: String, CodingKey {
             case modelType = "model_type"
@@ -1180,12 +1243,16 @@ public struct LFM2VLConfiguration: Codable, Sendable {
             case _convLCache = "conv_L_cache"
             case _blockDim = "block_dim"
             case _blockFFDim = "block_ff_dim"
+            case _intermediateSize = "intermediate_size"
             case _blockMultipleOf = "block_multiple_of"
             case _blockFFNDimMultiplier = "block_ffn_dim_multiplier"
             case _blockAutoAdjustFFDim = "block_auto_adjust_ff_dim"
             case _fullAttnIdxs = "full_attn_idxs"
             case layerTypes = "layer_types"
             case _ropeTheta = "rope_theta"
+            case _ropeParameters = "rope_parameters"
+            case _tieWordEmbeddings = "tie_word_embeddings"
+            case _tieEmbedding = "tie_embedding"
         }
     }
 
@@ -1226,7 +1293,11 @@ public struct LFM2VLConfiguration: Codable, Sendable {
     private let _downsampleFactor: Int?
     public var downsampleFactor: Int { _downsampleFactor ?? 2 }
     private let _imageTokenId: Int?
-    public var imageTokenIndex: Int { _imageTokenId ?? 396 }
+    public var imageTokenIndex: Int { _imageTokenId ?? Self.defaultImageTokenId }
+
+    /// LFM2-VL's image placeholder id, used when `config.json` omits `image_token_id`.
+    public static let defaultImageTokenId = 396
+
     private let _projectorBias: Bool?
     public var projectorBias: Bool { _projectorBias ?? true }
     private let _projectorHiddenSize: Int?
@@ -1248,6 +1319,13 @@ public struct LFM2VLConfiguration: Codable, Sendable {
     public var minTiles: Int { _minTiles ?? 2 }
     private let _useThumbnail: Bool?
     public var useThumbnail: Bool { _useThumbnail ?? false }
+    private let _tieWordEmbeddings: Bool?
+    private let _tieEmbedding: Bool?
+    /// Whether the output projection reuses `embed_tokens`: the top-level `tie_embedding`, then
+    /// `tie_word_embeddings`, then the `text_config` flags, where mlx-vlm conversions keep them.
+    var tieWordEmbeddings: Bool {
+        _tieEmbedding ?? _tieWordEmbeddings ?? textConfiguration.tieWordEmbeddings
+    }
 
     enum CodingKeys: String, CodingKey {
         case textConfiguration = "text_config"
@@ -1265,6 +1343,8 @@ public struct LFM2VLConfiguration: Codable, Sendable {
         case _minImageTokens = "min_image_tokens"
         case _minTiles = "min_tiles"
         case _useThumbnail = "use_thumbnail"
+        case _tieWordEmbeddings = "tie_word_embeddings"
+        case _tieEmbedding = "tie_embedding"
     }
 }
 
@@ -1277,6 +1357,13 @@ public struct LFM2VLProcessorConfiguration: Codable, Sendable {
     private let _encoderPatchSize: Int?
     private let _maxTiles: Int?
     private let _downsampleFactor: Int?
+    private let _imageToken: String?
+
+    /// The placeholder text the chat template emits for an image.
+    public var imageToken: String { _imageToken ?? Self.defaultImageToken }
+
+    /// The image placeholder used by the released LFM2-VL chat templates.
+    public static let defaultImageToken = "<image>"
 
     // Default values matching LFM2 VL models
     public var imageMean: [CGFloat] {
@@ -1304,6 +1391,7 @@ public struct LFM2VLProcessorConfiguration: Codable, Sendable {
         case _encoderPatchSize = "encoder_patch_size"
         case _maxTiles = "max_tiles"
         case _downsampleFactor = "downsample_factor"
+        case _imageToken = "image_token"
     }
 }
 

@@ -3,6 +3,7 @@
 import CoreImage
 import Foundation
 import MLX
+import MLXNN
 import Testing
 
 @testable import MLXLMCommon
@@ -1016,8 +1017,149 @@ struct MuseGlimmerImageBudgetTests {
     }
 }
 
+@Suite("MuseGlimmer text-only prepare")
+struct MuseGlimmerTextOnlyPrepareTests {
+
+    /// A text-only turn must not carry an attention mask: a batch of one has nothing to pad, the
+    /// model never reads `LMInput.text.mask`, and `ChatSession` treats a masked input as
+    /// non-resumable, vetoing prompt-cache reuse on every agentic turn.
+    @Test("text-only input carries no attention mask")
+    func noMaskWithoutImages() async throws {
+        let processor = MuseGlimmerProcessor(
+            MuseGlimmerProcessorConfiguration(),
+            tokenizer: MuseGlimmerStubTokenizer())
+        let input = try await processor.prepare(input: UserInput(prompt: "hello"))
+        #expect(input.text.mask == nil)
+        #expect(input.text.tokens.shape == [1, 4])
+    }
+}
+
+@Suite("MuseGlimmer on-demand vision")
+struct MuseGlimmerOnDemandVisionTests {
+
+    /// One image token over a 2x2 patch grid.
+    private static func imageInput() -> LMInput {
+        LMInput(
+            text: .init(tokens: MLXArray([1, 2, 7, 3, 4] as [Int32]).expandedDimensions(axis: 0)),
+            image: .init(
+                pixels: MLXArray.zeros([4, 2 * 3 * 14 * 14], dtype: .float32),
+                frames: [THW(1, 2, 2)]))
+    }
+
+    private static func textInput() -> LMInput {
+        LMInput(
+            text: .init(tokens: MLXArray([1, 2, 5, 3, 4] as [Int32]).expandedDimensions(axis: 0)))
+    }
+
+    private static func logits(_ model: MuseGlimmer, _ input: LMInput) throws -> MLXArray {
+        let result = try model.prepare(
+            input, cache: try model.newCache(parameters: nil), state: nil,
+            prefill: PrefillParameters())
+        guard case .logits(let output) = result else {
+            throw VLMError.processing("expected logits")
+        }
+        return output.logits
+    }
+
+    private static let quantization = BaseConfiguration.Quantization(groupSize: 32, bits: 4)
+
+    /// Writes a checkpoint that mirrors `Muse-Glimmer-30B-4bit`: the tower is bf16 while the
+    /// adapter and the projection are quantized. `transformers` exports scope the vision modules
+    /// in `model.`.
+    private static func writeCheckpoint(transformersLayout: Bool = false) throws -> URL {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MuseGlimmerOnDemandVision-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let source = try MuseGlimmerForwardTests.model()
+        quantize(
+            model: source, groupSize: 32, bits: 4,
+            filter: { path, _ in path.hasPrefix("vision_adapter") || path == "vision_projection" })
+        var arrays = [String: MLXArray]()
+        for (key, value) in source.parameters().flattened() {
+            let scoped = transformersLayout && key.hasPrefix("vision_")
+            arrays[scoped ? "model.\(key)" : key] = value
+        }
+        if transformersLayout {
+            // `sanitize` drops these; the first image must too.
+            arrays["model.vision_tower.rotary_emb.inv_freq"] = MLXArray.zeros([4])
+        }
+        try save(arrays: arrays, url: directory.appendingPathComponent("model.safetensors"))
+        return directory
+    }
+
+    private static func load(
+        _ directory: URL, excluding excluded: Set<ModelComponent> = [],
+        _ loading: ComponentLoading
+    ) throws -> MuseGlimmer {
+        let model = try MuseGlimmerForwardTests.model()
+        try loadWeights(
+            modelDirectory: directory, model: model, quantization: quantization,
+            excludedComponents: excluded, componentLoading: loading)
+        return model
+    }
+
+    @Test(
+        "vision loads on the first image and matches a full load", arguments: [false, true])
+    func visionLoadsOnFirstImage(transformersLayout: Bool) throws {
+        let directory = try Self.writeCheckpoint(transformersLayout: transformersLayout)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let full = try Self.load(directory, .immediate)
+        let onDemand = try Self.load(directory, .onFirstUse)
+        let excluded = try Self.load(directory, excluding: [.vision], .onFirstUse)
+
+        let names = Set(full.parameters().flattened().map(\.0))
+        let textNames = names.filter { !$0.hasPrefix("vision_") }
+        #expect(names.contains("vision_projection.scales"))
+        #expect(Set(onDemand.parameters().flattened().map(\.0)) == textNames)
+
+        let textLogits = try Self.logits(full, Self.textInput())
+        #expect(arrayEqual(try Self.logits(onDemand, Self.textInput()), textLogits).item(Bool.self))
+        #expect(arrayEqual(try Self.logits(excluded, Self.textInput()), textLogits).item(Bool.self))
+
+        let imageLogits = try Self.logits(full, Self.imageInput())
+        #expect(
+            arrayEqual(try Self.logits(onDemand, Self.imageInput()), imageLogits).item(Bool.self))
+        #expect(Set(onDemand.parameters().flattened().map(\.0)) == textNames)
+        #expect(throws: OnDemandComponentError.self) {
+            _ = try Self.logits(excluded, Self.imageInput())
+        }
+    }
+
+    /// Apps load with a plain configuration and still get images.
+    @Test("the model factory defers vision without any configuration")
+    func factoryDefersVision() async throws {
+        let directory = try Self.writeCheckpoint()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var config =
+            try JSONSerialization.jsonObject(
+                with: Data(MuseGlimmerForwardTests.tinyJSON.utf8)) as! [String: Any]
+        config["quantization"] = ["group_size": 32, "bits": 4]
+        try JSONSerialization.data(withJSONObject: config).write(
+            to: directory.appendingPathComponent("config.json"))
+        try Data(#"{"processor_class": "MuseGlimmerProcessor"}"#.utf8).write(
+            to: directory.appendingPathComponent("preprocessor_config.json"))
+
+        let context = try await VLMModelFactory.shared.load(
+            from: directory, using: MuseGlimmerStubTokenizerLoader())
+        let model = try #require(context.model as? MuseGlimmer)
+
+        #expect(!model.parameters().flattened().contains { $0.0.hasPrefix("vision_") })
+        let full = try Self.load(directory, .immediate)
+        #expect(
+            arrayEqual(
+                try Self.logits(model, Self.imageInput()), try Self.logits(full, Self.imageInput())
+            ).item(Bool.self))
+    }
+}
+
+private struct MuseGlimmerStubTokenizerLoader: TokenizerLoader {
+    func load(from directory: URL) async throws -> any Tokenizer {
+        MuseGlimmerStubTokenizer()
+    }
+}
+
 /// Minimal tokenizer: the budget tests only exercise `preprocess`, which never
-/// touches it.
+/// touches it, and the text-only prepare test only needs a fixed template.
 private struct MuseGlimmerStubTokenizer: Tokenizer {
     func encode(text: String, addSpecialTokens: Bool) -> [Int] { [] }
     func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { "" }
@@ -1030,7 +1172,7 @@ private struct MuseGlimmerStubTokenizer: Tokenizer {
         messages: [[String: any Sendable]],
         tools: [[String: any Sendable]]?,
         additionalContext: [String: any Sendable]?
-    ) throws -> [Int] { [] }
+    ) throws -> [Int] { [1, 2, 3, 4] }
 }
 
 @Suite("MuseGlimmer agentic protocol")
@@ -1058,11 +1200,30 @@ struct MuseGlimmerAgenticProtocolTests {
     func conventions() throws {
         let model = try MuseGlimmerForwardTests.model()
         #expect(model.toolCallFormat == .atem)
+        #expect(model.reasoningConfig == OnyxReasoningProtocol.glimmer)
         #expect(model.reasoningConfig?.startDelimiter == "to=self<|message|>")
         #expect(model.reasoningConfig?.endDelimiter == "<|eom|>")
         #expect(VLMRegistry.museGlimmer30B4bit.toolCallFormat == .atem)
+        #expect(VLMRegistry.museGlimmer30B4bit.reasoningConfig == OnyxReasoningProtocol.glimmer)
         #expect(VLMRegistry.museGlimmer30B4bit.extraEOSTokens.contains("<|eot|>"))
         #expect(VLMRegistry.museGlimmer30B4bit.extraEOSTokens.contains("<|end_of_text|>"))
+    }
+
+    /// A budget cut must force the frame boundary and nothing else: the model
+    /// opens its own answer frame, and `<|eom|>` is not an end-of-turn token.
+    @Test("budget transition forces only the reasoning frame boundary")
+    func budgetTransitionClosesTheFrame() throws {
+        let tokenizer = OnyxTestTokenizer()
+        let reasoning = OnyxReasoningProtocol.glimmer
+        #expect(reasoning.budgetTransition == .immediate)
+
+        let plan = try ThinkingBudgetPlan(
+            configuration: ThinkingBudgetConfiguration(maximumTokenCount: 8),
+            reasoning: reasoning,
+            tokenizer: tokenizer)
+
+        #expect(plan.forcedTransitionTokenIDs == [tokenizer.eom])
+        #expect(!VLMRegistry.museGlimmer30B4bit.extraEOSTokens.contains("<|eom|>"))
     }
 
     @Test("ATEM parser extracts schema-typed arguments")
@@ -1217,6 +1378,30 @@ struct MuseGlimmerAgenticProtocolTests {
         #expect(answer == [.response("sunny")])
     }
 
+    @Test("the Onyx decoder can end for steering only after private or visible text")
+    func onyxEndsForSteeringOnlyAfterFrameText() throws {
+        let tokenizer = OnyxTestTokenizer()
+        var decoder = try #require(
+            ToolCallFormat.atem.makeProtocolTokenStreamDecoder(
+                tokenizer: tokenizer, tools: Self.tools, stopStrings: []))
+        let script: [(token: Int, canEnd: Bool)] = [
+            (tokenizer.id(" to=self"), false), (tokenizer.message, false),
+            (tokenizer.id("Plan"), true), (tokenizer.id(" it\n"), false), (tokenizer.eom, false),
+            (tokenizer.start, false), (tokenizer.id("assistant to=weather.get"), false),
+            (tokenizer.message, false), (tokenizer.id("<atem:function_calls>"), false),
+            (tokenizer.eom, false),
+            (tokenizer.start, false), (tokenizer.id("assistant to=user"), false),
+            (tokenizer.message, false), (tokenizer.id("Sunny"), true),
+            (tokenizer.id(" today\n"), false), (tokenizer.eot, false),
+        ]
+        for (token, canEnd) in script {
+            _ = decoder.push(token) { _ in true }
+            #expect(
+                decoder.canEndForSteering == canEnd,
+                "after \(tokenizer.decode(tokenIds: [token]).debugDescription)")
+        }
+    }
+
     @Test(
         "Onyx applies the selected validation policy and counts rejections",
         arguments: ToolCallValidationPolicy.allCases)
@@ -1339,6 +1524,71 @@ struct MuseGlimmerAgenticProtocolTests {
         #expect(events.contains { if case .protocolError = $0 { true } else { false } })
     }
 
+    private func onyxEvents(_ tokenizer: OnyxTestTokenizer, _ tokens: [Int]) throws
+        -> (reasoning: String, response: String)
+    {
+        var decoder = try #require(
+            ToolCallFormat.atem.makeProtocolTokenStreamDecoder(
+                tokenizer: tokenizer, tools: nil, stopStrings: []))
+        var events: [TokenStreamEvent] = []
+        for token in tokens {
+            _ = decoder.push(token) {
+                events.append($0)
+                return true
+            }
+        }
+        _ = decoder.finish {
+            events.append($0)
+            return true
+        }
+        return (
+            events.compactMap { if case .reasoning(let text) = $0 { text } else { nil } }.joined(),
+            events.compactMap { if case .response(let text) = $0 { text } else { nil } }.joined()
+        )
+    }
+
+    @Test("Onyx markers spelled out in the middle of a frame stay in that frame")
+    func literalMarkersInsideFrames() throws {
+        let tokenizer = OnyxTestTokenizer()
+        let thought = "a frame is <|start|>assistant to=user<|message|> and ends with <|eot|>"
+        let answer = "private frames use <|start|>assistant to=self<|message|>"
+        let result = try onyxEvents(
+            tokenizer,
+            [
+                tokenizer.id(" to=self"), tokenizer.message, tokenizer.id(thought), tokenizer.eom,
+                tokenizer.start, tokenizer.id("assistant to=user"), tokenizer.message,
+                tokenizer.id(answer), tokenizer.eot,
+            ])
+
+        #expect(result.reasoning == thought)
+        #expect(result.response == answer)
+    }
+
+    @Test("an Onyx private frame that never closes is not shown as the answer")
+    func unclosedPrivateFrameStaysPrivate() throws {
+        let tokenizer = OnyxTestTokenizer()
+        let result = try onyxEvents(
+            tokenizer,
+            [tokenizer.id(" to=self"), tokenizer.message, tokenizer.id("unfinished plan")])
+
+        #expect(result.response.isEmpty)
+    }
+
+    @Test("a frame started inside an unclosed Onyx private frame does not leak it")
+    func frameStartedInsideUnclosedPrivateFrame() throws {
+        let tokenizer = OnyxTestTokenizer()
+        let result = try onyxEvents(
+            tokenizer,
+            [
+                tokenizer.id(" to=self"), tokenizer.message, tokenizer.id("first plan"),
+                tokenizer.start, tokenizer.id("assistant to=user"), tokenizer.message,
+                tokenizer.id("sunny"), tokenizer.eot,
+            ])
+
+        #expect(!result.response.contains("first plan"))
+        #expect(result.response == "sunny")
+    }
+
     @Test("prompt cache accounting follows each protocol's rendered call shape")
     func protocolSpecificCallAccounting() {
         let calls = [
@@ -1433,7 +1683,6 @@ struct MuseGlimmerOnyxCacheTests {
             cachedTokens: live,
             processedTokenCount: live.count,
             mainCacheIsAligned: true,
-            draftCacheIsAligned: true,
             maxTrimCount: live.count)
 
         let decision = try #require(rule.reuse(turn: turn, cache: cache))
@@ -1466,7 +1715,6 @@ struct MuseGlimmerOnyxCacheTests {
             cachedTokens: live,
             processedTokenCount: live.count,
             mainCacheIsAligned: true,
-            draftCacheIsAligned: true,
             maxTrimCount: live.count)
 
         let decision = try #require(rule.reuse(turn: turn, cache: cache))
@@ -1499,7 +1747,6 @@ struct MuseGlimmerOnyxCacheTests {
             cachedTokens: live,
             processedTokenCount: live.count,
             mainCacheIsAligned: true,
-            draftCacheIsAligned: true,
             maxTrimCount: live.count)
 
         #expect(rule.reuse(turn: turn, cache: cache) == nil)

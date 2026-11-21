@@ -35,34 +35,47 @@ public class LFM3Model: Module, LLMModel, KVCacheDimensionProvider {
         projectLogits(model(inputs, cache: cache))
     }
 
-    /// MLX conversions nest the text model under `language_model`. Keep only the text
-    /// model (`model.*` and a bare `lm_head`), which drops any vision or audio tensors.
-    static func textModuleName(_ name: String) -> String? {
-        var name = name
-        if name.hasPrefix("language_model.") {
-            name.removeFirst("language_model.".count)
-        }
-        let root = name.prefix { $0 != "." }
-        return root == "model" || root == "lm_head" ? name : nil
+    public func nextTokenLogits(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        let hidden = hiddenStates(input.tokens, cache: cache)
+        let projection: Module = lmHead ?? model.embedTokens
+        return .init(
+            logits: projectLogits(
+                quantizedVocabularyProjectionInput(hidden, projection: projection)))
     }
 
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var renamed = [String: MLXArray]()
-        for (name, value) in weights {
-            if let mapped = Self.textModuleName(name) {
-                renamed[mapped] = value
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        // MLX conversions nest the text model under `language_model`. Keep only the text
+        // model, which drops any vision or audio tensors. The same mapping renames the
+        // per-layer quantization settings, including the bare `lm_head` module path.
+        var checkpoint = try checkpoint.mapNames { name in
+            var name = name
+            if name.hasPrefix("language_model.") {
+                name.removeFirst("language_model.".count)
             }
+            let root = name.prefix { $0 != "." }
+            return root == "model" || root == "lm_head" ? name : nil
         }
         var weights = filterLMHeadWeights(
-            from: renamed, tiedWordEmbeddings: configuration.tieWordEmbeddings)
+            from: checkpoint.weights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
 
         // PyTorch stores the depthwise conv as [C, 1, K]; MLX expects [C, K, 1].
         for (name, value) in weights where name.hasSuffix("conv.conv.weight") {
+            guard value.ndim == 3 else {
+                throw ModelFactoryError.invalidConfiguration(
+                    "LFM3 convolution tensor \(name) must have rank 3, got \(value.shape)")
+            }
             if value.dim(-1) > value.dim(1) {
                 weights[name] = value.transposed(0, 2, 1)
             }
         }
-        return weights
+        checkpoint.weights = weights
+        return checkpoint
+    }
+
+    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        try prepareCheckpoint(.init(weights: weights)).weights
     }
 
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
@@ -88,30 +101,15 @@ public class LFM3Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 }
 
-extension LFM3Model {
+extension LFM3Model: HiddenStateLanguageModel {
     /// Final normed hidden states `[B, L, hidden]` for token ids `[B, L]`.
     package func hiddenStates(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         model(inputs, cache: cache)
     }
 
     /// Vocabulary logits for final hidden states, tied or untied.
-    func projectLogits(_ hiddenStates: MLXArray) -> MLXArray {
+    package func projectLogits(_ hiddenStates: MLXArray) -> MLXArray {
         model.projectLogits(hiddenStates, lmHead: lmHead)
-    }
-}
-
-/// The checkpoint's per-layer quantization map names layers as the checkpoint does
-/// (`language_model.model.*`); sanitize renames tensors, so rename the map the same way.
-extension LFM3Model: PerLayerQuantizationSanitizing {
-    public func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization)
-        -> BaseConfiguration.PerLayerQuantization
-    {
-        var result = perLayerQuantization
-        result.perLayerQuantization = [:]
-        for (name, option) in perLayerQuantization.perLayerQuantization {
-            result.perLayerQuantization[Self.textModuleName(name) ?? name] = option
-        }
-        return result
     }
 }
 

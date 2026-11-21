@@ -44,7 +44,7 @@ private func createQwen3CompatibleModel(configuration data: Data) throws -> any 
 
 /// Registry of model type, e.g 'llama', to functions that can instantiate the model from configuration.
 ///
-/// Typically called via ``LLMModelFactory/loadContainer(from:using:configuration:useLatest:progressHandler:)``.
+/// Typically called via ``LLMModelFactory/loadContainer(from:using:configuration:useLatest:progress:)``.
 public enum LLMTypeRegistry {
 
     /// Shared instance with default model types.
@@ -72,6 +72,9 @@ public enum LLMTypeRegistry {
         "qwen3_5_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
         "qwen4_exp": create(Qwen4ExpConfiguration.self, Qwen4ExpModel.init),
         "qwen4_exp_text": create(Qwen4ExpConfiguration.self, Qwen4ExpTextModel.init),
+        "qwen3_8": create(Qwen35Configuration.self, Qwen35Model.init),
+        "qwen3_8_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
+        "qwen3_8_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
         "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
         "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
         "starcoder2": create(Starcoder2Configuration.self, Starcoder2Model.init),
@@ -110,6 +113,7 @@ public enum LLMTypeRegistry {
         "olmoe": create(OlmoEConfiguration.self, OlmoEModel.init),
         "olmo2": create(Olmo2Configuration.self, Olmo2Model.init),
         "olmo3": create(Olmo3Configuration.self, Olmo3Model.init),
+        "mellum": create(MellumConfiguration.self, MellumModel.init),
         "bailing_moe": create(BailingMoeConfiguration.self, BailingMoeModel.init),
         "lfm2_moe": create(LFM2MoEConfiguration.self, LFM2MoEModel.init),
         "nanochat": create(NanoChatConfiguration.self, NanoChatModel.init),
@@ -201,6 +205,12 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         id: "mlx-community/gemma-2-2b-it-4bit",
         // https://www.promptingguide.ai/models/gemma
         defaultPrompt: "What is the difference between lettuce and cabbage?"
+    )
+
+    static public let bonsai2_27B_ternary_2bit = ModelConfiguration(
+        id: "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
+        defaultPrompt: "What is the difference between a fruit and a vegetable?",
+        extraEOSTokens: ["<|im_end|>"]
     )
 
     static public let gemma3_1B_qat_4bit = ModelConfiguration(
@@ -375,6 +385,23 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<|im_end|>"]
     )
 
+    static public let qwen3_8_27b_4bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.8-27B-4bit",
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
+    static public let qwen3_8_27b_8bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.8-27B-8bit",
+        defaultPrompt: "Why is the sky blue?",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
+    static public let mellum2_1_12b_a2_5b_thinking_6bit = ModelConfiguration(
+        id: "mlx-community/Mellum2.1-12B-A2.5B-Thinking-6bit",
+        defaultPrompt: "Write a Swift function that checks whether a string is a palindrome."
+    )
+
     static public let openelm270m4bit = ModelConfiguration(
         id: "mlx-community/OpenELM-270M-Instruct",
         // https://huggingface.co/apple/OpenELM
@@ -462,6 +489,48 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         toolCallFormat: .lfm2
     )
 
+    /// Official LiquidAI LFM2.5 reasoning model. LiquidAI publishes all
+    /// precision variants in one repository, so this scopes resolution to the
+    /// recommended 4-bit MLX checkpoint instead of downloading every variant.
+    static public let lfm25_2_6b_4bit = ModelConfiguration(
+        id: "LiquidAI/LFM2.5-2.6B-MLX",
+        modelSubdirectory: "4bit",
+        defaultPrompt: "Explain why the sky is blue.",
+        toolCallFormat: .lfm2,
+        reasoningConfig: .alwaysOnThinking
+    )
+
+    /// Full-precision official variant, primarily for correctness baselines.
+    static public let lfm25_2_6b_bf16 = ModelConfiguration(
+        id: "LiquidAI/LFM2.5-2.6B-MLX",
+        modelSubdirectory: "bf16",
+        defaultPrompt: "Explain why the sky is blue.",
+        toolCallFormat: .lfm2,
+        reasoningConfig: .alwaysOnThinking
+    )
+
+    /// Official sparse LFM2.5 checkpoint with 1.5B active parameters. Its
+    /// conversion is mixed precision: most modules are 4-bit while routing
+    /// gates remain 8-bit, as declared by the checkpoint configuration.
+    static public let lfm25_8b_a1b_4bit = ModelConfiguration(
+        id: "LiquidAI/LFM2.5-8B-A1B-MLX-4bit",
+        defaultPrompt: "Explain why the sky is blue.",
+        toolCallFormat: .lfm2,
+        reasoningConfig: .alwaysOnThinking,
+        generationConfig: .init(
+            temperature: 0.2, topK: 80, repetitionPenalty: 1.05)
+    )
+
+    /// Higher-fidelity 8-bit variant of the sparse 8B-A1B architecture.
+    static public let lfm25_8b_a1b_8bit = ModelConfiguration(
+        id: "LiquidAI/LFM2.5-8B-A1B-MLX-8bit",
+        defaultPrompt: "Explain why the sky is blue.",
+        toolCallFormat: .lfm2,
+        reasoningConfig: .alwaysOnThinking,
+        generationConfig: .init(
+            temperature: 0.2, topK: 80, repetitionPenalty: 1.05)
+    )
+
     static public let lfm3_1_7b_4bit = ModelConfiguration(
         id: "LiquidAI/LFM3-1.7B-MLX-4bit",
         defaultPrompt: "Why is the sky blue?"
@@ -525,6 +594,7 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 
     private static func all() -> [ModelConfiguration] {
         [
+            bonsai2_27B_ternary_2bit,
             codeLlama13b4bit,
             deepSeekR1_7B_4bit,
             falconH1R7B,
@@ -572,6 +642,9 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             qwen3MoE_30b_a3b_4bit,
             qwen3_5_2b_4bit,
             qwen3_6_27b_4bit,
+            qwen3_8_27b_4bit,
+            qwen3_8_27b_8bit,
+            mellum2_1_12b_a2_5b_thinking_6bit,
             smolLM_135M_4bit,
             deepseek_r1_4bit,
             mimo_7b_sft_4bit,
@@ -581,6 +654,9 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             smollm3_3b_4bit,
             ernie_45_0_3BPT_bf16_ft,
             lfm2_1_2b_4bit,
+            lfm25_2_6b_4bit,
+            lfm25_8b_a1b_4bit,
+            lfm25_8b_a1b_8bit,
             lfm3_1_7b_4bit,
             baichuan_m1_14b_instruct_4bit,
             exaone_4_0_1_2b_4bit,
@@ -727,10 +803,18 @@ public final class LLMModelFactory: GenericModelFactory {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
 
+        // Honor `suppress_tokens` from generation_config.json (transformers'
+        // SuppressTokensLogitsProcessor): merge into the model's suppressed
+        // token IDs so the token iterators mask them during sampling.
+        mergeGenerationConfigSuppressedTokens(generationConfig, into: model)
+
         // Build a ModelConfiguration with loaded EOS token IDs and tool call format
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
         mutableConfiguration.stopStrings.formUnion(generationConfig?.stopStrings ?? [])
+        if mutableConfiguration.generationConfig == nil {
+            mutableConfiguration.generationConfig = generationConfig
+        }
         // Chat conventions. An explicit value on the configuration wins, followed
         // by a registered resolver that sees the repo id. Checkpoint metadata then
         // resolves the model declaration against the selected tool template.
@@ -757,7 +841,8 @@ public final class LLMModelFactory: GenericModelFactory {
         try await loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization,
-            weightFileSelection: configuration.weightFileSelection)
+            weightFileSelection: configuration.weightFileSelection,
+            excludedComponents: configuration.excludedComponents)
 
         (model as? DeepseekV4Model)?.prepareInferenceWeights()
 
@@ -787,7 +872,8 @@ public final class LLMModelFactory: GenericModelFactory {
             eosTokenIds: mutableConfiguration.eosTokenIds,
             toolCallFormat: mutableConfiguration.toolCallFormat,
             reasoningConfig: mutableConfiguration.reasoningConfig,
-            messageGenerator: mutableConfiguration.messageGenerator)
+            messageGenerator: mutableConfiguration.messageGenerator,
+            generationConfig: mutableConfiguration.generationConfig)
 
         let processor = LLMUserInputProcessor(
             tokenizer: tokenizer, configuration: modelConfig,

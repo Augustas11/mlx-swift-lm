@@ -14,6 +14,90 @@ private let cacheCreators: [@Sendable () -> any KVCache] = [
     { MambaCache() },
 ]
 
+@Test func testRewindableConvolutionCacheRoundTripsPromptCacheState() throws {
+    let cache = RewindableConvolutionCache(stateLength: 2, rollbackCapacity: 8)
+    let initial = MLXArray.zeros([1, 2, 4])
+    let input = MLXArray((0 ..< 20).map(Float.init)).reshaped(1, 5, 4)
+    cache.record(
+        input: input, initialState: initial,
+        currentState: input[0..., (-2)..., 0...])
+
+    let url = tempURL()
+    defer { try? FileManager.default.removeItem(at: url) }
+    try savePromptCache(url: url, cache: [cache], metadata: [:])
+    let (loaded, _) = try loadPromptCache(url: url)
+    let restored = try #require(loaded.first as? RewindableConvolutionCache)
+
+    #expect(restored.offset == 5)
+    #expect(restored.stateLength == 2)
+    #expect(restored.rollbackCapacity == 8)
+    assertArraysClose(restored.state, cache.state)
+    #expect(restored.trim(2) == 2)
+    #expect(restored.offset == 3)
+}
+
+@Test func testRewindableConvolutionCacheCopyPreservesPreparedBatchMetadata() throws {
+    let cache = RewindableConvolutionCache(stateLength: 2, rollbackCapacity: 8)
+    cache.prepare(lengths: [5, 3])
+    let copy = try #require(cache.copy() as? RewindableConvolutionCache)
+
+    #expect(copy.currentLengths?.asArray(Int.self) == [5, 3])
+    #expect(copy.stateLength == 2)
+    #expect(copy.rollbackCapacity == 8)
+}
+
+@Test func testHybridConvolutionTrimFailsWithoutPartiallyTrimmingAttention() {
+    for convolutionFirst in [false, true] {
+        let convolution = RewindableConvolutionCache(stateLength: 2, rollbackCapacity: 8)
+        let input = MLXArray.ones([1, 12, 4])
+        convolution.record(
+            input: input, initialState: MLXArray.zeros([1, 2, 4]),
+            currentState: input[0..., (-2)..., 0...])
+        let attention = KVCacheSimple()
+        let kv = MLXArray.ones([1, 1, 12, 4])
+        _ = attention.update(keys: kv, values: kv)
+        let caches: [KVCache] =
+            convolutionFirst
+            ? [convolution, attention] : [attention, convolution]
+        #expect(trimPromptCache(caches, numTokens: 9) == 0)
+        #expect(convolution.offset == 12)
+        #expect(attention.offset == 12)
+        #expect(CacheList(caches[0], caches[1]).trim(9) == 0)
+        #expect(convolution.offset == 12)
+        #expect(attention.offset == 12)
+        #expect(trimPromptCache(caches, numTokens: 8) == 8)
+        #expect(convolution.offset == 4)
+        #expect(attention.offset == 4)
+        #expect(trimPromptCache(caches, numTokens: 1) == 0)
+        #expect(convolution.offset == 4)
+        #expect(attention.offset == 4)
+    }
+}
+
+@Test(arguments: [7, 8, 12], [false, true])
+func testNativeHybridRewindChecksTheWrittenWindow(length: Int, convolutionFirst: Bool) {
+    let convolution = RewindableConvolutionCache(stateLength: 2, rollbackCapacity: 8)
+    let input = MLXArray((0 ..< length).map(Float.init)).reshaped(1, length, 1)
+    convolution.record(
+        input: input, initialState: MLXArray.zeros([1, 2, 1]),
+        currentState: input[0..., (-2)..., 0...])
+    let attention = RotatingKVCache(maxSize: 8, keep: 0)
+    let kv = input.reshaped(1, 1, length, 1)
+    _ = attention.update(keys: kv, values: kv)
+    let caches: [KVCache] =
+        convolutionFirst ? [convolution, attention] : [attention, convolution]
+    #expect(!attention.isTrimmable(after: 3))
+
+    let expectedTrim = length == 7 ? 3 : 0
+    #expect(rewindSpeculativePromptCache(caches, numTokens: 3) == expectedTrim)
+    #expect(convolution.offset == length - expectedTrim)
+    #expect(attention.offset == length - expectedTrim)
+    if expectedTrim > 0 {
+        #expect(convolution[0]?.asArray(Float.self) == [2, 3])
+        #expect(attention.state[0].asArray(Float.self) == [0, 1, 2, 3])
+    }
+}
+
 // MARK: - Helper
 
 private func tempURL() -> URL {
@@ -306,6 +390,23 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
         #expect(arrays.keys.allSatisfy { Int($0.split(separator: ".")[0]) != nil })
         #expect(!metadata.keys.contains { $0.contains("__mlx_lm_state_") })
         #expect(metadata["2.0"] == "KVCache")
+    }
+
+    @Test func testLoadedPromptCacheNoLongerReadsItsFile() throws {
+        let cache = KVCacheSimple()
+        let keys = MLXArray(0 ..< 32).reshaped([1, 2, 4, 4]).asType(.float32)
+        let values = -keys
+        _ = cache.update(keys: keys, values: values)
+        let url = tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+        try savePromptCache(url: url, cache: [cache])
+
+        // Saving truncates the file before it evaluates what it writes.
+        let snapshot = try loadPromptCacheSnapshot(url: url)
+        try savePromptCache(url: url, cache: snapshot.cache)
+
+        let restored = try loadPromptCacheSnapshot(url: url)
+        assertArraysClose(restored.cache[0].state, [keys, values])
     }
 
     @Test func testEmptyPromptCacheStateUsesTheLegacyFormat() throws {
@@ -680,6 +781,36 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
         #expect(restored[3].state.isEmpty)
         #expect(restored[4] is ChunkedKVCache)
         #expect(restored[4].state.isEmpty)
+    }
+
+    @Test func testRotatingKVCacheStatePreservesRingStorageAfterWrap() {
+        let cache = RotatingKVCache(maxSize: 3)
+
+        for value in 0 ..< 5 {
+            let keys = MLXArray([Float(value)]).reshaped([1, 1, 1, 1])
+            let values = MLXArray([Float(value + 10)]).reshaped([1, 1, 1, 1])
+            _ = cache.update(keys: keys, values: values)
+        }
+
+        let state = cache.state
+        #expect(state.count == 2)
+        #expect(state[0].flattened().asArray(Float.self) == [3, 4, 2])
+        #expect(state[1].flattened().asArray(Float.self) == [13, 14, 12])
+    }
+
+    @Test func testRotatingKVCacheTemporalStatePreservesLogicalOrderAfterWrap() {
+        let cache = RotatingKVCache(maxSize: 3)
+
+        for value in 0 ..< 5 {
+            let keys = MLXArray([Float(value)]).reshaped([1, 1, 1, 1])
+            let values = MLXArray([Float(value + 10)]).reshaped([1, 1, 1, 1])
+            _ = cache.update(keys: keys, values: values)
+        }
+
+        let state = cache.temporalState
+        #expect(state.count == 2)
+        #expect(state[0].flattened().asArray(Float.self) == [2, 3, 4])
+        #expect(state[1].flattened().asArray(Float.self) == [12, 13, 14])
     }
 
     // MARK: - ArraysCache sparse slot round-trip
@@ -1346,6 +1477,38 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
         }
     }
 
+    // MARK: - Quantized attention head dims
+    // Regression for #652: MLA caches store [kvLatent, kPe] as keys and only kvLatent as
+    // values, so the GQA output reshape must follow the value head dim, not the query one.
+
+    @Test("quantizedScaledDotProductAttention supports values narrower than keys")
+    func quantizedAttentionSupportsMLAStyleHeadDims() throws {
+        withRandomState(MLXRandom.RandomState(seed: 0)) {
+            let (B, nKVHeads, nRepeats, L) = (1, 1, 4, 3)
+            let (kHeadDim, vHeadDim) = (192, 128)
+            let scale = 1.0 / Float(kHeadDim).squareRoot()
+
+            let q = MLXRandom.normal([B, nKVHeads * nRepeats, L, kHeadDim])
+            let k = MLXRandom.normal([B, nKVHeads, L, kHeadDim])
+            let v = MLXRandom.normal([B, nKVHeads, L, vHeadDim])
+
+            let reference = MLXFast.scaledDotProductAttention(
+                queries: q, keys: k, values: v, scale: scale, mask: .causal)
+
+            let cache = QuantizedKVCache(groupSize: 64, bits: 8)
+            let (qK, qV) = cache.updateQuantized(keys: k, values: v)
+            let out = quantizedScaledDotProductAttention(
+                queries: q, quantizedKeys: qK, quantizedValues: qV,
+                scale: scale, mask: .causal,
+                groupSize: cache.groupSize, bits: cache.bits, mode: cache.mode)
+
+            #expect(out.shape == reference.shape)
+            #expect(
+                allClose(out, reference, rtol: 0.05, atol: 0.1).item(Bool.self),
+                "quantized MLA attention diverges from full precision")
+        }
+    }
+
     // MARK: - ropeOffset overridability
 
     /// A `BaseKVCache` subclass reporting a per-row RoPE offset, as a batched cache does.
@@ -1430,6 +1593,14 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
 
         let short = try #require(cache.logicalView(tail: 3))
         #expect(encodedPositions(short.0) == [17, 18, 19], "a short tail took the wrong end")
+    }
+
+    @Test func testRotatingKVCacheReportsEvictedTokensThroughKVCache() {
+        let rotating = RotatingKVCache(maxSize: 8, keep: 2)
+        fillOneAtATime(rotating, positions: 0 ..< 20)
+
+        let cache: any KVCache = rotating
+        #expect(cache.evictedTokenCount == 12)
     }
 
     @Test func testRotatingLogicalViewClampsTailToWhatTheCacheHolds() throws {
@@ -1617,6 +1788,43 @@ private final class ProtocolDefaultTrimmabilityCache: KVCache {
         #expect(cache.state.count == 10)
         #expect(relativeRMSError(cachedKeys, keys) < 0.5)
         #expect(relativeRMSError(cachedValues, values) < 0.5)
+    }
+
+    @Test func testVarianceNormalizedKVCacheExposesLiveKeyValues() throws {
+        let cache = VarianceNormalizedKVCache(
+            tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 2)
+        #expect(cache.currentKeyValues() == nil)
+
+        let keys = MLXRandom.normal([1, 1, 40, 32]).asType(.float16)
+        let values = MLXRandom.normal([1, 1, 40, 32]).asType(.float16)
+        let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+        let live = try #require(cache.currentKeyValues())
+        eval(cachedKeys, cachedValues, live.keys, live.values)
+
+        #expect(live.keys.shape == keys.shape)
+        #expect(live.values.shape == values.shape)
+        #expect(allClose(live.keys, cachedKeys, rtol: 0, atol: 0).item(Bool.self))
+        #expect(allClose(live.values, cachedValues, rtol: 0, atol: 0).item(Bool.self))
+        #expect(relativeRMSError(live.keys, keys) < 0.5)
+        #expect(relativeRMSError(live.values, values) < 0.5)
+
+        cache.trim(10)
+        let trimmed = try #require(cache.currentKeyValues())
+        #expect(trimmed.keys.dim(2) == 30)
+        #expect(trimmed.values.dim(2) == 30)
+    }
+
+    @Test func testVarianceNormalizedKVCacheInnerStateHoldsTheStoredSlabs() throws {
+        let cache = VarianceNormalizedKVCache(
+            tileSize: 32, keyBits: 4, valueBits: 4, sinkhornIterations: 2)
+        let keys = MLXRandom.normal([1, 1, 8 * 32 + 5, 32]).asType(.float16)
+        let values = MLXRandom.normal([1, 1, 8 * 32 + 5, 32]).asType(.float16)
+        let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+        eval(cachedKeys, cachedValues)
+
+        let stateBytes = cache.state.reduce(0) { $0 + $1.nbytes }
+        #expect(KVCacheStatus(cache: [cache]).memoryBytes == stateBytes)
+        #expect(cache.innerState().count < cache.state.count)
     }
 
     @Test func testVarianceNormalizedKVCacheSerializationRoundTrip() throws {

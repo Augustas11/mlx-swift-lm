@@ -184,13 +184,17 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var out = model(inputs, cache: cache)
-        if let lmHead {
-            out = lmHead(out)
-        } else {
-            out = model.embedTokens.asLinear(out)
+        projectLogits(hiddenStates(inputs, cache: cache))
+    }
+
+    public func nextTokenLogits(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        var hidden = hiddenStates(input.tokens, cache: cache)
+        if lmHead == nil {
+            hidden = quantizedVocabularyProjectionInput(hidden, projection: model.embedTokens)
         }
-        return out
+        return .init(logits: projectLogits(hidden))
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -200,6 +204,16 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
             from: weights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
 
         return weights
+    }
+}
+
+extension Qwen3Model: HiddenStateLanguageModel {
+    package func hiddenStates(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        model(inputs, cache: cache)
+    }
+
+    package func projectLogits(_ hiddenStates: MLXArray) -> MLXArray {
+        lmHead?(hiddenStates) ?? model.embedTokens.asLinear(hiddenStates)
     }
 }
 

@@ -456,6 +456,9 @@ public struct KVCacheLayerStatus: Sendable, Hashable {
     public let state: State
     public let resolvedStrategy: KVCacheStrategyIdentifier?
     public let reason: Reason?
+    /// Bytes allocated for this layer's arrays, including space reserved for
+    /// tokens not yet written.
+    public let memoryBytes: Int
 
     package init(
         path: [Int],
@@ -463,7 +466,8 @@ public struct KVCacheLayerStatus: Sendable, Hashable {
         capacitySource: CapacitySource?,
         state: State,
         resolvedStrategy: KVCacheStrategyIdentifier?,
-        reason: Reason?
+        reason: Reason?,
+        memoryBytes: Int
     ) {
         self.path = path
         self.kind = kind
@@ -471,6 +475,7 @@ public struct KVCacheLayerStatus: Sendable, Hashable {
         self.state = state
         self.resolvedStrategy = resolvedStrategy
         self.reason = reason
+        self.memoryBytes = memoryBytes
     }
 }
 

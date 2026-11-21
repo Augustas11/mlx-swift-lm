@@ -2,8 +2,9 @@
 
 import Foundation
 import MLX
-import MLXLLM
+@_spi(Testing) import MLXLLM
 import MLXNN
+import MLXScriptedLM
 import Testing
 
 @testable import MLXLMCommon
@@ -17,16 +18,8 @@ struct SpeculativeDecodingTests {
 
     init() {
         let processor = TestInputProcessor()
-        let modelConfig = Gemma3TextConfiguration(
-            modelType: "text",
-            hiddenSize: 64, hiddenLayers: 8, intermediateSize: 64,
-            attentionHeads: 4, headDim: 64,
-            rmsNormEps: 0.00001, vocabularySize: 100, kvHeads: 4,
-            ropeTheta: 1_000_000, ropeLocalBaseFreq: 10_000,
-            ropeTraditional: false, queryPreAttnScalar: 256,
-            slidingWindow: 512, slidingWindowPattern: 6,
-            maxPositionEmbeddings: 32768
-        )
+        let modelConfig = Gemma3TextConfiguration.smallConfiguration(
+            vocabularySize: 100)
 
         let mainModel = Gemma3TextModel(modelConfig)
 
@@ -75,7 +68,7 @@ struct SpeculativeDecodingTests {
         withLogitProcessor: Bool
     ) async throws {
         let vocabularySize = 100
-        let tokenizer = TestTokenizer(vocabularySize: vocabularySize)
+        let tokenizer = PseudoWordTokenizer(vocabularySize: vocabularySize)
         let processor = TestInputProcessor(
             tokenizer: tokenizer,
             configuration: ModelConfiguration(id: "stable-transition-test"),
@@ -116,6 +109,48 @@ struct SpeculativeDecodingTests {
         #expect(!normalTokens.isEmpty)
         #expect(!speculativeTokens.isEmpty)
         #expect(normalTokens == speculativeTokens)
+    }
+
+    @Test func `Speculative API keeps the drafter when log probabilities are requested`()
+        async throws
+    {
+        let vocabularySize = 100
+        let tokenizer = PseudoWordTokenizer(vocabularySize: vocabularySize)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "log-probability-speculative-test"),
+            messageGenerator: DefaultMessageGenerator()
+        )
+        let context = ModelContext(
+            configuration: processor.configuration,
+            model: CacheTrackingTransitionModel(vocabularySize: vocabularySize),
+            processor: processor,
+            tokenizer: processor.tokenizer
+        )
+        let mainCache = [KVCacheSimple()]
+        let draftCache = [KVCacheSimple()]
+        let parameters = GenerateParameters(maxTokens: 3, temperature: 0, logProbabilities: 2)
+
+        var tokens = [Int]()
+        var completion: GenerateCompletionInfo?
+        for await generation in try generateTokens(
+            input: LMInput(tokens: MLXArray([7])), cache: mainCache,
+            parameters: parameters, context: context,
+            draftModel: CacheTrackingTransitionModel(vocabularySize: vocabularySize),
+            draftCache: draftCache, numDraftTokens: 2)
+        {
+            if let token = generation.token { tokens.append(token) }
+            if let info = generation.info {
+                completion = info
+            }
+        }
+
+        #expect(tokens.count == 3)
+        #expect(completion?.speculativeDecodingTelemetry?.roundCount == 1)
+        // Both caches advanced: prompt + 2 accepted drafts. The draft cache feeds
+        // the last accepted draft when generation ends.
+        #expect(mainCache.first?.offset == 3)
+        #expect(draftCache.first?.offset == 3)
     }
 
     @Test(arguments: [2, 8, 48], [false, true])
@@ -216,9 +251,9 @@ struct SpeculativeDecodingTests {
         #expect(telemetry.emittedTokenCount == tokenCount)
     }
 
-    @Test(arguments: [1, 2, 4])
+    @Test(arguments: [1, 2, 3, 4])
     func `finalizeGeneration trims unreturned speculative lookahead`(consumedTokens: Int) throws {
-        // Contract: after `finalizeGeneration()` the shared caches must represent
+        // Contract: after `finalizeGeneration()` both caches must represent
         // exactly the tokens returned to the generation loop — no verified
         // but unreturned lookahead. ChatSession relies on this to reconcile
         // its token ledger against the model-wide processed-token timeline,
@@ -249,13 +284,13 @@ struct SpeculativeDecodingTests {
 
         iterator.finalizeGeneration()
 
-        let expectedMain = 1 + Swift.min(consumed, 3)
-        let expectedDraft = 1 + Swift.min(consumed, 2)
-        #expect(mainCache.first?.offset == expectedMain)
-        #expect(draftCache.first?.offset == expectedDraft)
+        // Once the third draft is returned, the draft cache feeds it too.
+        let expected = 1 + Swift.min(consumed, 3)
+        #expect(mainCache.first?.offset == expected)
+        #expect(draftCache.first?.offset == expected)
         // The authoritative timeline rewound with the entries, not behind them.
-        #expect(iterator.mainCacheStorage.processedTokenCount == expectedMain)
-        #expect(iterator.draftCacheStorage.processedTokenCount == expectedDraft)
+        #expect(iterator.mainCacheStorage.processedTokenCount == expected)
+        #expect(iterator.draftCacheStorage.processedTokenCount == expected)
         #expect(iterator.mainCacheStorage.nativeAttentionOffsetsAreAligned)
         #expect(iterator.draftCacheStorage.nativeAttentionOffsetsAreAligned)
     }

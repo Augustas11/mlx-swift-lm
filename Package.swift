@@ -43,6 +43,9 @@ let package = Package(
         .library(
             name: "IntegrationTestHelpers",
             targets: ["IntegrationTestHelpers"]),
+        .library(
+            name: "MLXScriptedLM",
+            targets: ["MLXScriptedLM"]),
     ],
     traits: [
         // Gates the MLXLanguageModel adapter for Apple's FoundationModels
@@ -85,7 +88,13 @@ let package = Package(
         // same process can submit while the first waits. Recursive entry, a
         // CPU stream and a failed asynchronous schedule keep the locked path.
         // Core is unchanged from .24.
-        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "12d26ef6c6d65ba3a265a2b65c3c9380d9c22bd7"),
+        // mlx-swift 0.33.0-macprovider.26 is upstream 0.33.0 plus the fork's
+        // layers above (rebased), ml-explore/mlx-swift #522 (asMTLBuffer on a
+        // zero-size array), mlx-c 0.8.0 with the reference-prefill entry point,
+        // and core v0.32.4-macprovider.16: .15 plus ml-explore/mlx #4883 (do not
+        // wire user-provided buffers), #4881 (MetalAllocator::malloc(0)) and
+        // #4930 (no allocation inside quantize_impl).
+        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "761da5c42a7f9ef0d27dabdab03d52750b63f748"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
@@ -175,6 +184,18 @@ let package = Package(
             path: "Libraries/IntegrationTestHelpers",
             exclude: ["README.md"]
         ),
+
+        // Scripted tokenizers and models
+        .target(
+            name: "MLXScriptedLM",
+            dependencies: [
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Libraries/MLXScriptedLM",
+            exclude: ["README.md"]
+        ),
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
@@ -186,6 +207,7 @@ let package = Package(
                 "MLXVLM",
                 "MLXEmbedders",
                 "MLXRerankers",
+                "MLXScriptedLM",
             ],
             path: "Tests/MLXLMTests",
             exclude: [
@@ -283,7 +305,10 @@ let package = Package(
                 "MLXCXGrammar",
                 .product(name: "MLX", package: "mlx-swift"),
             ],
-            path: "Libraries/MLXGuidedGeneration"
+            path: "Libraries/MLXGuidedGeneration",
+            exclude: [
+                "README.md"
+            ]
         ),
         // Bridges Apple's FoundationModels framework to MLX-powered on-device
         // inference. Public surface is gated by @available(macOS 27 / iOS 27 /
@@ -303,7 +328,10 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
             ],
-            path: "Libraries/MLXFoundationModels"
+            path: "Libraries/MLXFoundationModels",
+            exclude: [
+                "README.md"
+            ]
         ),
         .testTarget(
             name: "MLXFoundationModelsTests",
@@ -338,6 +366,7 @@ let package = Package(
                 "MLXGuidedGeneration",
                 "MLXLMCommon",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
             ],
             path: "Tests/MLXGuidedGenerationTests"
         ),

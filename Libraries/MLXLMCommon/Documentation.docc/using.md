@@ -57,6 +57,14 @@ You can look at <doc:#Integration-Packages> implementations for examples
 of how to write these -- there are only a few properties and methods
 and they typically have trivial mappings to the concrete implementation.
 
+A tokenizer can override ``Tokenizer/makeStreamingDetokenizer()`` to provide its
+own incremental decoder. The default returns ``NaiveStreamingDetokenizer``.
+Each call must create independent state and preserve special tokens used by tool
+and reasoning parsers. Emit only stable text from `next()`; return any remaining
+text from ``StreamingDetokenizer/finish()``. Generation flushes the decoder before
+finishing downstream parsers, and framed protocols start a fresh decoder for each
+payload. A consumer that stops early can discard the remaining state.
+
 This example shows adapting `HuggingFace.HubClient` to the `Downloader` protocol:
 
 ```swift
@@ -203,7 +211,7 @@ Beyond that, chose one of the 3 integration methods and add either the adapter p
 In your Package.swift add a reference to mlx-swift-lm, chosing either the `main` branch or something that tracks versions:
 
 ```swift
-.package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.3")),
+.package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "3.32.3")),
 ```
 
 Beyond that, chose one of the 3 integration methods and add either the adapter packages OR the implementation packages if using macros/local implemenentation.  See <doc#Integration-Packages>.

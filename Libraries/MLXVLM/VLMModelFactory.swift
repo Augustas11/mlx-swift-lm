@@ -82,7 +82,7 @@ private func create<C: Decodable, P>(
 
 /// Registry of model type, e.g 'llama', to functions that can instantiate the model from configuration.
 ///
-/// Typically called via ``VLMModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
+/// Typically called via ``VLMModelFactory/load(from:using:configuration:useLatest:progress:)``.
 public enum VLMTypeRegistry {
 
     /// Shared instance with default model types.
@@ -98,10 +98,14 @@ public enum VLMTypeRegistry {
                 JSONDecoder.json5().decode(PrismHadamardQwen35Configuration.self, from: data))
         },
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
+        "qwen3_8": create(Qwen35Configuration.self, Qwen35.init),
+        "qwen3_8_moe": create(Qwen35Configuration.self, Qwen35MoE.init),
+        "prism_hadamard_qwen35": createPrismHadamardQwen35Model,
         "idefics3": create(Idefics3Configuration.self, Idefics3.init),
         "gemma3": create(Gemma3Configuration.self, Gemma3.init),
         "gemma4": create(Gemma4Configuration.self, Gemma4.init),
         "gemma4_unified": create(Gemma4UnifiedConfiguration.self, Gemma4Unified.init),
+        "diffusion_gemma": create(DiffusionGemmaVLMConfiguration.self, DiffusionGemma.init),
         "smolvlm": create(SmolVLM2Configuration.self, SmolVLM2.init),
         "fastvlm": create(FastVLMConfiguration.self, FastVLM.init),
         "llava_qwen2": create(FastVLMConfiguration.self, FastVLM.init),
@@ -126,6 +130,14 @@ public enum VLMProcessorTypeRegistry {
             Qwen25VLProcessorConfiguration.self, Qwen25VLProcessor.init),
         "Qwen3VLProcessor": create(
             Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
+        "Qwen3_5VLProcessor": create(
+            Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
+        "Qwen3_5_VLProcessor": create(
+            Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
+        "Qwen3_8VLProcessor": create(
+            Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
+        "Qwen3_8_VLProcessor": create(
+            Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
         "Idefics3Processor": create(
             Idefics3ProcessorConfiguration.self, Idefics3Processor.init),
         "Gemma3Processor": create(
@@ -134,6 +146,8 @@ public enum VLMProcessorTypeRegistry {
             Gemma4ProcessorConfiguration.self, Gemma4Processor.init),
         "Gemma4UnifiedProcessor": create(
             Gemma4UnifiedProcessorConfiguration.self, Gemma4UnifiedProcessor.init),
+        "DiffusionGemma4Processor": create(
+            DiffusionGemma4ProcessorConfiguration.self, DiffusionGemma4Processor.init),
         "SmolVLMProcessor": create(
             SmolVLMProcessorConfiguration.self, SmolVLMProcessor.init),
         "FastVLMProcessor": create(
@@ -253,6 +267,12 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<turn|>"]
     )
 
+    static public let diffusionGemma_26BA4B_it_mxfp4 = ModelConfiguration(
+        id: "mlx-community/diffusiongemma-26B-A4B-it-mxfp4",
+        defaultPrompt: "Describe the image in English",
+        extraEOSTokens: ["<end_of_turn>"]
+    )
+
     static public let smolvlm = ModelConfiguration(
         id: "HuggingFaceTB/SmolVLM2-500M-Video-Instruct-mlx",
         defaultPrompt:
@@ -276,16 +296,30 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
         extraEOSTokens: ["<|im_end|>"]
     )
 
+    static public let qwen3_8_27B_4bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.8-27B-4bit",
+        defaultPrompt: "Describe the image in English",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
+    static public let qwen3_8_27B_8bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.8-27B-8bit",
+        defaultPrompt: "Describe the image in English",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
+    static public let bonsai2_27B_ternary_2bit = ModelConfiguration(
+        id: "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
+        defaultPrompt: "Describe the image in English",
+        extraEOSTokens: ["<|im_end|>"]
+    )
+
     static public let museGlimmer30B4bit = ModelConfiguration(
         id: "mlx-community/Muse-Glimmer-30B-4bit",
         defaultPrompt: "Describe the image in English",
         extraEOSTokens: ["<|eot|>", "<|end_of_text|>"],
         toolCallFormat: .atem,
-        reasoningConfig: ReasoningConfig(
-            startDelimiter: "to=self<|message|>",
-            endDelimiter: "<|eom|>",
-            promptStrategy: .none,
-            isSpecialToken: true)
+        reasoningConfig: OnyxReasoningProtocol.glimmer
     )
 
     static public func all() -> [ModelConfiguration] {
@@ -302,11 +336,15 @@ public class VLMRegistry: AbstractModelRegistry, @unchecked Sendable {
             gemma4_E2B_it_4bit,
             gemma4_E4B_it_4bit,
             gemma4_26BA4B_it_4bit,
+            diffusionGemma_26BA4B_it_mxfp4,
             gemma4_31B_it_4bit,
             smolvlm,
             fastvlm,
             qwen3_5_27B_4bit,
             qwen3_5_35B_A3B_4bit,
+            qwen3_8_27B_4bit,
+            qwen3_8_27B_8bit,
+            bonsai2_27B_ternary_2bit,
             museGlimmer30B4bit,
         ]
     }
@@ -456,9 +494,17 @@ public final class VLMModelFactory: GenericModelFactory {
             eosTokenIds = Set(genEosIds)  // Override per Python mlx-lm behavior
         }
 
+        // Honor `suppress_tokens` from generation_config.json (transformers'
+        // SuppressTokensLogitsProcessor): merge into the model's suppressed
+        // token IDs so the token iterators mask them during sampling.
+        mergeGenerationConfigSuppressedTokens(generationConfig, into: model)
+
         var mutableConfiguration = configuration
         mutableConfiguration.eosTokenIds = eosTokenIds
         mutableConfiguration.stopStrings.formUnion(generationConfig?.stopStrings ?? [])
+        if mutableConfiguration.generationConfig == nil {
+            mutableConfiguration.generationConfig = generationConfig
+        }
 
         // Chat conventions. An explicit value on the configuration wins, followed
         // by a registered resolver that sees the repo id. Checkpoint metadata then
@@ -498,7 +544,8 @@ public final class VLMModelFactory: GenericModelFactory {
         try await loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization,
-            weightFileSelection: configuration.weightFileSelection)
+            weightFileSelection: configuration.weightFileSelection,
+            excludedComponents: configuration.excludedComponents)
 
         let tokenizer = try await tokenizerTask
         try model.validate(tokenizer: tokenizer)
@@ -542,7 +589,8 @@ public final class VLMModelFactory: GenericModelFactory {
             eosTokenIds: mutableConfiguration.eosTokenIds,
             toolCallFormat: mutableConfiguration.toolCallFormat,
             reasoningConfig: mutableConfiguration.reasoningConfig,
-            messageGenerator: mutableConfiguration.messageGenerator)
+            messageGenerator: mutableConfiguration.messageGenerator,
+            generationConfig: mutableConfiguration.generationConfig)
 
         return .init(
             configuration: modelConfig, model: model, processor: processor,

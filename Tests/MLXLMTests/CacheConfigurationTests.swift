@@ -123,6 +123,29 @@ private func legacyStatus(cache: [KVCache], maxKVSize: Int) throws -> KVCacheSta
     #expect(status.layers[4].path == [3, 1])
 }
 
+@Test func cacheStatusReportsAllocatedMemory() {
+    func attention() -> KVCacheSimple {
+        let cache = KVCacheSimple()
+        let tokens = MLXArray.zeros([1, 2, 3, 8])
+        _ = cache.update(keys: tokens, values: tokens)
+        return cache
+    }
+    let recurrent = MambaCache()
+    recurrent[0] = MLXArray.zeros([1, 3, 16])
+    recurrent[1] = MLXArray.zeros([1, 2, 4, 8])
+
+    let status = KVCacheStatus(
+        cache: [attention(), KVCacheSimple(), CacheList(recurrent, attention())])
+
+    // Three tokens reserve a whole step of rows for keys and for values.
+    let attentionBytes = 2 * (2 * KVCacheSimple().step * 8) * 4
+    let recurrentBytes = (3 * 16 + 2 * 4 * 8) * 4
+    #expect(
+        status.layers.map(\.memoryBytes)
+            == [attentionBytes, 0, recurrentBytes, attentionBytes])
+    #expect(status.memoryBytes == 2 * attentionBytes + recurrentBytes)
+}
+
 // MARK: - Default LanguageModel path
 
 @Test func defaultLanguageModelHonorsMaxKVSize() throws {
@@ -363,6 +386,49 @@ private func legacyStatus(cache: [KVCache], maxKVSize: Int) throws -> KVCacheSta
     for cache in unbounded where !(cache is MambaCache) {
         #expect(cache is KVCacheSimple)
         #expect(cache.maxSize == nil)
+    }
+}
+
+/// Deliberately uses a normal import: applications need these dimensions
+/// before running either the target or the drafter.
+@Suite struct Qwen35PublicConfigurationTests {
+    @Test(arguments: [false, true])
+    func targetAndDrafterExposeReadOnlyGeometry(moe: Bool) throws {
+        let json = """
+            {"model_type":"qwen3_5","text_config":{
+              "hidden_size":16,"num_hidden_layers":2,"intermediate_size":32,
+              "num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,
+              "linear_num_value_heads":2,"linear_num_key_heads":1,"linear_key_head_dim":32,
+              "linear_value_head_dim":8,"linear_conv_kernel_dim":2,"vocab_size":64,
+              "full_attention_interval":2,"mtp_num_hidden_layers":1,
+              "num_experts":\(moe ? 4 : 0),"num_experts_per_tok":\(moe ? 2 : 0),
+              "shared_expert_intermediate_size":16,"moe_intermediate_size":24}}
+            """
+        let configuration = try JSONDecoder().decode(
+            Qwen35Configuration.self, from: Data(json.utf8))
+        let target: Qwen35Model = moe ? Qwen35MoEModel(configuration) : Qwen35Model(configuration)
+        let textTarget = Qwen35TextModel(target.configuration)
+        let drafter = Qwen35MTPDraftModel(target.configuration)
+        for geometry in [target.configuration, textTarget.configuration, drafter.configuration] {
+            #expect(geometry.hiddenSize == 16)
+            #expect(geometry.hiddenLayers == 2)
+            #expect(geometry.intermediateSize == 32)
+            #expect(geometry.attentionHeads == 2)
+            #expect(geometry.kvHeads == 1)
+            #expect(geometry.headDim == 8)
+            #expect(geometry.linearNumValueHeads == 2)
+            #expect(geometry.linearNumKeyHeads == 1)
+            #expect(geometry.linearKeyHeadDim == 32)
+            #expect(geometry.linearValueHeadDim == 8)
+            #expect(geometry.linearConvKernelDim == 2)
+            #expect(geometry.vocabularySize == 64)
+            #expect(geometry.resolvedLayerTypes == ["linear_attention", "full_attention"])
+            #expect(geometry.mtpNumHiddenLayers == 1)
+            #expect(geometry.numExperts == (moe ? 4 : 0))
+            #expect(geometry.numExpertsPerTok == (moe ? 2 : 0))
+            #expect(geometry.sharedExpertIntermediateSize == 16)
+            #expect(geometry.moeIntermediateSize == 24)
+        }
     }
 }
 

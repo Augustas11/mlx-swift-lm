@@ -134,9 +134,9 @@ struct RerankerTests {
         let reranker = makeConstantReranker(
             scoreKind: .normalizedRelevance, scores: [0.5])
         let task = Task {
-            try await reranker.scores(query: "q", documents: ["d"])
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await reranker.scores(query: "q", documents: ["d"])
         }
-        task.cancel()
 
         await #expect(throws: CancellationError.self) {
             try await task.value
@@ -212,6 +212,28 @@ struct RerankerTests {
         #expect(configuration.encoderRerankerConfiguration.padTokenID == 1)
         #expect(configuration.encoderRerankerConfiguration.maxInputTokens == 8_192)
         #expect(configuration.encoderRerankerConfiguration.scoreKind == .normalizedRelevance)
+    }
+
+    @Test func bertConfigurationRejectsDuplicateIDToLabelKeys() throws {
+        #expect(throws: DecodingError.self) {
+            try decodeBertConfiguration(
+                modelType: "bert",
+                architecture: "BertModel",
+                labels: 2,
+                padTokenID: 0,
+                maxPositionEmbeddings: 32,
+                stringIDToLabel: ["1": "pos", "01": "also-pos"])
+        }
+
+        let configuration = try decodeBertConfiguration(
+            modelType: "bert",
+            architecture: "BertModel",
+            labels: 2,
+            padTokenID: 0,
+            maxPositionEmbeddings: 32,
+            idToLabel: [0: "irrelevant", 1: "relevant"])
+
+        #expect(configuration.idToLabel == [0: "irrelevant", 1: "relevant"])
     }
 
     @Test func encoderConfigurationUsesDeclaredPositiveLabel() throws {
@@ -568,6 +590,30 @@ struct RerankerTests {
         #expect(scores[0] <= 1)
     }
 
+    @Test(arguments: [DType.bfloat16, .float16, .float32])
+    func jinaCosineSimilarityUsesFloat32Reductions(dtype: DType) {
+        let query = MLXArray([Float(1), 2, 3]).reshaped(1, 3).asType(dtype)
+        let documents = MLXArray([Float(3), 2, 1, -3, -2, -1, 0, 0, 0])
+            .reshaped(3, 3).asType(dtype)
+
+        let output = jinaCosineSimilarity(documents, query)
+        let scores = output.asArray(Float.self)
+
+        #expect(output.dtype == .float32)
+        #expect(abs(scores[0] - 10.0 / 14.0) < 1e-6)
+        #expect(abs(scores[1] + 10.0 / 14.0) < 1e-6)
+        #expect(scores[2] == 0)
+    }
+
+    @Test(arguments: [Float(1e-5), 1e3])
+    func jinaCosineSimilarityAvoidsFloat16UnderflowAndOverflow(scale: Float) {
+        let vector = (MLXArray([Float(1), 2, 3]) * scale).reshaped(1, 3).asType(.float16)
+        let score = jinaCosineSimilarity(vector, vector).item(Float.self)
+
+        #expect(score.isFinite)
+        #expect(abs(score - 1) < 1e-6)
+    }
+
     @Test func causalScoringUsesMicroBatchesAndReturnsNormalizedRelevance() async throws {
         let tokenizer = ByteRerankerTokenizer()
         let model = TestCausalRerankerModel(
@@ -585,6 +631,14 @@ struct RerankerTests {
         #expect(scores.count == 3)
         #expect(model.callCount == 2)
         #expect(scores.allSatisfy { $0 >= 0 && $0 <= 1 })
+
+        let singletonScores = try await container.causalRerankerScores(
+            query: "q",
+            documents: ["a", "bbbb", "cc"],
+            instruction: nil,
+            maxInputTokens: 8_192,
+            options: .init(maxBatchSize: 1, maxBatchTokens: 4_096))
+        #expect(scores == singletonScores)
     }
 
     @Test func causalTokenBudgetTruncatesOversizedSingleton() async throws {
@@ -602,6 +656,78 @@ struct RerankerTests {
             options: .init(maxBatchTokens: 512))
 
         #expect(model.callShapes == [[1, 512]])
+    }
+
+    @Test(arguments: [false, true], [false, true])
+    func qwenFinalTokenLogitsMatchFullProjection(tied: Bool, quantized: Bool) throws {
+        let configuration = try JSONDecoder().decode(
+            MLXLLM.Qwen3Configuration.self,
+            from: Data(
+                """
+                {
+                  "vocab_size": 128, "hidden_size": 64, "num_hidden_layers": 2,
+                  "intermediate_size": 128, "num_attention_heads": 4,
+                  "num_key_value_heads": 2, "head_dim": 16, "rms_norm_eps": 1e-6,
+                  "tie_word_embeddings": \(tied)
+                }
+                """.utf8))
+
+        for dtype: DType in [.float32, .float16] {
+            let model = withRandomState(MLXRandom.RandomState(seed: 42)) {
+                MLXLLM.Qwen3Model(configuration)
+            }
+            model.apply { $0.dtype.isFloatingPoint ? $0.asType(dtype) : $0 }
+            if quantized {
+                quantize(model: model, groupSize: 32, bits: 4)
+            }
+            for lengths in [[1], [1, 3, 8], [8, 4, 8]] {
+                let width = lengths.max() ?? 1
+                let rows = lengths.enumerated().map { row, length in
+                    (0 ..< width).map { column in
+                        column < length ? (row * 13 + column * 7 + 1) % 128 : 0
+                    }
+                }
+                let tokens = MLXArray(rows.flatMap { $0 }).reshaped(lengths.count, width)
+                let full = model(tokens, cache: nil)
+                let expected = stacked(
+                    lengths.enumerated().map { row, length in full[row, length - 1] })
+                let hidden = model.hiddenStates(tokens, cache: nil)
+                let actual = model.projectLogits(
+                    stacked(lengths.enumerated().map { row, length in hidden[row, length - 1] }))
+
+                #expect(actual.shape == [lengths.count, 128])
+                let tolerance: Float = dtype == .float16 ? 0.02 : 0.0001
+                #expect(abs(actual - expected).max().item(Float.self) < tolerance)
+            }
+        }
+    }
+
+    @Test func causalScoringProjectsFinalTokensAndKeepsSingletonPrefill() async throws {
+        let tokenizer = ByteRerankerTokenizer()
+        let container = makeModelContainer(
+            model: TestHiddenStateRerankerModel(tokenizer: tokenizer), tokenizer: tokenizer)
+        let reference = makeModelContainer(
+            model: TestCausalRerankerModel(
+                trueTokenID: tokenizer.trueTokenID, falseTokenID: tokenizer.falseTokenID),
+            tokenizer: tokenizer)
+        let documents = ["bbbb", "a", String(repeating: "c", count: 1_000)]
+        let options = RerankExecutionOptions(maxBatchSize: 2, maxBatchTokens: 1_024)
+
+        let actual = try await container.causalRerankerScores(
+            query: "q", documents: documents, instruction: nil,
+            maxInputTokens: 512, options: options)
+        let expected = try await reference.causalRerankerScores(
+            query: "q", documents: documents, instruction: nil,
+            maxInputTokens: 512, options: options)
+        let calls = try await container.perform { context in
+            let model = try #require(context.model as? TestHiddenStateRerankerModel)
+            return (model.hiddenStateShapes, model.projectedShapes, model.fullForwardShapes)
+        }
+
+        #expect(actual == expected)
+        #expect(calls.0.map(\.first) == [2])
+        #expect(calls.1 == [[2, 128]])
+        #expect(calls.2 == [[1, 512]])
     }
 
     @Test func jinaFactoryRegistrationUsesArchitecture() async throws {
@@ -702,6 +828,7 @@ private func bertConfigurationData(
     padTokenID: Int,
     maxPositionEmbeddings: Int,
     idToLabel: [Int: String] = [:],
+    stringIDToLabel: [String: String] = [:],
     labelToID: [String: Int] = [:],
     includeNumLabels: Bool = true,
     numLayers: Int = 1
@@ -721,7 +848,9 @@ private func bertConfigurationData(
     if includeNumLabels {
         configuration["num_labels"] = labels
     }
-    if !idToLabel.isEmpty {
+    if !stringIDToLabel.isEmpty {
+        configuration["id2label"] = stringIDToLabel
+    } else if !idToLabel.isEmpty {
         configuration["id2label"] = Dictionary(
             uniqueKeysWithValues: idToLabel.map { (String($0.key), $0.value) })
     }
@@ -737,7 +866,8 @@ private func decodeBertConfiguration(
     labels: Int,
     padTokenID: Int,
     maxPositionEmbeddings: Int,
-    idToLabel: [Int: String] = [:]
+    idToLabel: [Int: String] = [:],
+    stringIDToLabel: [String: String] = [:]
 ) throws -> BertConfiguration {
     try JSONDecoder().decode(
         BertConfiguration.self,
@@ -747,7 +877,8 @@ private func decodeBertConfiguration(
             labels: labels,
             padTokenID: padTokenID,
             maxPositionEmbeddings: maxPositionEmbeddings,
-            idToLabel: idToLabel))
+            idToLabel: idToLabel,
+            stringIDToLabel: stringIDToLabel))
 }
 
 private func decodeQwenConfiguration() throws -> MLXLLM.Qwen3Configuration {
@@ -957,6 +1088,45 @@ private final class TestEncoderRerankerModel: Module, RerankerModel, @unchecked 
     }
 }
 
+/// Uses the reference logits as hidden states, so projection is the identity.
+private final class TestHiddenStateRerankerModel: Module, HiddenStateLanguageModel {
+    private let base: TestCausalRerankerModel
+    private(set) var hiddenStateShapes = [[Int]]()
+    private(set) var projectedShapes = [[Int]]()
+    private(set) var fullForwardShapes = [[Int]]()
+
+    init(tokenizer: ByteRerankerTokenizer) {
+        base = TestCausalRerankerModel(
+            trueTokenID: tokenizer.trueTokenID, falseTokenID: tokenizer.falseTokenID)
+    }
+
+    func hiddenStates(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let hidden = base(.init(tokens: inputs), cache: cache, state: nil).logits
+        hiddenStateShapes.append(hidden.shape)
+        return hidden
+    }
+
+    func projectLogits(_ hiddenStates: MLXArray) -> MLXArray {
+        projectedShapes.append(hiddenStates.shape)
+        return hiddenStates
+    }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        fullForwardShapes.append(input.tokens.shape)
+        return base(input, cache: cache, state: state)
+    }
+
+    func newCache(parameters: GenerateParameters?) -> [KVCache] { [] }
+}
+
 private final class TestCausalRerankerModel: Module, LanguageModel, ListwiseRerankerModel,
     @unchecked Sendable
 {
@@ -1001,7 +1171,7 @@ private final class TestCausalRerankerModel: Module, LanguageModel, ListwiseRera
         for row in 0 ..< batchSize {
             var runningTotal = 0
             for column in 0 ..< sequenceLength {
-                runningTotal += tokenValues[row * sequenceLength + column]
+                runningTotal += tokenValues[row * sequenceLength + column] + 1
                 let offset = (row * sequenceLength + column) * vocabularySize
                 values[offset + trueTokenID] = Float(runningTotal % 100) / 20
                 values[offset + falseTokenID] = 0

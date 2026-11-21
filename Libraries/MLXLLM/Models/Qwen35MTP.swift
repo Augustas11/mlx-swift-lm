@@ -17,6 +17,10 @@ final class Qwen35MTPPredictor: Module {
         var mtpArgs = args
         mtpArgs.hiddenLayers = max(args.mtpNumHiddenLayers, 1)
         mtpArgs.fullAttentionInterval = 1
+        let layerTypes = Array(
+            repeating: HybridAttentionSchedule.fullAttention, count: mtpArgs.hiddenLayers)
+        mtpArgs.layerTypes = layerTypes
+        mtpArgs.resolvedLayerTypes = layerTypes
 
         if args.mtpUseDedicatedEmbeddings {
             _embedTokens.wrappedValue = Embedding(
@@ -84,38 +88,74 @@ final class Qwen35MTPPredictor: Module {
     }
 }
 
-public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
+public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel, ResumableMTPDrafterModel {
     public let configuration: Qwen35TextConfiguration
     public let maximumBlockSize: Int? = 2
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = true
-    private let preconvertedNorms: Bool
-    private let standaloneCheckpoint: Bool
+    private let checkpointPolicy: Qwen35CheckpointPolicy
 
     @ModuleInfo(key: "mtp") var mtp: Qwen35MTPPredictor
 
-    public init(
+    public convenience init(
         _ configuration: Qwen35TextConfiguration,
-        preconvertedNorms: Bool = false,
-        standaloneCheckpoint: Bool = false
+        preconvertedNorms: Bool = false
+    ) {
+        self.init(
+            configuration,
+            checkpointPolicy: .init(
+                modelType: configuration.modelType,
+                preconvertedNorms: preconvertedNorms))
+    }
+
+    private init(
+        _ configuration: Qwen35TextConfiguration, checkpointPolicy: Qwen35CheckpointPolicy
     ) {
         self.configuration = configuration
-        self.preconvertedNorms = preconvertedNorms
-        self.standaloneCheckpoint = standaloneCheckpoint
+        self.checkpointPolicy = checkpointPolicy
         _mtp.wrappedValue = Qwen35MTPPredictor(configuration)
         super.init()
     }
 
     public convenience init(
         _ configuration: Qwen35Configuration,
-        preconvertedNorms: Bool = false,
-        standaloneCheckpoint: Bool = false
+        preconvertedNorms: Bool = false
     ) {
         self.init(
             configuration.textConfig,
-            preconvertedNorms: preconvertedNorms,
-            standaloneCheckpoint: standaloneCheckpoint)
+            checkpointPolicy: .init(
+                modelType: configuration.modelType,
+                preconvertedNorms: preconvertedNorms))
+    }
+
+    public func validateCompatibility(with target: any LanguageModel) throws {
+        let targetConfiguration: Qwen35TextConfiguration
+        switch target {
+        case let target as Qwen35Model:
+            targetConfiguration = target.languageModel.configuration
+        case let target as Qwen35TextModel:
+            targetConfiguration = target.configuration
+        default:
+            throw MTPDrafterCompatibilityError.incompatibleTarget(
+                drafter: "Qwen35MTPDraftModel",
+                expected: "a Qwen3.5 text target",
+                actual: String(describing: type(of: target))
+            )
+        }
+
+        guard
+            targetConfiguration.hiddenSize == configuration.hiddenSize,
+            targetConfiguration.vocabularySize == configuration.vocabularySize
+        else {
+            throw MTPDrafterCompatibilityError.incompatibleTarget(
+                drafter: "Qwen35MTPDraftModel",
+                expected: "a Qwen3.5 text target with hidden size \(configuration.hiddenSize) "
+                    + "and vocabulary size \(configuration.vocabularySize)",
+                actual: "\(type(of: target)) with hidden size \(targetConfiguration.hiddenSize) "
+                    + "and vocabulary size \(targetConfiguration.vocabularySize)"
+            )
+        }
     }
 
     public func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
@@ -152,6 +192,57 @@ public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
             hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
             lmHead: lmHead, sampler: sampler)
         state.proposalAppended = 0
+    }
+
+    public func finalizeDrafterState(
+        target _: any LanguageModel,
+        targetBoundaryHidden _: MLXArray,
+        targetProcessedTokenCount: Int,
+        discardedTargetTokens: Int,
+        positionDeltas _: MLXArray?,
+        state: inout MTPDrafterState
+    ) -> Bool {
+        finalizeShiftedMTPDrafterState(
+            targetProcessedTokenCount: targetProcessedTokenCount,
+            discardedTargetTokens: discardedTargetTokens,
+            state: &state)
+    }
+
+    public func resumeDrafterState(
+        target: any LanguageModel,
+        suffixTokens: MLXArray,
+        suffixTargetHidden: MLXArray,
+        targetBoundaryHidden: MLXArray,
+        firstBonus: MLXArray,
+        positionDeltas _: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    ) -> Bool {
+        let suffix = normalizedMTPTokenBatch(suffixTokens)
+        let suffixLength = suffix.dim(-1)
+        guard suffixLength > 0,
+            suffixTargetHidden.dim(1) >= suffixLength,
+            targetBoundaryHidden.dim(1) == 1,
+            state.proposalAppended == 0,
+            state.cache.allSatisfy({ $0.offset == state.nextPosition })
+        else { return false }
+
+        let (targetEmbedTokens, lmHead) = targetEmbeddingAndHead(target)
+        let inputEmbedding = mtp.embedTokens ?? targetEmbedTokens
+        let tokens = concatenated(
+            [suffix, normalizedMTPColumn(firstBonus)], axis: 1)
+        let hiddens = concatenated(
+            [targetBoundaryHidden, suffixTargetHidden[0..., ..<suffixLength, 0...]], axis: 1)
+        let mtpHidden = mtp(
+            inputsEmbeds: inputEmbedding(tokens), hiddenStates: hiddens,
+            cache: state.cache, positionOffset: state.nextPosition)
+        state.nextPosition += tokens.dim(1)
+        state.seedHidden = mtpHidden[0..., (-1)..., 0...]
+        state.seedToken = sampleMTPSeed(
+            hidden: state.seedHidden!, targetEmbedTokens: targetEmbedTokens,
+            lmHead: lmHead, sampler: sampler)
+        state.proposalAppended = 0
+        return state.cache.allSatisfy { $0.offset == state.nextPosition }
     }
 
     public func draftBlock(
@@ -384,14 +475,24 @@ public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
         return MTPPackedDrafterAdvanceResult(states: states, proposals: proposals)
     }
 
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        qwenMTPSanitizeWeights(
-            weights: weights,
-            mtpNumHiddenLayers: configuration.mtpNumHiddenLayers,
-            numExperts: configuration.numExperts,
-            shiftNormWeights: !preconvertedNorms,
-            standaloneCheckpoint: standaloneCheckpoint
-        )
+    public var excludedCheckpointNamespaces: [String] {
+        checkpointPolicy.excludedCheckpointNamespaces
+    }
+
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        try checkpointPolicy.prepare(
+            checkpoint, mtpNumHiddenLayers: configuration.mtpNumHiddenLayers,
+            numExperts: configuration.numExperts)
+    }
+
+    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        try sanitize(weights: weights, metadata: [:])
+    }
+
+    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws -> [String:
+        MLXArray]
+    {
+        try prepareCheckpoint(.init(weights: weights, metadata: metadata)).weights
     }
 
     private func targetEmbeddingAndHead(_ target: any LanguageModel) -> (Embedding, Linear?) {
@@ -403,5 +504,11 @@ public final class Qwen35MTPDraftModel: Module, MTPPackedStatefulDrafterModel {
         }
         fatalError(
             "Qwen35MTPDraftModel requires a Qwen35 target, got \(type(of: target))")
+    }
+}
+
+extension Qwen35MTPDraftModel: ModelConversionMetadataProvider {
+    public var modelConversionMetadata: [String: String] {
+        [Qwen35CheckpointPolicy.normMetadataKey: "scale"]
     }
 }

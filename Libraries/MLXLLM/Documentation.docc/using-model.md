@@ -16,10 +16,14 @@ let modelFactory: ModelFactory
 // e.g. LLMRegistry.llama3_8B_4bit
 let modelConfiguration: ModelConfiguration
 
-// e.g. TokenizersLoader() from MLXLMTokenizers
+// e.g. #hubDownloader() from MLXHuggingFace
+let downloader: any Downloader
+
+// e.g. #huggingFaceTokenizerLoader() from MLXHuggingFace
 let tokenizerLoader: any TokenizerLoader
 
 let container = try await modelFactory.loadContainer(
+    from: downloader,
     using: tokenizerLoader,
     configuration: modelConfiguration
 )
@@ -77,6 +81,41 @@ The returned `LoRAModelMetadata.defaultKeys` come from the registered model arch
 not from safetensors names. This accounts for models that rename or reshape checkpoint weights
 while loading.
 
+### LFM2.5 DSpark speculative decoding
+
+Liquid AI's DSpark checkpoints are block drafters rather than standalone
+language models. Register the draft architecture, load the target and its
+matching draft checkpoint, then use the MTP generation overload:
+
+```swift
+await LFM2DSparkRegistration.register()
+
+let target = try await LLMModelFactory.shared.load(
+    from: targetDirectory,
+    using: tokenizerLoader
+)
+let draft = try await MTPDrafterModelFactory.shared.load(
+    from: draftDirectory,
+    using: tokenizerLoader
+)
+let input = try target.processor.prepare(input: UserInput(prompt: prompt))
+
+let stream = try generate(
+    input: input,
+    parameters: GenerateParameters(maxTokens: 256, temperature: 0),
+    context: target,
+    mtpDrafter: draft.model,
+    blockSize: 10
+)
+```
+
+The released 1.2B-Instruct, 2.6B, and 8B-A1B drafters are available from
+`MTPDrafterRegistry`. Each has a nine-token proposal block; the Swift
+iterator's `blockSize` includes the verifier bonus token, hence `10` above.
+DSpark currently requires greedy decoding (`temperature: 0`) so verification
+remains exact. Pair each draft with the target named in its model card; loading
+or running incompatible architecture dimensions fails closed.
+
 ## Evaluation Flow
 
 - Load the Model
@@ -118,10 +157,17 @@ let result = try await modelContainer.perform { [input] context in
 Given that `input` we can call `generate()` to produce a stream
 of tokens. In this example we use a `NaiveStreamingDetokenizer`
 to assist in converting a stream of tokens into text and print it.
-The stream is stopped after we hit a maximum number of tokens:
+The stream is stopped after we hit a maximum number of tokens.
+Call `finish()` on a manually managed detokenizer when generation ends to flush remaining text:
 
 ```
     var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
+    defer {
+        if let text = detokenizer.finish() {
+            print(text, terminator: "")
+            fflush(stdout)
+        }
+    }
 
     return try MLXLMCommon.generate(
         input: input, parameters: generateParameters, context: context

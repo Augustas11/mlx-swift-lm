@@ -180,6 +180,21 @@ public final class DeepseekV4DSparkDraftModel: Module, MTPPackedStatefulDrafterM
         })
     }
 
+    public func validateCompatibility(with target: any LanguageModel) throws {
+        guard let model = target as? DeepseekV4Model else {
+            throw MTPDrafterCompatibilityError.incompatibleTarget(
+                drafter: "DeepseekV4DSparkDraftModel", expected: "a DeepSeek V4 target",
+                actual: String(describing: type(of: target)))
+        }
+        guard model.mtp.count == configuration.dsparkStageCount, !model.mtp.isEmpty else {
+            throw MTPDrafterCompatibilityError.incompatibleTarget(
+                drafter: "DeepseekV4DSparkDraftModel",
+                expected: "a DeepSeek V4 target with \(configuration.dsparkStageCount) embedded "
+                    + "drafter stages",
+                actual: "\(model.mtp.count) stages")
+        }
+    }
+
     private func target(_ target: any LanguageModel) -> DeepseekV4Model {
         guard let target = target as? DeepseekV4Model,
             target.mtp.count == configuration.dsparkStageCount, !target.mtp.isEmpty

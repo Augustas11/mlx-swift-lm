@@ -190,6 +190,15 @@ public class DoRALinear: Linear, LoRALayer {
 }
 ```
 
+### Unsupported Base Layers
+
+The adapter layers copy the base layer's arrays, so they accept only a plain `Linear` or
+`QuantizedLinear`. Subclasses such as `HadamardQuantizedLinear` (Bonsai) and
+`RotateQuantizedLinear` (ParoQuant) rotate the input before the matmul, and a copy would drop
+that rotation. `load(into:)`, `fuse(with:)` and `LoRAContainer.from(model:configuration:)`
+throw `ModelAdapterError.unsupportedLayer(key:type:)` before they change the model. Calling
+`LoRALinear.from(linear:)` or `DoRALinear.from(linear:)` directly on such a layer traps.
+
 ## LoRAModel Protocol
 
 Models must conform to `LoRAModel` for adapter support:
@@ -237,8 +246,8 @@ public protocol LoRALayer: Module {
 ```swift
 // Load base model
 let container = try await LLMModelFactory.shared.loadContainer(
-    from: HubClient.default,
-    using: TokenizersLoader(),  // TokenizersLoader() from MLXLMTokenizers (swift-tokenizers-mlx)
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
     configuration: .init(id: "mlx-community/Llama-3.2-3B-Instruct-4bit")
 )
 

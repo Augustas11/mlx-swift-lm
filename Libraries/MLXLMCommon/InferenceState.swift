@@ -28,8 +28,7 @@ package struct InferenceStatePreparationReport {
     package var succeeded: Bool { failures.isEmpty }
 }
 
-private let inferenceStateLogger = Logger(
-    subsystem: "mlx-swift-lm", category: "inference-state")
+private let inferenceStateLogger = MLXLogger(label: "inference-state")
 
 /// Prepare a language model after checkpoint loading or an explicit topology
 /// update.
@@ -62,6 +61,9 @@ package func prepareInferenceState(
 ///
 /// All custom checkpoint loaders should finalize through this function so
 /// inference-only optimizations are applied consistently.
+///
+/// It also clears the MLX buffer cache. Tensors the load read and dropped, or that
+/// preparation replaced, would otherwise stay there until generation clears it.
 @discardableResult
 package func materializeModelForInference(
     _ model: BaseLanguageModel
@@ -76,5 +78,6 @@ package func materializeModelForInference(
     } else {
         eval(model)
     }
+    Memory.clearCache()
     return report
 }

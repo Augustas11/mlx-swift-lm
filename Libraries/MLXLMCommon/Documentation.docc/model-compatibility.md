@@ -35,6 +35,111 @@ A repository is a good candidate when the following are true:
 - The model fits the target machine's memory budget, including weights, KV
   cache, processor tensors, and prompt context.
 
+## Checkpoint Components And Name Mappings
+
+``BaseLanguageModel/prepareCheckpoint(_:)`` runs before quantization and strict
+parameter validation. Its ``ModelCheckpoint`` value keeps tensor names, per-file
+metadata, and per-layer quantization settings together. The loading sequence is:
+
+1. Read tensors with the metadata of the file that supplied each tensor.
+2. Select the requested component and normalize its names and tensor layout.
+3. Quantize runtime modules using the normalized layer settings.
+4. Update the model with strict parameter validation, then prepare it for inference.
+
+``CheckpointComponent`` declares accepted serialized namespaces, a runtime
+destination, and known sibling namespaces to exclude. It resolves exactly one
+embedded component. A root component requires an explicit standalone declaration
+from the model's configuration. Unknown paths remain for strict validation;
+missing or competing components fail before quantization.
+
+``CheckpointNameMapping`` applies ordered prefix replacements and module
+exclusions at complete path boundaries. Use ``ModelCheckpoint/mapNames(using:)``
+to apply these rules to tensors, source metadata, and layer settings together.
+``ModelCheckpoint/mapNames(_:)`` supports custom mappings with the same collision
+checks. Aliases cannot overwrite a tensor or a precision declaration.
+
+The shared loader has no architecture-specific namespace or conversion rules.
+Models describe their layouts through these value types and implement numeric
+transformations in ``BaseLanguageModel/prepareCheckpoint(_:)``. Gemma3n uses the
+same mapping API to remove its serialized wrapper while preserving layer
+precision. Qwen uses component selection for its MTP predictor. Existing models
+still use their sanitizer through the default implementation; migrate renaming
+sanitizers to the checkpoint hook so their precision declarations follow renames.
+
+Rotated checkpoints use the same hook. A Hadamard-rotated pack such as
+`prism_hadamard_qwen35` names its rotated layers in `config.json`.
+``HadamardQuantizedCheckpointPolicy`` replaces those layers with
+``HadamardQuantizedLinear`` and ``HadamardQuantizedEmbedding`` before the load.
+Its ``HadamardQuantizedCheckpointPolicy/prepare(_:)`` runs in the model's hook to
+check the sign vectors and cast the unpacked tensors, for on-demand components too.
+
+Qwen3.5 targets exclude the MTP component. Drafters accept embedded `mtp.*` and
+converted `language_model.mtp.*` components, and unprefixed heads declared as
+`qwen3_5_mtp`. An ordinary target without MTP weights is not a standalone head.
+Unknown tensors and missing parameters still fail strict loading.
+
+New Swift MTP conversions write `mlx_swift_lm.qwen_mtp.norm_convention=scale`.
+`offset` declares upstream zero-centered RMSNorm weights that require adding one;
+`scale` declares the runtime multiplicative weights. Explicit declarations take
+precedence. For existing exports, standalone heads and `language_model.mtp.*`
+use scales; `mtp.*` uses offsets unless its own file declares `format=mlx` or the
+caller sets `preconvertedNorms`. Metadata from a target shard does not classify
+a separate MTP shard. Conflicting norm declarations fail before model update.
+
+## Components That Load On First Use
+
+Some models have large parts that many sessions never use, such as the vision
+encoder of a VLM. Loading them is lazy, like `MLXArray` evaluation: nothing is
+read until an input needs it, and apps need no configuration.
+
+A model declares its parts through ``ModelComponentsProviding``. For each
+``ModelComponent``, it lists ``CheckpointComponent`` values whose destination is
+the path of a module and whose namespaces cover every serialized name of that
+module. It lists the parts that can load later as ``OnDemandComponent`` values,
+which live outside the module tree. Their destinations must be optional modules.
+
+Models that load the same checkpoints return the same components, so a family
+names its modules once. The loader then reads each part in one of three ways. An
+on-demand part loads on first use. A part whose module the model has loads with
+it. A part the model does not have is never read, such as the vision encoder of a
+VLM checkpoint that a text model loads:
+
+```swift
+package enum Gemma4Checkpoint {
+    package static let components: [ModelComponent: [CheckpointComponent]] = [
+        .vision: .modules("vision_tower", "vision_embedder", "embed_vision"),
+        .audio: .modules("audio_tower", "embed_audio"),
+    ]
+}
+
+extension Gemma4Model: ModelComponentsProviding {
+    public var modelComponents: [ModelComponent: [CheckpointComponent]] {
+        Gemma4Checkpoint.components
+    }
+}
+```
+
+Before reading the checkpoint, the loader removes the modules of each on-demand
+component and does not read its tensors. The first input that needs the
+component reads only its namespaces. Then the component goes through the same
+``BaseLanguageModel/prepareCheckpoint(_:)``, quantization, and strict validation
+as the model, and is evaluated. All of this happens under a lock, and the
+component is published only after that. The model's module tree does not change
+after the load, so sessions that share the model stay safe. Concurrent first uses
+share one load. The checkpoint files must stay readable until then.
+
+Model conversion loads with ``ComponentLoading/immediate`` because it saves every
+weight. It rebuilds modules that an earlier on-demand load removed. List an
+on-demand component in ``ModelConfiguration/excludedComponents`` to never load
+it. Inputs that need it then fail with an error. A built-in component still
+loads, and the loader logs a warning.
+
+``BaseLanguageModel/excludedCheckpointNamespaces`` is the same read filter for
+namespaces that a model never loads. An embedded Qwen MTP drafter excludes the
+target namespaces that its component selection drops, so it reads only its own
+tensors from a shared checkpoint. The Qwen 3.5 target excludes that head in turn.
+A file whose tensors are all excluded still supplies its metadata.
+
 ## Finding The Source Of Truth
 
 The model factories and registries are the authoritative compatibility list.

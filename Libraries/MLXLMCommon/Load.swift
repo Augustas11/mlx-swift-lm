@@ -129,18 +129,21 @@ private final class ConcurrentLoadState: @unchecked Sendable {
         if firstError == nil { firstError = error }
     }
 
-    /// Weights merged in file order (a later file overwrites a duplicate name, matching the
-    /// serial loader) and the first file's metadata.
-    func result() throws -> (weights: [String: MLXArray], metadata: [String: String]) {
+    /// Preserve file order and tensor metadata, including later-file-wins duplicates.
+    func result() throws -> ModelCheckpoint {
         lock.lock()
         defer { lock.unlock() }
         if let firstError { throw firstError }
         var weights = [String: MLXArray]()
-        for fileWeights in perFile {
+        var weightMetadata = [String: [String: String]]()
+        for (index, fileWeights) in perFile.enumerated() {
             weights.merge(fileWeights) { _, new in new }
+            for name in fileWeights.keys {
+                weightMetadata[name] = perFileMetadata[index]
+            }
         }
         let metadata = perFileMetadata.first { !$0.isEmpty } ?? [:]
-        return (weights, metadata)
+        return ModelCheckpoint(weights: weights, metadata: metadata, weightMetadata: weightMetadata)
     }
 }
 
@@ -154,10 +157,32 @@ private final class ConcurrentLoadState: @unchecked Sendable {
 func loadWeightArrays(urls: [URL], initialMaterializationPrefixes: [String]? = nil) throws -> (
     weights: [String: MLXArray], metadata: [String: String]
 ) {
+    let checkpoint = try loadModelCheckpoint(
+        urls: urls, initialMaterializationPrefixes: initialMaterializationPrefixes)
+    return (checkpoint.weights, checkpoint.metadata)
+}
+
+/// Tensors under `excludedNamespaces` are never read. A file that holds only excluded tensors
+/// still supplies its metadata.
+func loadModelCheckpoint(
+    urls: [URL], excludedNamespaces: [String] = [], initialMaterializationPrefixes: [String]? = nil
+) throws -> ModelCheckpoint {
+    let exclusions = CheckpointNameMapping(excludedNamespaces.map { .excludePrefix($0) })
+    return try loadModelCheckpoint(
+        urls: urls, initialMaterializationPrefixes: initialMaterializationPrefixes
+    ) { exclusions.mapName($0) != nil }
+}
+
+/// Only tensors whose names pass `isRead` are read. With `initialMaterializationPrefixes`,
+/// only tensors under those module prefixes are evaluated now; the rest stay lazy.
+func loadModelCheckpoint(
+    urls: [URL], initialMaterializationPrefixes: [String]? = nil,
+    isRead: @escaping @Sendable (String) -> Bool
+) throws -> ModelCheckpoint {
     struct WorkItem {
         let file: Int
         let url: URL
-        /// tensors this item evaluates; nil evaluates the whole file
+        /// tensors this item evaluates; nil evaluates every tensor in the file that is read
         let names: [String]?
     }
 
@@ -165,7 +190,7 @@ func loadWeightArrays(urls: [URL], initialMaterializationPrefixes: [String]? = n
         var spansPerFile = [[SafetensorSpan]?]()
         var totalBytes: Int64 = 0
         for url in urls {
-            let spans = try? safetensorSpansInFileOrder(url: url)
+            let spans = (try? safetensorSpansInFileOrder(url: url))?.filter { isRead($0.name) }
             spansPerFile.append(spans)
             totalBytes += spans?.reduce(0) { $0 + $1.byteCount } ?? 0
         }
@@ -184,21 +209,51 @@ func loadWeightArrays(urls: [URL], initialMaterializationPrefixes: [String]? = n
                         WorkItem(file: file, url: url, names: spans[range].map(\.name)))
                 }
             } else {
-                items.append(WorkItem(file: file, url: url, names: nil))
+                // An empty list reads only the metadata of a file with nothing to read.
+                let names: [String]? = spansPerFile[file] == nil ? nil : []
+                items.append(WorkItem(file: file, url: url, names: names))
             }
         }
         return items
     }()
 
     let state = ConcurrentLoadState(fileCount: urls.count)
+    let progress = ModelLoadProgressScope.reporter
     DispatchQueue.concurrentPerform(iterations: items.count) { index in
         let item = items[index]
         do {
             // A caller's withError does not reach this worker thread.
             try withLoaderThreadError {
-                let (selected, metadata) = try loadWeightArrayGroup(
-                    url: item.url, names: item.names,
-                    initialMaterializationPrefixes: initialMaterializationPrefixes)
+                // Explicitly the CPU stream: `Load` has no GPU implementation and the arrays
+                // land in unified memory either way. The concurrency comes from evaluating
+                // disjoint groups from many threads, not from the stream itself.
+                let all: [String: MLXArray]
+                let metadata: [String: String]
+                if let progress {
+                    let worker = UUID()
+                    (all, metadata) = try loadArraysAndMetadata(url: item.url, stream: .cpu) {
+                        progress.update($0, worker: worker)
+                    }
+                } else {
+                    (all, metadata) = try loadArraysAndMetadata(url: item.url, stream: .cpu)
+                }
+
+                var selected = [String: MLXArray]()
+                if let names = item.names {
+                    for name in names {
+                        if let array = all[name] { selected[name] = array }
+                    }
+                } else {
+                    selected = all.filter { isRead($0.key) }
+                }
+
+                // force this range's I/O here, on this stream, in file-offset order
+                // Leave deferred modules (`InitialInferenceMaterializationProviding`)
+                // unread until first use.
+                let eager = selected.filter {
+                    initiallyMaterializesWeight($0.key, prefixes: initialMaterializationPrefixes)
+                }
+                if !eager.isEmpty { eval(Array(eager.values)) }
                 state.merge(file: item.file, weights: selected, metadata: metadata)
             }
         } catch {
@@ -344,9 +399,9 @@ private func topLevelSafetensorURLs(in modelDirectory: URL) -> [URL] {
 
 /// Load model weights.
 ///
-/// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
+/// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progress:)``.
 /// This function loads model weight `safetensor` files in the given `modelDirectory`,
-/// calls ``BaseLanguageModel/sanitize(weights:metadata:)`` to allow per-model preprocessing,
+/// calls ``BaseLanguageModel/prepareCheckpoint(_:)`` to allow per-model preprocessing,
 /// applies optional quantization, and
 /// updates the model with the weights. Derived inference-only state is prepared after the
 /// checkpoint update and before the model is evaluated and returned to callers.
@@ -355,55 +410,49 @@ private func topLevelSafetensorURLs(in modelDirectory: URL) -> [URL] {
 /// exist, and otherwise by the conventional `model*.safetensors` names. A model can name extra
 /// files it needs by conforming to ``AdditionalWeightFilesProviding``, and a caller can override
 /// the choice with ``ModelConfiguration/weightFileSelection``.
+///
+/// The model loads without the `excludedComponents` it supports, see
+/// ``ModelComponentsProviding``. Its on-demand components load the first time an input
+/// needs them, unless `componentLoading` is ``ComponentLoading/immediate``. Tensors of components
+/// that do not load now and of the model's ``BaseLanguageModel/excludedCheckpointNamespaces`` are
+/// not read.
 public func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
-    weightFileSelection: WeightFileSelection = .automatic
+    weightFileSelection: WeightFileSelection = .automatic,
+    excludedComponents: Set<ModelComponent> = [],
+    componentLoading: ComponentLoading = .onFirstUse
 ) throws {
-    // load the weights and collect metadata from the first safetensor file
-    var weights = [String: MLXArray]()
-    var metadata = [String: String]()
     let additionalFiles = (model as? any AdditionalWeightFilesProviding)?.additionalWeightFiles
     let weightURLs = try safetensorWeightURLs(
         in: modelDirectory,
         selection: weightFileSelection,
         additionalFiles: additionalFiles ?? [])
+    let perLayerQuantization =
+        (perLayerQuantization
+        ?? quantization.map { .init(quantization: $0, perLayerQuantization: [:]) })
+        .map {
+            (model as? any PerLayerQuantizationSanitizing)?.sanitize(perLayerQuantization: $0)
+                ?? $0
+        }
     let initialModules = (model as? any InitialInferenceMaterializationProviding)?
         .initialInferenceModules
-    (weights, metadata) = try loadWeightArrays(
-        urls: weightURLs, initialMaterializationPrefixes: initialModules.map { Array($0.keys) })
-
-    // per-model cleanup (models can inspect metadata to customize behavior)
-    weights = model.sanitize(weights: weights, metadata: metadata)
-
-    // quantize if needed
-    let perLayerQuantization = perLayerQuantization.map {
-        (model as? any PerLayerQuantizationSanitizing)?.sanitize(perLayerQuantization: $0) ?? $0
-    }
-    if quantization != nil || perLayerQuantization != nil {
-        quantize(model: model) { path, module in
-            if weights["\(path).scales"] != nil {
-                if let perLayerQuantization {
-                    return perLayerQuantization.quantization(layer: path)?.asTuple
-                } else {
-                    return quantization?.asTuple
-                }
-            } else {
-                return nil
-            }
-        }
-    }
-
-    // apply the loaded weights
+    let excludedNamespaces =
+        try prepareComponents(
+            of: model, urls: weightURLs, excluded: excludedComponents,
+            loading: componentLoading, perLayerQuantization: perLayerQuantization)
+        + model.excludedCheckpointNamespaces
+    // The checkpoint goes out of scope before materialization, so tensors that preparation
+    // replaces are freed by then.
     do {
-        let parameters = ModuleParameters.unflattened(weights)
-        try model.update(parameters: parameters, verify: [.all])
+        var checkpoint = try loadModelCheckpoint(
+            urls: weightURLs, excludedNamespaces: excludedNamespaces,
+            initialMaterializationPrefixes: initialModules.map { Array($0.keys) })
+        checkpoint.perLayerQuantization = perLayerQuantization
+        checkpoint = try model.prepareCheckpoint(checkpoint)
+        try applyCheckpoint(checkpoint, to: model)
     }
-    // The model now holds every array. Drop the loader's references so a
-    // tensor that preparation replaces (a fused projection) can be freed
-    // there; held here, each stays resident beside its replacement.
-    weights.removeAll()
 
     // Build derived inference-only state and realize the model while the loader
     // still has exclusive access. Forward passes must remain read-only.
@@ -432,8 +481,20 @@ func loadWeightArrayGroup(
     return (selected, metadata)
 }
 
+/// Quantize the layers `checkpoint` has scales for, then update `module` with strict validation.
+func applyCheckpoint(_ checkpoint: ModelCheckpoint, to module: Module) throws {
+    let weights = checkpoint.weights
+    if let perLayerQuantization = checkpoint.perLayerQuantization {
+        quantize(model: module) { path, _ in
+            guard weights["\(path).scales"] != nil else { return nil }
+            return perLayerQuantization.quantization(layer: path)?.asTuple
+        }
+    }
+    try module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+}
+
 /// Async variant of
-/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:)-6eqw7``.
+/// ``loadWeights(modelDirectory:model:quantization:perLayerQuantization:weightFileSelection:excludedComponents:componentLoading:)-858j8``.
 ///
 /// Loading blocks its thread on file I/O and fans out with `DispatchQueue.concurrentPerform`.
 /// Swift concurrency's cooperative threads must never block, so this overload runs the load
@@ -443,21 +504,28 @@ public func loadWeights(
     modelDirectory: URL, model: BaseLanguageModel,
     quantization: BaseConfiguration.Quantization? = nil,
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil,
-    weightFileSelection: WeightFileSelection = .automatic
+    weightFileSelection: WeightFileSelection = .automatic,
+    excludedComponents: Set<ModelComponent> = [],
+    componentLoading: ComponentLoading = .onFirstUse
 ) async throws {
     let model = SendableBox(model)
+    let progress = ModelLoadProgressScope.reporter
     try await withCheckedThrowingContinuation {
         (continuation: CheckedContinuation<Void, any Error>) in
         DispatchQueue.global(qos: .userInitiated).async {
             // The caller's withError does not reach this thread.
             continuation.resume(
                 with: Result {
-                    try withLoaderThreadError {
-                        try loadWeights(
-                            modelDirectory: modelDirectory, model: model.consume(),
-                            quantization: quantization,
-                            perLayerQuantization: perLayerQuantization,
-                            weightFileSelection: weightFileSelection)
+                    try ModelLoadProgressScope.$reporter.withValue(progress) {
+                        try withLoaderThreadError {
+                            try loadWeights(
+                                modelDirectory: modelDirectory, model: model.consume(),
+                                quantization: quantization,
+                                perLayerQuantization: perLayerQuantization,
+                                weightFileSelection: weightFileSelection,
+                                excludedComponents: excludedComponents,
+                                componentLoading: componentLoading)
+                        }
                     }
                 })
         }

@@ -68,6 +68,7 @@ public struct FastVLMConfiguration: Codable, Sendable {
         public let multimodalProjectorType: String
         public let multimodalProjectorHiddenSize: Int
         public let tokenizerModelMaxLangth: Int
+        public var tokenizerModelMaxLength: Int { tokenizerModelMaxLangth }
         public let tokenizerPaddingSide: String
 
         enum CodingKeys: String, CodingKey {
@@ -991,9 +992,8 @@ public struct FastVLMProcessor: UserInputProcessor {
             let promptTokens = try tokenizer.applyChatTemplate(
                 messages: messages, tools: input.tools,
                 additionalContext: input.additionalContext)
-            let tokensArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
-            let mask = ones(like: tokensArray)
-            return LMInput(text: .init(tokens: tokensArray, mask: mask), image: nil)
+            // No mask: one unpadded sequence needs none, and a mask stops prompt-cache reuse.
+            return LMInput(tokens: MLXArray(promptTokens).expandedDimensions(axis: 0))
         }
 
         guard input.images.count == 1 else {
@@ -1080,7 +1080,7 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     private func getInputEmbeddings(inputIds: MLXArray, pixelValues: MLXArray?, mask: MLXArray?)
-        -> MLXArray
+        throws -> MLXArray
     {
         guard let pixelValues = pixelValues else {
             return languageModel.model.embedTokens(inputIds)
@@ -1094,7 +1094,7 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
             imageFeatures.dim(3)
         )
         let mmInputs = multimodalProjector(imageFeatures.reshaped(B, H * W, C))
-        let finalEmbeddings = prepareInputsForMultimodal(
+        let finalEmbeddings = try prepareInputsForMultimodal(
             imageFeatures: mmInputs, inputIds: inputIds, mask: mask)
         return finalEmbeddings
     }
@@ -1102,7 +1102,7 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
     // This method assumes bs == 1, and one single image
     private func prepareInputsForMultimodal(
         imageFeatures: MLXArray, inputIds ids: MLXArray, mask: MLXArray?
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         let inputIds: MLXArray
         if let mask = mask {
             // Remove padding
@@ -1114,20 +1114,75 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
         }
 
         let inputIdsArray = inputIds.asArray(Int.self)
-        let imageTokenIndex =
-            inputIdsArray.firstIndex(of: config.baseConfiguration.imageTokenIndex) ?? 0
-        // Embed tokens before and after and then split to insert the image
-        let tokens = inputIdsArray.split(separator: config.baseConfiguration.imageTokenIndex)
-            .joined()
-        let tokenEmbeddings = languageModel.model.embedTokens(MLXArray(tokens))
-        let splitTokenEmbeddings = tokenEmbeddings.split(indices: [imageTokenIndex])
+        let imageBlock = imageFeatures[0]
+        let imageLength = imageBlock.dim(0)
+        let (beforeTokens, afterTokens) = try Self.splitTextTokensForMultimodal(
+            inputIds: inputIdsArray,
+            imageTokenId: config.baseConfiguration.imageTokenIndex,
+            imageLength: imageLength,
+            maxLength: config.baseConfiguration.tokenizerModelMaxLength,
+            paddingSide: config.baseConfiguration.tokenizerPaddingSide)
 
-        // Concatenate - once again this is easy because we assume bs==1 and a single image
-        let embeddings = concatenated(
-            [splitTokenEmbeddings[0], imageFeatures[0], splitTokenEmbeddings[1]], axis: 0)
-
-        // TODO: trim if we went over model_max_length
+        var embeddingParts = [MLXArray]()
+        if !beforeTokens.isEmpty {
+            embeddingParts.append(languageModel.model.embedTokens(MLXArray(beforeTokens)))
+        }
+        embeddingParts.append(imageBlock)
+        if !afterTokens.isEmpty {
+            embeddingParts.append(languageModel.model.embedTokens(MLXArray(afterTokens)))
+        }
+        let embeddings = concatenated(embeddingParts, axis: 0)
         return embeddings.expandedDimensions(axis: 0)
+    }
+
+    static func splitTextTokensForMultimodal(
+        inputIds: [Int], imageTokenId: Int, imageLength: Int, maxLength: Int, paddingSide: String
+    ) throws -> (beforeTokens: [Int], afterTokens: [Int]) {
+        guard let imageTokenIndex = inputIds.firstIndex(of: imageTokenId) else {
+            throw VLMError.processing("FastVLM prompt is missing image token \(imageTokenId).")
+        }
+
+        var beforeTokens = Array(inputIds[..<imageTokenIndex])
+        var afterTokens =
+            imageTokenIndex + 1 < inputIds.count
+            ? Array(inputIds[(imageTokenIndex + 1)...])
+            : []
+
+        guard maxLength > 0 else {
+            return (beforeTokens, afterTokens)
+        }
+        guard imageLength <= maxLength else {
+            throw VLMError.processing(
+                "FastVLM image features (\(imageLength)) exceed tokenizer_model_max_length (\(maxLength))."
+            )
+        }
+
+        var overflow = beforeTokens.count + afterTokens.count + imageLength - maxLength
+        guard overflow > 0 else {
+            return (beforeTokens, afterTokens)
+        }
+
+        func trimStart(_ tokens: inout [Int], by count: inout Int) {
+            let removed = min(tokens.count, count)
+            tokens.removeFirst(removed)
+            count -= removed
+        }
+
+        func trimEnd(_ tokens: inout [Int], by count: inout Int) {
+            let removed = min(tokens.count, count)
+            tokens.removeLast(removed)
+            count -= removed
+        }
+
+        if paddingSide.lowercased() == "left" {
+            trimStart(&beforeTokens, by: &overflow)
+            trimStart(&afterTokens, by: &overflow)
+        } else {
+            trimEnd(&afterTokens, by: &overflow)
+            trimEnd(&beforeTokens, by: &overflow)
+        }
+
+        return (beforeTokens, afterTokens)
     }
 
     public func prepare(
@@ -1135,8 +1190,10 @@ public class FastVLM: Module, VLMModel, KVCacheDimensionProvider {
     ) throws
         -> PrepareResult
     {
-        let embeddings = getInputEmbeddings(
-            inputIds: input.text.tokens,
+        var tokens = input.text.tokens
+        if tokens.ndim == 1 { tokens = tokens.expandedDimensions(axis: 0) }
+        let embeddings = try getInputEmbeddings(
+            inputIds: tokens,
             pixelValues: input.image?.pixels,
             mask: input.text.mask
         )

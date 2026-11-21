@@ -185,6 +185,36 @@ public class NemotronHTests: XCTestCase {
         XCTAssertEqual(config.routedScalingFactor, 1.0)
     }
 
+    func testConfigurationDecodingDenseWithoutMoEKeys() throws {
+        // A dense checkpoint (e.g. NVIDIA-Nemotron-3-Nano-4B) has no "E" layers and
+        // ships none of the MoE keys; it must still decode, and build a model.
+        let json = """
+            {
+                "vocab_size": 100,
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "mamba_num_heads": 4,
+                "mamba_head_dim": 16,
+                "ssm_state_size": 16,
+                "conv_kernel": 4,
+                "n_groups": 2,
+                "intermediate_size": 128,
+                "hybrid_override_pattern": "M-M*"
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            NemotronHConfiguration.self, from: json.data(using: .utf8)!)
+
+        XCTAssertEqual(config.moeIntermediateSize, 0)
+        XCTAssertEqual(config.moeSharedExpertIntermediateSize, 0)
+        XCTAssertEqual(config.nRoutedExperts, 0)
+        XCTAssertEqual(config.numExpertsPerTok, 0)
+        _ = NemotronHModel(config)  // no MoE layer is built, so no expert count is needed
+    }
+
     // MARK: - Weight Sanitization Tests
 
     func testSanitizeConv1dWeights() throws {
@@ -552,6 +582,30 @@ public class NemotronHTests: XCTestCase {
         let output = model.callAsFunction(input, cache: nil)
 
         XCTAssertEqual(output.shape, [1, 3, 100])
+    }
+
+    /// bfloat16 weights must stay bfloat16 through the Mamba gated norm.
+    /// A float32 identity weight promotes every later activation.
+    func testNemotronHBFloat16WeightsKeepBFloat16Activations() throws {
+        let model = NemotronHModel(makeTestConfig(pattern: "M*M-E"))
+        let cast = model.castPredicate!
+        let parameters = model.parameters().flattened().map { key, value in
+            (key, cast(key) ? value.asType(.bfloat16) : value)
+        }
+        model.update(parameters: ModuleParameters.unflattened(parameters))
+
+        let cache = try model.newCache(parameters: nil)
+        let prompt = model.callAsFunction(
+            MLXArray([1, 2, 3, 4, 5])[.newAxis, .ellipsis], cache: cache)
+        let next = model.callAsFunction(
+            MLXArray([6])[.newAxis, .ellipsis], cache: cache)
+        eval(prompt, next)
+
+        XCTAssertEqual(prompt.dtype, .bfloat16)
+        XCTAssertEqual(next.dtype, .bfloat16)
+        for case let kv as KVCacheSimple in cache {
+            XCTAssertEqual(kv.state.first?.dtype, .bfloat16)
+        }
     }
 
     // MARK: - Cast Predicate Test

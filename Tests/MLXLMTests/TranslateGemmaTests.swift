@@ -4,9 +4,10 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+import MLXScriptedLM
 import XCTest
 
-@_spi(GemmaEncoder) @testable import MLXLLM
+@_spi(GemmaEncoder) @_spi(Testing) @testable import MLXLLM
 
 /// Regression coverage for TranslateGemma.
 ///
@@ -140,7 +141,7 @@ public class TranslateGemmaTests: XCTestCase {
     func testGemma3TextModelKeepsDefaultMessageGenerator() {
         let model = Gemma3TextModel(Self.tinyConfig())
 
-        let generator = model.messageGenerator(tokenizer: TestTokenizer())
+        let generator = model.messageGenerator(tokenizer: PseudoWordTokenizer())
 
         XCTAssertFalse(generator is TranslateGemma3MessageGenerator)
         XCTAssertTrue(generator is DefaultMessageGenerator)
@@ -228,24 +229,7 @@ public class TranslateGemmaTests: XCTestCase {
 
     /// Minimal configuration to exercise `sanitize` without allocating a full-size model.
     private static func tinyConfig() -> Gemma3TextConfiguration {
-        Gemma3TextConfiguration(
-            modelType: "gemma3_text",
-            hiddenSize: 8,
-            hiddenLayers: 1,
-            intermediateSize: 16,
-            attentionHeads: 2,
-            headDim: 4,
-            rmsNormEps: 1e-6,
-            vocabularySize: 32,
-            kvHeads: 1,
-            ropeTheta: 1_000_000.0,
-            ropeLocalBaseFreq: 10_000.0,
-            ropeTraditional: false,
-            queryPreAttnScalar: 256,
-            slidingWindow: 16,
-            slidingWindowPattern: 6,
-            maxPositionEmbeddings: 64
-        )
+        .tinyConfiguration(vocabularySize: 32)
     }
 
     /// Records the prompt the wrapped processor is handed.

@@ -18,6 +18,13 @@ public enum Chat {
         /// The content of the message.
         public var content: String
 
+        // Records an opening reasoning delimiter supplied by the generation prompt.
+        package var prefilledReasoningStartDelimiter: String? = nil
+
+        // Finished reasoning that was streamed apart from `content`, kept for
+        // templates that replay it.
+        package var reasoning: String? = nil
+
         /// Array of image data associated with the message.
         public var images: [UserInput.Image]
 
@@ -154,9 +161,18 @@ extension MessageGenerator {
             "content": message.content,
         ]
 
+        addReasoning(to: &dictionary, for: message)
         addToolMetadata(to: &dictionary, for: message)
 
         return dictionary
+    }
+
+    /// Adds reasoning the session recorded apart from the content, as `reasoning_content`.
+    /// Qwen and Gemma 4 templates replay it; templates that do not read the key ignore it.
+    package func addReasoning(to dictionary: inout Message, for message: Chat.Message) {
+        if let reasoning = message.reasoning {
+            dictionary["reasoning_content"] = reasoning
+        }
     }
 
     /// Adds tool-call metadata from a structured message to a raw message dictionary.
@@ -184,12 +200,19 @@ extension MessageGenerator {
         }
     }
 
+    /// Avoid truthy empty text parts on assistant tool calls.
+    /// Keep empty text parts elsewhere for templates that require nonempty lists.
     package func contentParts(
         for message: Chat.Message, layout: MessageContentLayout
     ) -> [[String: String]] {
         var parts: [[String: String]] = []
 
         func appendText(_ text: String) {
+            if text.isEmpty, message.role == .assistant, let calls = message.tool?.calls,
+                !calls.isEmpty
+            {
+                return
+            }
             parts.append(["type": "text", "text": text])
         }
 
@@ -246,7 +269,8 @@ extension MessageGenerator {
 }
 
 /// Default implementation of ``MessageGenerator`` that produces `role` and
-/// `content`, plus `name`, `tool_call_id`, and `tool_calls` when present.
+/// `content`, plus `name`, `tool_call_id`, `tool_calls`, and `reasoning_content`
+/// when present.
 ///
 /// ```swift
 /// [

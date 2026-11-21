@@ -167,9 +167,13 @@ private struct OnyxProtocolDecoder {
     private let toolParser = ATEMToolCallParser()
     private let tools: [[String: any Sendable]]?
     private let validationPolicy: ToolCallValidationPolicy
-    private var reasoningDetokenizer: NaiveStreamingDetokenizer
-    private var responseDetokenizer: NaiveStreamingDetokenizer
+    private var reasoningDetokenizer: any StreamingDetokenizer
+    private var responseDetokenizer: any StreamingDetokenizer
     private(set) var isInsideReasoning = false
+
+    /// Whether the latest token streamed private or visible text that ends in a
+    /// visible character. Headers, tool frames, and closing markers never do.
+    private(set) var endsInVisibleText = false
 
     init?(
         tokenizer: any Tokenizer, tools: [[String: any Sendable]]?,
@@ -180,8 +184,8 @@ private struct OnyxProtocolDecoder {
         self.tokenizer = tokenizer
         self.tools = tools
         self.validationPolicy = toolCallPolicy.validation
-        self.reasoningDetokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
-        self.responseDetokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+        self.reasoningDetokenizer = tokenizer.makeStreamingDetokenizer()
+        self.responseDetokenizer = tokenizer.makeStreamingDetokenizer()
     }
 
     mutating func push(_ token: Int) -> TokenStreamEvent? {
@@ -193,10 +197,13 @@ private struct OnyxProtocolDecoder {
     }
 
     private mutating func route(_ step: OnyxParseStep) -> TokenStreamEvent? {
+        endsInVisibleText = false
         switch step {
         case .consumed:
             isInsideReasoning = false
         case .opened(let header):
+            reasoningDetokenizer = tokenizer.makeStreamingDetokenizer()
+            responseDetokenizer = tokenizer.makeStreamingDetokenizer()
             isInsideReasoning = header.recipient == .reasoning
         case .payload(let header, let token):
             switch header.recipient {
@@ -204,12 +211,14 @@ private struct OnyxProtocolDecoder {
                 isInsideReasoning = true
                 reasoningDetokenizer.append(token: token)
                 if let text = reasoningDetokenizer.next(), !text.isEmpty {
+                    endsInVisibleText = text.last?.isWhitespace == false
                     return .reasoning(text)
                 }
             case .user:
                 isInsideReasoning = false
                 responseDetokenizer.append(token: token)
                 if let text = responseDetokenizer.next(), !text.isEmpty {
+                    endsInVisibleText = text.last?.isWhitespace == false
                     return .response(text)
                 }
             case .tool, .unknown:
@@ -220,9 +229,13 @@ private struct OnyxProtocolDecoder {
             isInsideReasoning = false
             switch header.recipient {
             case .reasoning:
-                reasoningDetokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+                let text = reasoningDetokenizer.finish()
+                reasoningDetokenizer = tokenizer.makeStreamingDetokenizer()
+                return text.map(TokenStreamEvent.reasoning)
             case .user:
-                responseDetokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+                let text = responseDetokenizer.finish()
+                responseDetokenizer = tokenizer.makeStreamingDetokenizer()
+                return text.map(TokenStreamEvent.response)
             case .tool(let recipient):
                 let text = tokenizer.decode(tokenIds: payload, skipSpecialTokens: false)
                 guard var call = toolParser.parse(content: text, tools: tools),
@@ -256,6 +269,8 @@ private struct OnyxProtocolDecoder {
             }
         case .rejected(let message):
             isInsideReasoning = false
+            reasoningDetokenizer = tokenizer.makeStreamingDetokenizer()
+            responseDetokenizer = tokenizer.makeStreamingDetokenizer()
             return .protocolError(message)
         }
         return nil
@@ -271,6 +286,12 @@ struct OnyxStreamAdapter: TokenStreamDecoder {
     let receivesStopTokens = true
 
     var isInsideReasoning: Bool { protocolDecoder.isInsideReasoning }
+
+    /// A step can end inside a private or visible frame, after text that ends in a
+    /// visible character, with no stop-string prefix held back.
+    var canEndForSteering: Bool {
+        protocolDecoder.endsInVisibleText && stopStringFilter.buffer.isEmpty
+    }
 
     init?(
         tokenizer: any Tokenizer,

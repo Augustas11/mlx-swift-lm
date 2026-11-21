@@ -381,6 +381,47 @@ struct TurboQuantKVCacheTests {
         #expect(cache.offset == 5)
     }
 
+    @Test func cacheCopyIsIndependentOfItsSource() throws {
+        let (b, hq, hkv, d) = (1, 4, 2, 64)
+        let scale = 1 / Float(d).squareRoot()
+        func decode(_ cache: TurboQuantKVCache, key: UInt64) -> MLXArray {
+            let k = MLXRandom.normal([b, hkv, 1, d], key: MLXRandom.key(key)) * 0.3
+            let v = MLXRandom.normal([b, hkv, 1, d], key: MLXRandom.key(key + 1)) * 0.3
+            let q = MLXRandom.normal([b, hq, 1, d], key: MLXRandom.key(key + 2)) * 0.3
+            return cache.compressedAttention(queries: q, keys: k, values: v, scale: scale)
+        }
+
+        let cache = TurboQuantKVCache(bits: 4, keyBits: 4, valueBits: 2, seed: 123)
+        let keys = MLXRandom.normal([b, hkv, 16, d], key: MLXRandom.key(1)) * 0.3
+        let values = MLXRandom.normal([b, hkv, 16, d], key: MLXRandom.key(2)) * 0.3
+        _ = cache.update(keys: keys, values: values)
+        eval(decode(cache, key: 10))
+        #expect(cache.isCompressed)
+        let state = cache.state
+        eval(state)
+
+        // Rewind the copy and write over rows the source still holds.
+        let copy = try #require(cache.copy() as? TurboQuantKVCache)
+        #expect(copy.isCompressed)
+        #expect(copy.metaState == cache.metaState)
+        copy.trim(4)
+        for step in 0 ..< 6 {
+            eval(decode(copy, key: 20 + UInt64(step) * 3))
+        }
+
+        #expect(cache.offset == 17)
+        let stateAfterCopy = cache.state
+        #expect(stateAfterCopy.count == state.count)
+        for (before, after) in zip(state, stateAfterCopy) {
+            #expect(before.shape == after.shape)
+            #expect(arrayEqual(before, after).item(Bool.self))
+        }
+
+        // A copy carries everything the source decodes with.
+        let twin = try #require(cache.copy() as? TurboQuantKVCache)
+        #expect(arrayEqual(decode(cache, key: 40), decode(twin, key: 40)).item(Bool.self))
+    }
+
     @Test func cacheState() {
         let cache = TurboQuantKVCache(bits: 4)
         let keys = MLXRandom.normal([1, 2, 4, 32])
@@ -394,6 +435,66 @@ struct TurboQuantKVCacheTests {
         #expect(
             state.count == 2 || state.count == 4,
             "State should have 2 or 4 arrays, got \(state.count)")
+    }
+
+    /// Regression test: the cache inherited an empty `innerState()`, so `eval(cache)`
+    /// skipped its buffers and `KVCacheStatus` counted zero bytes for it.
+    @Test func cacheInnerStateHoldsRawAndCompressedStorage() {
+        let cache = TurboQuantKVCache(bits: 4)
+        let B = 1
+        let H = 2
+        let D = 128
+
+        let keys = MLXRandom.normal([B, H, 4, D])
+        let values = MLXRandom.normal([B, H, 4, D])
+        eval(keys, values)
+        _ = cache.update(keys: keys, values: values)
+
+        // Prefill keeps raw keys and values in 256-row steps.
+        let rawBytes = 2 * (B * H * 256 * D) * 4
+        #expect(KVCacheStatus(cache: [cache]).memoryBytes == rawBytes)
+
+        let newKey = MLXRandom.normal([B, H, 1, D])
+        let newValue = MLXRandom.normal([B, H, 1, D])
+        let queries = MLXRandom.normal([B, H * 2, 1, D])
+        eval(newKey, newValue, queries)
+        eval(
+            cache.compressedAttention(
+                queries: queries, keys: newKey, values: newValue,
+                scale: 1.0 / sqrt(Float(D))))
+
+        #expect(cache.isCompressed)
+        let compressedBytes = KVCacheStatus(cache: [cache]).memoryBytes
+        #expect(compressedBytes == cache.memoryBytes)
+        #expect(compressedBytes > 0 && compressedBytes < rawBytes)
+    }
+
+    @Test func compressedCachesExposeLiveKeyValues() throws {
+        let keys = MLXRandom.normal([1, 2, 8, 64])
+        let values = MLXRandom.normal([1, 2, 8, 64])
+        let newKeys = MLXRandom.normal([1, 2, 1, 64])
+        let newValues = MLXRandom.normal([1, 2, 1, 64])
+        let queries = MLXRandom.normal([1, 2, 1, 64])
+        eval(keys, values, newKeys, newValues, queries)
+
+        for (keyBits, valueBits) in [(0, 4), (8, 4), (4, 4)] {
+            let cache = TurboQuantKVCache(
+                bits: max(keyBits, valueBits), keyBits: keyBits, valueBits: valueBits)
+            _ = cache.update(keys: keys, values: values)
+            let output = cache.compressedAttention(
+                queries: queries,
+                keys: newKeys,
+                values: newValues,
+                scale: 1.0 / 8.0)
+            eval(output)
+
+            let live = try #require(cache.currentKeyValues())
+            eval(live.keys, live.values)
+            #expect(live.keys.shape == [1, 2, 9, 64])
+            #expect(live.values.shape == [1, 2, 9, 64])
+            #expect(!MLX.isNaN(live.keys).any().item(Bool.self))
+            #expect(!MLX.isNaN(live.values).any().item(Bool.self))
+        }
     }
 
     @Test func cacheIsTrimmable() {

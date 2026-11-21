@@ -364,18 +364,27 @@ public final class RerankerContainer: Reranker, Sendable {
     /// Semantic meaning and numeric range of returned scores.
     public let scoreKind: RerankScoreKind
     private let scoreOperation: ScoreOperation
+    private let memoryReporter: (any ModelMemoryReporting)?
 
     /// Create a type-erased reranker around a scoring operation.
     ///
     /// The operation must return one finite score per document in original input order.
+    /// Pass the container that owns the model as `memoryReporter` to support ``memory()``.
     public init(
         modelID: String,
         scoreKind: RerankScoreKind,
+        memoryReporter: (any ModelMemoryReporting)? = nil,
         scoreOperation: @escaping ScoreOperation
     ) {
         self.modelID = modelID
         self.scoreKind = scoreKind
+        self.memoryReporter = memoryReporter
         self.scoreOperation = scoreOperation
+    }
+
+    /// Measure model tensor buffers, or `nil` if no memory reporter was provided.
+    public func memory() async throws -> ModelMemory? {
+        try await memoryReporter?.memory()
     }
 
     /// Score documents while preserving their original order.
@@ -1053,14 +1062,20 @@ private struct CausalLMReranker {
                 count: maxLength - document.input.tokenIds.count)
         }
         let tokens = MLXArray(inputIDs).reshaped(batch.count, maxLength)
-        let logits = model(LMInput.Text(tokens: tokens), cache: nil, state: nil).logits
-        let scores = batch.enumerated().map { row, document in
-            probability(
-                logits: logits[row, document.input.tokenIds.count - 1],
-                tokens: classifierTokens)
-        }
+        let lengths = batch.map(\.input.tokenIds.count)
+        let logits =
+            if let model = model as? any HiddenStateLanguageModel {
+                model.projectLogits(
+                    lastPositions(model.hiddenStates(tokens, cache: nil), lengths: lengths))
+            } else {
+                lastPositions(
+                    model(LMInput.Text(tokens: tokens), cache: nil, state: nil).logits,
+                    lengths: lengths)
+            }
         MLX.eval(logits)
-        return scores
+        return batch.indices.map { row in
+            probability(logits: logits[row], tokens: classifierTokens)
+        }
     }
 
     private func nextTokenLogits(
@@ -1124,6 +1139,12 @@ private struct CausalLMReranker {
 private struct EncodedCausalDocument {
     var index: Int
     var input: RerankerInput
+}
+
+/// Selects position `length - 1` of each right-padded row, mapping `[B, L, D]` to `[B, D]`.
+private func lastPositions(_ array: MLXArray, lengths: [Int]) -> MLXArray {
+    let indices = MLXArray(lengths.map { Int32($0 - 1) }).reshaped(-1, 1, 1)
+    return takeAlong(array, indices, axis: 1).squeezed(axis: 1)
 }
 
 private func causalMicroBatches(

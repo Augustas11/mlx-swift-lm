@@ -970,20 +970,31 @@ public class Gemma3nTextModel: Module, LLMModel {
             inputs: inputs, inputsEmbeds: inputsEmbeds, mask: mask, cache: cacheArray)
     }
 
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var processedWeights: [String: MLXArray] = [:]
-
-        for (key, value) in weights {
-            if key.hasPrefix("model.language_model.") {
-                // Remove "model." prefix for VLM-style weights
-                let newKey = key.replacingOccurrences(
-                    of: "model.language_model.", with: "language_model.")
-                processedWeights[newKey] = value
-            } else {
-                // Keep other weights as-is
-                processedWeights[key] = value
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        var checkpoint = try checkpoint.mapNames(
+            using: .init([
+                .replacePrefix("model.language_model", with: "language_model")
+            ]))
+        // Older MLX exports include unused K/V modules on sharing layers.
+        let unusedPrefixes = (languageModel.firstKvSharedLayerIdx ..< config.numHiddenLayers)
+            .flatMap { index in
+                ["k_proj", "v_proj", "k_norm", "v_norm"].map {
+                    "language_model.layers.\(index).self_attn.\($0)"
+                }
             }
+        checkpoint = try checkpoint.mapNames { name in
+            unusedPrefixes.contains { name == $0 || name.hasPrefix($0 + ".") } ? nil : name
         }
+        checkpoint.weights = trimVocabulary(weights: checkpoint.weights)
+        return checkpoint
+    }
+
+    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        try prepareCheckpoint(.init(weights: weights)).weights
+    }
+
+    private func trimVocabulary(weights: [String: MLXArray]) -> [String: MLXArray] {
+        var processedWeights = weights
 
         // Shared-KV layers have no K/V projections or norms; older MLX exports
         // still carry those unused modules.

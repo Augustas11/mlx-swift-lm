@@ -946,8 +946,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         } else {
             out = model.embedTokens.asLinear(out)
         }
-        out = tanh(out / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
-        return out
+        return gemma4LogitSoftcap(out, config.finalLogitSoftcapping)
     }
 
     /// MTP-aware entry point: with ``mtpEmitFlagKey`` set, the output carries the post-norm
@@ -1075,4 +1074,8 @@ extension Gemma4TextModel: LoRAModel {
 
 extension Gemma4TextModel {
     public var toolCallFormat: ToolCallFormat? { .gemma4 }
+
+    /// Gemma 4 brackets its thinking in labeled channels rather than a delimiter
+    /// pair (see `ReasoningConfig.gemma4`).
+    public var reasoningConfig: ReasoningConfig? { .gemma4 }
 }

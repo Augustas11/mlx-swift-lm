@@ -103,6 +103,25 @@ public final class GLM5NextMTPDraftModel: Module, MTPPackedStatefulDrafterModel 
         }
     }
 
+    public func validateCompatibility(with target: any LanguageModel) throws {
+        let text: GLM5NextTextModel
+        if let model = target as? GLM5NextModel {
+            text = model.languageModel
+        } else if let model = target as? GLM5NextTextModel {
+            text = model
+        } else {
+            throw MTPDrafterCompatibilityError.incompatibleTarget(
+                drafter: "GLM5NextMTPDraftModel", expected: "a GLM5Next target",
+                actual: String(describing: type(of: target)))
+        }
+        guard text.mtp.first is GLM5NextMTPLayer else {
+            throw MTPDrafterCompatibilityError.incompatibleTarget(
+                drafter: "GLM5NextMTPDraftModel",
+                expected: "a GLM5Next target loaded with its MTP weights",
+                actual: "\(type(of: target)) without MTP layers")
+        }
+    }
+
     func head(_ target: any LanguageModel) -> Head {
         let text: GLM5NextTextModel
         if let model = target as? GLM5NextModel {

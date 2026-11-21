@@ -74,12 +74,41 @@ private final class FailingInferenceStateModel: Module, LanguageModel,
 private final class MLXErrorSanitizingModel: Module, BaseLanguageModel {
     @ModuleInfo(key: "layer") var layer = Linear(2, 2, bias: false)
 
-    func sanitize(weights: [String: MLXArray], metadata: [String: String])
+    func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws
         -> [String: MLXArray]
     {
         var weights = weights
         weights["layer.weight"] = weights["layer.weight"]?.transposed(0, 2, 1)
         return weights
+    }
+}
+
+/// Drops `unused` from its checkpoint and replaces its weight in `prepare()`, the way Qwen 3.5
+/// fuses its input projections.
+private final class ReplacingModel: Module, LanguageModel, KVCacheDimensionProvider {
+    static let size = 2048
+    @ModuleInfo(key: "layer") var layer = Linear(size, size, bias: false)
+    let kvHeads: [Int] = []
+
+    func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        weights.filter { $0.key != "unused" }
+    }
+
+    func prepare() throws {
+        try layer.update(
+            parameters: ModuleParameters.unflattened([
+                "weight": MLXArray.zeros([Self.size, Self.size])
+            ]), verify: .none)
+    }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        layer(inputs)
     }
 }
 
@@ -107,7 +136,7 @@ final class LoadWeightsTests: XCTestCase {
         try handle.truncate(atOffset: UInt64(file.count + count))
         try handle.close()
 
-        XCTAssertThrowsError(try loadWeightArrays(urls: [url])) {
+        XCTAssertThrowsError(try loadModelCheckpoint(urls: [url])) {
             XCTAssertTrue($0 is MLXError, "\($0)")
         }
     }
@@ -535,6 +564,26 @@ final class LoadWeightsTests: XCTestCase {
         } catch {
             // expected
         }
+    }
+
+    // Tensors the model drops or replaces must not stay in the buffer cache after the load.
+    func testLoadWeightsReleasesTheTensorsTheModelDoesNotKeep() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let size = ReplacingModel.size
+        try save(
+            arrays: [
+                "layer.weight": MLXArray.ones([size, size]),
+                "unused": MLXArray.ones([size, size]),
+            ],
+            url: directory.appendingPathComponent("model.safetensors"))
+
+        let model = ReplacingModel()
+        try loadWeights(modelDirectory: directory, model: model)
+
+        XCTAssertLessThan(Memory.cacheMemory, size * size * 4 / 2)
+        XCTAssertEqual(model.layer.weight.sum().item(Float.self), 0)
     }
 
     /// Writes a checkpoint whose index names only `model.safetensors` while the head lives in

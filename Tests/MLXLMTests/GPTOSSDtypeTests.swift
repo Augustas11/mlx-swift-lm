@@ -59,6 +59,13 @@ final class GPTOSSDtypeTests: XCTestCase {
             let step = model(MLXArray([Int32(6)]).reshaped(1, 1), cache: cache)
             eval(step)
             XCTAssertEqual(step.dtype, .bfloat16, "decode logits, quantized=\(quantized)")
+
+            // Every layer's cache keeps its keys in the input dtype.
+            for (layer, layerCache) in cache.enumerated() {
+                XCTAssertEqual(
+                    layerCache.state.first?.dtype, .bfloat16,
+                    "cache layer \(layer), quantized=\(quantized)")
+            }
         }
     }
 }

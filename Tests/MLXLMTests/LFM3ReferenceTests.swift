@@ -69,8 +69,7 @@ final class LFM3ReferenceTests: XCTestCase {
         try Device.withDefaultDevice(.cpu) {
             let model = try makeModel()
             let config = model.configuration
-            let ids: [Int32] = (0 ..< 38).map { Int32(($0 * 7 + 3) % 16) }
-            let tokens = MLXArray(ids).reshaped(2, 19)
+            let tokens = MLXArray((0 ..< 38).map { Int32(($0 * 7 + 3) % 16) }).reshaped(2, 19)
 
             func compare(_ actual: MLXArray, _ key: String) throws {
                 let values = try XCTUnwrap(LFM3ReferenceValues.outputs[key], key)

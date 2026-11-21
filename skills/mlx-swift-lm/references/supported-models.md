@@ -83,6 +83,14 @@ LLMRegistry.glm4_9b_4bit          // mlx-community/GLM-4-9B-0414-4bit
 // Note: GLM4 uses special tool call format
 ```
 
+### Mellum
+
+```swift
+// model_type: "mellum"
+LLMRegistry.mellum2_1_12b_a2_5b_thinking_6bit  // mlx-community/Mellum2.1-12B-A2.5B-Thinking-6bit
+// Note: Mellum uses Qwen-style <think> reasoning and JSON tool calls
+```
+
 ### Other Supported LLM Types
 
 | model_type | Description |
@@ -103,7 +111,7 @@ LLMRegistry.glm4_9b_4bit          // mlx-community/GLM-4-9B-0414-4bit
 | `exaone4` | EXAONE 4 |
 | `olmo2`, `olmo3`, `olmoe` | OLMo |
 | `falcon_h1` | Falcon H1 |
-| `jamba_3b` | Jamba |
+| `jamba` | Jamba |
 | `apertus` | Apertus |
 | `nanochat` | NanoChat |
 | `nemotron_h` | Nemotron H |
@@ -111,6 +119,35 @@ LLMRegistry.glm4_9b_4bit          // mlx-community/GLM-4-9B-0414-4bit
 | `bailing_moe` | Bailing MoE |
 | `gpt_oss` | GPT OSS |
 | `minicpm` | MiniCPM |
+
+### LFM3 tokenizer requirements
+
+LFM3 needs BPE `ignore_merges: true` and regex splitting by Unicode code point.
+Swift Transformers 1.3.5 is incompatible. Stable
+[1.4.0](https://github.com/huggingface/swift-transformers/releases/tag/1.4.0)
+includes both required fixes:
+[#397](https://github.com/huggingface/swift-transformers/pull/397) and
+[#398](https://github.com/huggingface/swift-transformers/pull/398). The token-ID and
+chat/tool-template integration tests pass with 1.4.0. Supply a `TokenizerLoader`
+using that release or another compatible implementation. The model rejects known
+incompatible tokenization through the generic `BaseLanguageModel.validate(tokenizer:)` hook
+at load time. The core package does not depend on Swift Transformers.
+
+Unit tests generate deterministic weights in memory and compare every operator,
+layer, and logit against FP32 reference values embedded in Swift. Regenerate those
+values with `python tools/lfm3-reference.py`, which pins LiquidAI's source revision.
+No model files or downloads are needed to run the unit tests.
+For a downloaded official 4-bit checkpoint, `tools/lfm3-checkpoint-reference.py`
+exports matching FP32 logits from the original Hugging Face implementation.
+`IntegrationTesting/IntegrationTestingTests/LFM3CheckpointTests.swift` reads
+`MLX_LFM3_CHECKPOINT` and `MLX_LFM3_REFERENCE_FILE`; set `MLX_ENABLE_TF32=0` in the
+test process for that parity check. The same integration class checks
+factory rejection of incompatible tokenizers.
+`MLX_LFM3_LONG_CONTEXT=1` enables the synthetic 4K/16K/32K cache tests.
+The integration project's tokenizer goldens are opt-in with
+`MLX_RUN_LFM3_TOKENIZER=1`; `MLX_LFM3_TOKENIZER_DIRECTORY` selects local tokenizer
+files instead of downloading them. Set these variables in the test process
+(for example, when invoking `xcrun xctest` directly or in Xcode's test scheme).
 
 ## VLM Families
 
@@ -159,19 +196,19 @@ Models not in registries can be loaded by ID:
 // Any mlx-community model
 let config = ModelConfiguration(id: "mlx-community/SomeModel-4bit")
 let container = try await LLMModelFactory.shared.loadContainer(
-    from: HubClient.default,
-    using: TokenizersLoader(),  // TokenizersLoader() from MLXLMTokenizers (swift-tokenizers-mlx)
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
     configuration: config
 )
 
 // Specific revision
-let config = ModelConfiguration(
+let revisionConfig = ModelConfiguration(
     id: "mlx-community/Model",
     revision: "v1.0"
 )
 
 // Local model
-let config = ModelConfiguration(
+let localConfig = ModelConfiguration(
     directory: URL(filePath: "/path/to/model")
 )
 ```
@@ -219,32 +256,35 @@ let config = ModelConfiguration(
 ### Tokenizer Overrides
 
 ```swift
-// Override tokenizer class
-let config = ModelConfiguration(
-    id: "...",
-    overrideTokenizer: "PreTrainedTokenizer"
-)
-
-// Use tokenizer from different model
+// Use the tokenizer from a different model (remote id or local directory)
 let config = ModelConfiguration(
     id: "model-without-tokenizer",
-    tokenizerId: "different-model-with-tokenizer"
+    tokenizerSource: .id("different-model-with-tokenizer")
+)
+
+// From a local tokenizer directory
+let localTokenizerConfig = ModelConfiguration(
+    id: "model-without-tokenizer",
+    tokenizerSource: .directory(URL(filePath: "/path/to/tokenizer"))
 )
 ```
+
+`overrideTokenizer` is gone: the tokenizer *class* is no longer selected by
+`ModelConfiguration`. Tokenizer construction is owned by the `TokenizerLoader` passed to
+the factory, so supply a custom `TokenizerLoader` instead — see
+[tokenizer-chat.md](tokenizer-chat.md#unrecognized-tokenizer-classes).
 
 ## Adding New Model Types
 
 Extend the type registry for new architectures:
 
 ```swift
-// Custom model type
-LLMTypeRegistry.shared.register(
-    modelType: "custom_model",
-    creator: { configData in
-        let config = try JSONDecoder().decode(CustomConfig.self, from: configData)
-        return CustomModel(config)
-    }
-)
+// Custom model type — ModelTypeRegistry is an actor, so the call is `await`ed.
+// The first parameter is unlabeled and the method is `registerModelType(_:creator:)`.
+await LLMTypeRegistry.shared.registerModelType("custom_model") { configData in
+    let config = try JSONDecoder().decode(CustomConfig.self, from: configData)
+    return CustomModel(config)
+}
 ```
 
 ## Checking Supported Types
