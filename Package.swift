@@ -202,6 +202,7 @@ let package = Package(
                 .copy("Resources/deepseek_v4_tiny"),
                 .copy("Resources/ricursive_tiny"),
                 .copy("Resources/qwen4_exp"),
+                .copy("Resources/inkling2"),
             ]
         ),
         .macro(
