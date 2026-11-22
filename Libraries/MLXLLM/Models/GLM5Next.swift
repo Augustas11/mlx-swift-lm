@@ -514,15 +514,38 @@ final class GLM5NextMoE: Module, UnaryLayer {
             let sharedUp = glm5NextAffine(sharedExperts.upProj),
             let sharedDown = glm5NextAffine(sharedExperts.downProj)
         else { return nil }
-        let (sig, biased) = glm5NextRouterLogits(
-            x2, weight: gate.weight, bias: gate.eScoreCorrectionBias)
-        return glm5NextMoEExperts(
-            x2, sig: sig, biased: biased, topK: gate.topK, scaling: gate.scaling,
-            normalize: gate.normalize, limit: limit,
-            gate: gateParts, up: upParts, down: downParts,
-            sharedGate: sharedGate, sharedUp: sharedUp, sharedDown: sharedDown,
-            shareExpertLoads: shareExpertLoads
-        )?.reshaped(x.shape)
+        // `LabSectionTimer` sections are pass-throughs unless lab timing is on.
+        let (sig, biased) = LabSectionTimer.run("moe.router", outputs: { [$0.0, $0.1] }) {
+            glm5NextRouterLogits(x2, weight: gate.weight, bias: gate.eScoreCorrectionBias)
+        }
+        let out = LabSectionTimer.run("moe.experts", outputs: { $0.map { [$0] } ?? [] }) {
+            glm5NextMoEExperts(
+                x2, sig: sig, biased: biased, topK: gate.topK, scaling: gate.scaling,
+                normalize: gate.normalize, limit: limit,
+                gate: gateParts, up: upParts, down: downParts,
+                sharedGate: sharedGate, sharedUp: sharedUp, sharedDown: sharedDown,
+                shareExpertLoads: shareExpertLoads
+            )
+        }
+        if LabSectionTimer.enabled, out != nil {
+            labReplay(x2, sharedExperts: sharedExperts)
+        }
+        return out?.reshaped(x.shape)
+    }
+
+    /// Lab timing only, after the real expert call, results discarded (no
+    /// value of the forward changes): `moe.replay.shared` runs the shared
+    /// expert alone over the same tokens with the kernels that read each of
+    /// its weight tiles once for every token (`glm5NextProject`), the share
+    /// of `moe.experts` its reads take; `moe.replay.route` replays the
+    /// router's selection and counts the distinct routed experts of the call
+    /// against its picks (`GLM5NextLabRouteCounter`).
+    private func labReplay(_ x2: MLXArray, sharedExperts: GLM5NextMLP) {
+        _ = LabSectionTimer.run("moe.replay.shared") { sharedExperts(x2) }
+        let indices = LabSectionTimer.run("moe.replay.route") { gate(x2).0 }
+        let picks = indices.asType(.int32).asArray(Int32.self)
+        GLM5NextLabRouteCounter.add(
+            tokens: x2.dim(0), picks: picks.count, unique: Set(picks).count)
     }
 
 }
@@ -1469,21 +1492,35 @@ final class GLM5NextDecoderLayer: Module {
         _ state: GLM5NextHCState, cache: KVCache?, previousTopk: [MLXArray?],
         checkpointAfter: Int? = nil
     ) -> (GLM5NextHCState, [MLXArray?]) {
-        let (normed, h, post, comb, mm) = attnHC.deferredBranchInput(state, norm: inputLayerNorm)
+        // `LabSectionTimer` sections are pass-throughs unless lab timing is on.
+        let (normed, h, post, comb, mm) = LabSectionTimer.run(
+            "hc.attn_pre", outputs: { [$0.0, $0.1, $0.2, $0.3, $0.4] }
+        ) { attnHC.deferredBranchInput(state, norm: inputLayerNorm) }
         let attention: MLXArray
         var topk = previousTopk
         if isLinear {
-            attention = (selfAttn as! GLM5NextLinearAttention)(
-                normed, cache: linearCache(cache), checkpointAfter: checkpointAfter)
+            let linear = linearCache(cache)
+            attention = LabSectionTimer.run("kda", outputs: { [$0] + (linear?.state ?? []) }) {
+                (selfAttn as! GLM5NextLinearAttention)(
+                    normed, cache: linear, checkpointAfter: checkpointAfter)
+            }
         } else {
-            (attention, topk) = (selfAttn as! GLM5NextAttention)(
-                normed, cache: cache, previousTopk: previousTopk,
-                perColumn: checkpointAfter != nil && normed.dim(1) > 1)
+            (attention, topk) = LabSectionTimer.run("mla", outputs: { [$0.0] }) {
+                (selfAttn as! GLM5NextAttention)(
+                    normed, cache: cache, previousTopk: previousTopk,
+                    perColumn: checkpointAfter != nil && normed.dim(1) > 1)
+            }
         }
-        let (ffnNormed, ffnH, ffnPost, ffnComb, ffnMM) = ffnHC.deferredBranchInput(
-            .deferred(y: attention, residual: h, post: post, comb: comb, mm: mm),
-            norm: postAttentionLayerNorm)
-        let ffnOut = (mlp as! UnaryLayer)(ffnNormed)
+        let (ffnNormed, ffnH, ffnPost, ffnComb, ffnMM) = LabSectionTimer.run(
+            "hc.ffn_pre", outputs: { [$0.0, $0.1, $0.2, $0.3, $0.4] }
+        ) {
+            ffnHC.deferredBranchInput(
+                .deferred(y: attention, residual: h, post: post, comb: comb, mm: mm),
+                norm: postAttentionLayerNorm)
+        }
+        let ffnOut = LabSectionTimer.run(mlp is GLM5NextMoE ? "moe" : "mlp") {
+            (mlp as! UnaryLayer)(ffnNormed)
+        }
         return (
             .deferred(y: ffnOut, residual: ffnH, post: ffnPost, comb: ffnComb, mm: ffnMM), topk
         )
@@ -1699,9 +1736,9 @@ public final class GLM5NextTextModel: Module, LLMModel {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let hidden = LabSectionTimer.forward(
-            tag: "rows=\(inputs.dim(0)),L=\(inputs.dim(1))", outputs: { [$0] }
-        ) { model(inputs, cache: cache) }
+        let tag = "rows=\(inputs.dim(0)),L=\(inputs.dim(1))"
+        let hidden = LabSectionTimer.forward(tag: tag, outputs: { [$0] }) { model(inputs, cache: cache) }
+        GLM5NextLabRouteCounter.emit(tag: tag)
         return logits(hidden)
     }
 
@@ -1732,8 +1769,15 @@ public final class GLM5NextTextModel: Module, LLMModel {
             }
             return LMOutput(logits: self(input.tokens, cache: cache))
         }
-        let hidden = model.hidden(
-            input.tokens, cache: cache, checkpointAfter: state?[mtpCacheCheckpointIndexKey])
+        let verifying = state?[mtpCacheCheckpointIndexKey] != nil
+        let tag = "rows=\(input.tokens.dim(0)),L=\(input.tokens.dim(-1)),v=\(verifying ? 1 : 0)"
+        let (hidden, labLogits) = LabSectionTimer.forward(tag: tag, outputs: { [$0.1] }) {
+            () -> (MLXArray, MLXArray) in
+            let hidden = model.hidden(
+                input.tokens, cache: cache, checkpointAfter: state?[mtpCacheCheckpointIndexKey])
+            return (hidden, LabSectionTimer.run("lm_head") { logits(model.norm(hidden)) })
+        }
+        GLM5NextLabRouteCounter.emit(tag: tag)
         var outState = state ?? LMOutput.State()
         outState[mtpLastHiddenStatesKey] = hidden
         if let cache, let source = model.layers.lastIndex(where: { !$0.isLinear }),
@@ -1743,7 +1787,7 @@ public final class GLM5NextTextModel: Module, LLMModel {
             outState[mtpSharedKVOffsetsKey] = ["full_attention": offset]
             outState[mtpSharedKVSourceIndicesKey] = ["full_attention": source]
         }
-        return LMOutput(logits: logits(model.norm(hidden)), state: outState)
+        return LMOutput(logits: labLogits, state: outState)
     }
 
     /// One cache per decoder layer. Sparse-attention layers keep the whole
@@ -2429,4 +2473,34 @@ extension GLM5NextModel {
 
 extension GLM5NextModel: SpeculativeCacheRewindModel {
     public var maximumNativeTargetCacheRewind: Int { 7 }
+}
+
+/// Lab timing only: distinct routed experts against picks over one forward's
+/// fused MoE calls (`GLM5NextMoE.labReplay`), printed as one
+/// `glm5next_moe_routes` stderr line per forward that had any.
+enum GLM5NextLabRouteCounter {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var calls = 0
+    nonisolated(unsafe) private static var tokens = 0
+    nonisolated(unsafe) private static var picks = 0
+    nonisolated(unsafe) private static var unique = 0
+
+    static func add(tokens t: Int, picks p: Int, unique u: Int) {
+        lock.withLock {
+            calls += 1
+            tokens += t
+            picks += p
+            unique += u
+        }
+    }
+
+    static func emit(tag: String) {
+        guard LabSectionTimer.enabled else { return }
+        let line: String? = lock.withLock {
+            defer { (calls, tokens, picks, unique) = (0, 0, 0, 0) }
+            guard calls > 0 else { return nil }
+            return "glm5next_moe_routes tag=\(tag) calls=\(calls) tokens=\(tokens) picks=\(picks) unique=\(unique)\n"
+        }
+        if let line { try? FileHandle.standardError.write(contentsOf: Data(line.utf8)) }
+    }
 }
