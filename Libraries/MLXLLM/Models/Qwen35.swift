@@ -554,17 +554,23 @@ final class Qwen35Attention: Module {
         let (q, gate, k, values) = projectPreRope(x)
 
         let offset = positionOffset.map(RoPEOffset.scalar) ?? cache?.ropeOffset
-        let queries = applyRotaryPosition(rope, to: q, offset: offset)
-        let keys = applyRotaryPosition(rope, to: k, offset: offset)
+        // `LabSectionTimer` sections are pass-throughs unless lab timing is on.
+        let (queries, keys) = LabSectionTimer.run("fa.rope", outputs: { [$0.0, $0.1] }) {
+            (applyRotaryPosition(rope, to: q, offset: offset),
+             applyRotaryPosition(rope, to: k, offset: offset))
+        }
 
-        let output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
+        let output = LabSectionTimer.run("fa.attn") {
+            attentionWithCacheUpdate(
+                queries: queries,
+                keys: keys,
+                values: values,
+                cache: cache,
+                scale: scale,
+                mask: mask
+            )
+        }
+        qwen35LabTraceAttentionShape(queries: queries, cache: cache, kvHeads: kvHeads, mask: mask)
 
         return mergeHeadsAndProject(attention: output, gate: gate)
     }
@@ -785,17 +791,22 @@ final class Qwen35DecoderLayer: Module {
 
         let r: MLXArray
         if isLinear {
-            r = linearAttn!(
-                inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
-                checkpointAfter: checkpointAfter)
+            let linearCache = cache as? MambaCache
+            r = LabSectionTimer.run("gdn", outputs: { [$0] + (linearCache?.state ?? []) }) {
+                linearAttn!(
+                    inputLayerNorm(x), mask: ssmMask, cache: linearCache,
+                    checkpointAfter: checkpointAfter)
+            }
         } else {
-            r = selfAttn!(
-                inputLayerNorm(x), mask: attentionMask, cache: cache,
-                positionOffset: positionOffset)
+            r = LabSectionTimer.run("fa.layer") {
+                selfAttn!(
+                    inputLayerNorm(x), mask: attentionMask, cache: cache,
+                    positionOffset: positionOffset)
+            }
         }
 
         let h = x + r
-        return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
+        return LabSectionTimer.run("mlp") { h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h)) }
     }
 
     // MARK: - Compiled decode blocks
@@ -857,14 +868,23 @@ final class Qwen35DecoderLayer: Module {
     ) -> MLXArray {
         let attn = selfAttn!
         let offset = cache.ropeOffset
-        return attentionWithCacheUpdate(
-            queries: applyRotaryPosition(attn.rope, to: queries, offset: offset),
-            keys: applyRotaryPosition(attn.rope, to: keys, offset: offset),
-            values: values,
-            cache: cache,
-            scale: attn.scale,
-            mask: mask
-        )
+        // `LabSectionTimer` sections are pass-throughs unless lab timing is on.
+        let (roped, ropedKeys) = LabSectionTimer.run("fa.rope", outputs: { [$0.0, $0.1] }) {
+            (applyRotaryPosition(attn.rope, to: queries, offset: offset),
+             applyRotaryPosition(attn.rope, to: keys, offset: offset))
+        }
+        let output = LabSectionTimer.run("fa.attn") {
+            attentionWithCacheUpdate(
+                queries: roped,
+                keys: ropedKeys,
+                values: values,
+                cache: cache,
+                scale: attn.scale,
+                mask: mask
+            )
+        }
+        qwen35LabTraceAttentionShape(queries: roped, cache: cache, kvHeads: attn.kvHeads, mask: mask)
+        return output
     }
 
     // MARK: - Layer bodies
@@ -1130,7 +1150,9 @@ public class Qwen35TextModelInner: Module {
                 args.append(mambaCache[1]!)
             }
 
-            let outputs = compiledSegments(self, at: segmentIndex, args)
+            let outputs = LabSectionTimer.run("seg", outputs: { $0 }) {
+                compiledSegments(self, at: segmentIndex, args)
+            }
 
             carry = outputs[0]
             for (i, layerIndex) in segment.linearLayers.enumerated() {
@@ -1253,7 +1275,9 @@ public class Qwen35TextModelInner: Module {
                 args.append(mambaCache[1]!)
             }
 
-            let outputs = verifySegments(self, at: segmentIndex, checkpointAfter: split, args)
+            let outputs = LabSectionTimer.run("seg", outputs: { $0 }) {
+                verifySegments(self, at: segmentIndex, checkpointAfter: split, args)
+            }
 
             carry = outputs[0]
             for (i, layerIndex) in segment.linearLayers.enumerated() {
@@ -1350,36 +1374,44 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var out = model(inputs, cache: cache)
-        if let lmHead {
-            out = lmHead(out)
-        } else {
-            out = model.embedTokens.asLinear(out)
+        LabSectionTimer.forward(
+            tag: "rows=\(inputs.dim(0)),L=\(inputs.dim(1))", outputs: { [$0] }
+        ) {
+            let out = model(inputs, cache: cache)
+            return LabSectionTimer.run("lm_head") {
+                if let lmHead { return lmHead(out) }
+                return model.embedTokens.asLinear(out)
+            }
         }
-        return out
     }
 
     public func callAsFunction(
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
         let emitDrafterState = state?[mtpEmitFlagKey] ?? false
-        let hiddenStates: MLXArray
-        if emitDrafterState {
-            // The final norm inside `forward` is the same `norm` applied to
-            // the same hidden state; requesting it there lets a short
-            // verification step run through the compiled segments.
-            hiddenStates = model.forward(
-                input.tokens, cache: cache, applyFinalNorm: true,
-                checkpointAfter: state?[mtpCacheCheckpointIndexKey])
-        } else {
-            hiddenStates = model(input.tokens, cache: cache)
-        }
-
-        let logits: MLXArray
-        if let lmHead {
-            logits = lmHead(hiddenStates)
-        } else {
-            logits = model.embedTokens.asLinear(hiddenStates)
+        let verifying = emitDrafterState && state?[mtpCacheCheckpointIndexKey] != nil
+        // Lab timing: one `section_timing` line per forward; `v=1` marks an
+        // MTP verification step. A pass-through unless lab timing is on.
+        let (hiddenStates, logits) = LabSectionTimer.forward(
+            tag: "rows=\(input.tokens.dim(0)),L=\(input.tokens.dim(-1)),v=\(verifying ? 1 : 0)",
+            outputs: { [$0.1] }
+        ) { () -> (MLXArray, MLXArray) in
+            let hiddenStates: MLXArray
+            if emitDrafterState {
+                // The final norm inside `forward` is the same `norm` applied to
+                // the same hidden state; requesting it there lets a short
+                // verification step run through the compiled segments.
+                hiddenStates = model.forward(
+                    input.tokens, cache: cache, applyFinalNorm: true,
+                    checkpointAfter: state?[mtpCacheCheckpointIndexKey])
+            } else {
+                hiddenStates = model(input.tokens, cache: cache)
+            }
+            let logits = LabSectionTimer.run("lm_head") {
+                if let lmHead { return lmHead(hiddenStates) }
+                return model.embedTokens.asLinear(hiddenStates)
+            }
+            return (hiddenStates, logits)
         }
 
         guard emitDrafterState else {
@@ -1566,3 +1598,29 @@ extension Qwen35TextModel {
     public var toolCallFormat: ToolCallFormat? { .qwen35 }
     public var reasoningConfig: ReasoningConfig? { QwenReasoningProtocol.tagged }
 }
+
+/// Lab timing only (`LabSectionTimer.enabled`): one stderr line per distinct
+/// full-attention call shape class (query columns, mask kind), so a profile
+/// can name the SDPA kernel the call takes. Off, one Bool read.
+func qwen35LabTraceAttentionShape(
+    queries: MLXArray, cache: KVCache?, kvHeads: Int,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode
+) {
+    guard LabSectionTimer.enabled else { return }
+    let maskKind: String
+    switch mask {
+    case .none: maskKind = "none"
+    case .causal: maskKind = "causal"
+    case .array: maskKind = "array"
+    default: maskKind = "other"
+    }
+    let key = "\(queries.dim(2))/\(maskKind)"
+    let first = qwen35LabShapeLock.withLock { qwen35LabShapesSeen.insert(key).inserted }
+    guard first else { return }
+    let line = "lab_fa_shape rows=\(queries.dim(0)) q_heads=\(queries.dim(1)) q_tokens=\(queries.dim(2)) "
+        + "head_dim=\(queries.dim(3)) kv_heads=\(kvHeads) keys=\(cache?.offset ?? -1) mask=\(maskKind)\n"
+    try? FileHandle.standardError.write(contentsOf: Data(line.utf8))
+}
+
+private let qwen35LabShapeLock = NSLock()
+nonisolated(unsafe) private var qwen35LabShapesSeen = Set<String>()
