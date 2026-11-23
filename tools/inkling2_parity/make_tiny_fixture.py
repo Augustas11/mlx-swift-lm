@@ -10,7 +10,7 @@ Three fixtures, each a directory with config.json, model.safetensors and oracle.
 
 - tiny-source: the source checkpoint layout (`model.llm.*`): NVFP4 experts with a per-expert
   amax on layers 0-6, MXFP8 on layer 7, dense attention. mlx-vlm reads it through its own
-  `Model.sanitize`, as it reads thinkingmachines/Inkling-2-Mini.
+  `Model.sanitize` and `hf_quant_config.json`, as it reads thinkingmachines/Inkling-2-Mini.
 - tiny-oq: the same weights in the oQ layout (oMLX's runtime names, as in
   mlx-community/Inkling-2-Mini-oQ4e-mtp). Same oracle.
 - tiny-oq-affine: oQ layout only, other weights: affine 8-bit attention, embedding and head,
@@ -436,8 +436,27 @@ def run_oracle(mx, model, prompt):
     return {"prompt": prompt, "full_logits": full.tolist(), "cases": cases}
 
 
-def write(mx, directory, config, weights, oracle):
+def hf_quant_config(formats):
+    """The source checkpoint's `hf_quant_config.json` shape (`quant_method` "inkling2")."""
+    transforms = {"nvfp4": "nvfp4_nearest", "mxfp8": "mxfp8_nearest"}
+    groups = []
+    for fmt, transform in transforms.items():
+        tensors = [
+            f"model.llm.layers.{i}.mlp.experts.{which}_weight"
+            for i in range(LAYERS)
+            if formats[i] == fmt
+            for which in ("w13", "w2")
+        ]
+        if tensors:
+            groups.append({"weight_transform": transform, "tensors": tensors})
+    groups.append({"weight_transform": "cast", "tensors": ["model.llm.unembed.weight"]})
+    return {"quant_method": "inkling2", "model": {"parameter_groups": groups}}
+
+
+def write(mx, directory, config, weights, oracle, sidecar=None):
     directory.mkdir(parents=True, exist_ok=True)
+    if sidecar is not None:
+        (directory / "hf_quant_config.json").write_text(json.dumps(sidecar, indent=1) + "\n")
     (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
     mx.save_safetensors(str(directory / "model.safetensors"), weights, metadata={"format": "mlx"})
     (directory / "oracle.json").write_text(json.dumps(oracle) + "\n")
@@ -493,10 +512,16 @@ def main():
     assert set(mapped) == set(weights), sorted(set(mapped) ^ set(weights))
     for key, value in weights.items():
         assert mapped[key].shape == value.shape and mx.array_equal(mapped[key], value).item(), key
+    # mlx-vlm reads the sidecar into the expert formats we drew.
+    sidecar = hf_quant_config(formats)
+    declared = Model.quantization_from_metadata(stub, sidecar)
+    for path, spec in quant.items():
+        if ".switch_mlp." in path:
+            assert declared["language_model." + path] == spec, (path, declared.get(path), spec)
     model = load_reference(mx, nn, LanguageModel, TextConfig, mapped, quant)
     oracle = run_oracle(mx, model, prompt)
     oracle["reference"] = reference
-    write(mx, args.out / "tiny-source", top, source, oracle)
+    write(mx, args.out / "tiny-source", top, source, oracle, sidecar)
     oq, qmap = to_oq(mx, weights, quant, amax)
     write(mx, args.out / "tiny-oq", {**top, "quantization": {"group_size": 64, "bits": 4, "mode": "affine", **qmap}}, oq, oracle)
 

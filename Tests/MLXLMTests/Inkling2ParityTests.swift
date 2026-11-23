@@ -65,6 +65,8 @@ final class Inkling2ParityTests: XCTestCase {
         try configuration.validateModelConfiguration()
         let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
         let model = Inkling2Model(configuration, quantization: base.perLayerQuantization)
+        // tiny-source carries the source checkpoint's sidecar; the oQ fixtures have none.
+        try model.applyQuantizationMetadata(directory: directory)
         try loadWeights(
             modelDirectory: directory, model: model,
             perLayerQuantization: base.perLayerQuantization)
@@ -150,5 +152,126 @@ final class Inkling2ParityTests: XCTestCase {
 
     func testOQAffineLayoutMatchesOracle() throws {
         try checkParity("tiny-oq-affine")
+    }
+}
+
+/// Real-weight parity against `tools/inkling2_parity/dump_real_oracle.py` (mlx-vlm f1618d6d on
+/// the source checkpoint, 1024 and 8192 tokens, prefill 2048). Needs `INKLING2_REAL_MODEL` (the
+/// source checkpoint directory, with `hf_quant_config.json`) and `INKLING2_REAL_ORACLE` (the
+/// dump's output directory). `INKLING2_REAL_MODE=exact` (the default) requires every greedy
+/// token to match; `report` only records the comparison. `INKLING2_REAL_REPORT` writes the
+/// numbers as JSON. Runs on the GPU unless `INKLING2_REAL_DEVICE=cpu`; use the oracle's device.
+final class Inkling2RealParityTests: XCTestCase {
+    private struct Row: Encodable {
+        let length: Int
+        let steps: Int
+        let firstMismatch: Int?
+        let matchingTokens: Int
+        let meanKL: Float
+        let maxLogitDifference: Float
+        let prefillSeconds: Double
+        let decodeTokensPerSecond: Double
+    }
+
+    /// The oracle's schedule: chunks of 2048 over all prompt tokens but the last.
+    private static let prefillStep = 2048
+
+    func testGreedyTokensMatchMLXVLMOracle() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let modelPath = environment["INKLING2_REAL_MODEL"],
+            let oraclePath = environment["INKLING2_REAL_ORACLE"]
+        else {
+            throw XCTSkip("INKLING2_REAL_MODEL and INKLING2_REAL_ORACLE are not set")
+        }
+        let exact = (environment["INKLING2_REAL_MODE"] ?? "exact") == "exact"
+        let device: Device = environment["INKLING2_REAL_DEVICE"] == "cpu" ? .cpu : .gpu
+
+        try Device.withDefaultDevice(device) {
+            let directory = URL(fileURLWithPath: (modelPath as NSString).expandingTildeInPath)
+            let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+            let configuration = try JSONDecoder().decode(Inkling2Configuration.self, from: data)
+            try configuration.validateModelConfiguration()
+            let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
+            let model = Inkling2Model(configuration, quantization: base.perLayerQuantization)
+            try model.applyQuantizationMetadata(directory: directory)
+            try loadWeights(
+                modelDirectory: directory, model: model,
+                perLayerQuantization: base.perLayerQuantization)
+            model.train(false)
+
+            let oracleDirectory = URL(fileURLWithPath: (oraclePath as NSString).expandingTildeInPath)
+            let oracles = try FileManager.default.contentsOfDirectory(
+                at: oracleDirectory, includingPropertiesForKeys: nil
+            )
+            .filter { $0.lastPathComponent.hasPrefix("oracle-") && $0.pathExtension == "safetensors" }
+            .sorted { $0.path.compare($1.path, options: .numeric) == .orderedAscending }
+            XCTAssertFalse(oracles.isEmpty, "no oracle files in \(oraclePath)")
+
+            var report = [Row]()
+            for url in oracles {
+                let arrays = try loadArrays(url: url)
+                let prompt = try XCTUnwrap(arrays["prompt"])
+                let expected = try XCTUnwrap(arrays["greedy"]).asArray(Int32.self).map(Int.init)
+                let logits = try XCTUnwrap(arrays["logits"])
+
+                let cache = try model.newCache(parameters: nil)
+                let begin = Date()
+                guard
+                    case .tokens(let rest) = try model.prepare(
+                        LMInput(tokens: prompt), cache: cache,
+                        prefill: PrefillParameters(stepSize: Self.prefillStep, chunking: .remainder))
+                else {
+                    XCTFail("prepare should hand tokens to the iterator")
+                    continue
+                }
+                eval(cache)
+                let prefillSeconds = Date().timeIntervalSince(begin)
+                XCTAssertEqual(rest.tokens.size, 1, "prepare leaves the last prompt token")
+
+                var input = rest.tokens.reshaped(1, rest.tokens.size)
+                var tokens = [Int]()
+                var divergences = [Float]()
+                var worst: Float = 0
+                let decodeBegin = Date()
+                for step in expected.indices {
+                    let row = model(input, cache: cache)[0, -1].asType(.float32)
+                    eval(row)
+                    eval(cache)
+                    tokens.append(argMax(row, axis: -1).item(Int.self))
+
+                    let reference = logits[step]
+                    let referenceLog = reference - logSumExp(reference, axis: -1, keepDims: true)
+                    let log = row - logSumExp(row, axis: -1, keepDims: true)
+                    divergences.append(
+                        (exp(referenceLog) * (referenceLog - log)).sum().item(Float.self))
+                    worst = max(worst, abs(row - reference).max().item(Float.self))
+
+                    // Follow the oracle's token so one miss does not corrupt later comparisons.
+                    input = MLXArray([Int32(expected[step])]).reshaped(1, 1)
+                }
+                let decodeSeconds = Date().timeIntervalSince(decodeBegin)
+
+                let result = Row(
+                    length: prompt.size, steps: expected.count,
+                    firstMismatch: zip(tokens, expected).enumerated()
+                        .first { $0.element.0 != $0.element.1 }?.offset,
+                    matchingTokens: zip(tokens, expected).filter { $0 == $1 }.count,
+                    meanKL: divergences.reduce(0, +) / Float(max(divergences.count, 1)),
+                    maxLogitDifference: worst,
+                    prefillSeconds: prefillSeconds,
+                    decodeTokensPerSecond: Double(expected.count) / decodeSeconds)
+                report.append(result)
+                print("inkling2 real parity \(result)")
+                if exact {
+                    XCTAssertEqual(tokens, expected, "greedy tokens at prompt length \(prompt.size)")
+                }
+            }
+
+            if let path = environment["INKLING2_REAL_REPORT"] {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                try encoder.encode(report).write(to: URL(fileURLWithPath: path))
+            }
+        }
     }
 }
