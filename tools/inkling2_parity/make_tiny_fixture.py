@@ -33,6 +33,10 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+# `python3 -I` leaves the script's directory off sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from oq_adapter import from_oq, load_reference  # noqa: E402
+
 OUT = Path(__file__).resolve().parents[2] / "Tests/MLXLMTests/Resources/inkling2"
 
 H = 128
@@ -389,20 +393,20 @@ def to_oq(mx, w, quant, amax):
 # MARK: the oracle
 
 
-def load_reference(mx, nn, language_model_cls, text_config_cls, weights, quant):
-    from mlx_vlm.quantization.nvfp4 import replace_scaled_quantized_linears
+def check_oq_round_trip(mx, oq, quantization, weights, quant, config):
+    """`oq_adapter.from_oq` (which `dump_real_oracle.py --layout oq` uses on the real oQ build)
+    must give back the mlx-vlm weights and quantization `to_oq` started from."""
+    from mlx_vlm.models.inkling.inkling import _split_gate_up
 
-    model = language_model_cls(text_config_cls.from_dict(TEXT))
-
-    def predicate(path, module):
-        return dict(quant[path]) if path in quant else False
-
-    nn.quantize(model, group_size=64, bits=4, class_predicate=predicate)
-    replace_scaled_quantized_linears(model, weights)
-    model.load_weights(list(weights.items()), strict=True)
-    model.eval()
-    mx.eval(model.parameters())
-    return model
+    mapped, mapped_quant = from_oq(mx, oq, config, quantization, _split_gate_up)
+    assert set(mapped) == set(weights), sorted(set(mapped) ^ set(weights))
+    for key, value in weights.items():
+        assert mapped[key].shape == value.shape, (key, mapped[key].shape, value.shape)
+        assert mapped[key].dtype == value.dtype, (key, mapped[key].dtype, value.dtype)
+        assert mx.array_equal(mapped[key], value).item(), key
+    assert mapped_quant == quant, sorted(
+        k for k in set(mapped_quant) | set(quant) if mapped_quant.get(k) != quant.get(k)
+    )
 
 
 def run_oracle(mx, model, prompt):
@@ -518,23 +522,27 @@ def main():
     for path, spec in quant.items():
         if ".switch_mlp." in path:
             assert declared["language_model." + path] == spec, (path, declared.get(path), spec)
-    model = load_reference(mx, nn, LanguageModel, TextConfig, mapped, quant)
+    config = TextConfig.from_dict(TEXT)
+    model = load_reference(mx, nn, LanguageModel, config, mapped, quant)
     oracle = run_oracle(mx, model, prompt)
     oracle["reference"] = reference
     write(mx, args.out / "tiny-source", top, source, oracle, sidecar)
     oq, qmap = to_oq(mx, weights, quant, amax)
-    write(mx, args.out / "tiny-oq", {**top, "quantization": {"group_size": 64, "bits": 4, "mode": "affine", **qmap}}, oq, oracle)
+    quantization = {"group_size": 64, "bits": 4, "mode": "affine", **qmap}
+    check_oq_round_trip(mx, oq, quantization, weights, quant, config)
+    write(mx, args.out / "tiny-oq", {**top, "quantization": quantization}, oq, oracle)
 
     # Quantized attention, embedding and head; affine experts.
     mx.random.seed(24670)
     formats = ["nvfp4"] + ["affine4"] * (LAYERS - 1)
     weights, quant, amax = make_vlm_weights(mx, formats, quantize_dense=True)
-    model = load_reference(mx, nn, LanguageModel, TextConfig, weights, quant)
+    model = load_reference(mx, nn, LanguageModel, config, weights, quant)
     oracle = run_oracle(mx, model, prompt)
     oracle["reference"] = reference
     oq, qmap = to_oq(mx, weights, quant, amax)
-    config = {**top, "quantization": {"group_size": 64, "bits": 8, "mode": "affine", **qmap}}
-    write(mx, args.out / "tiny-oq-affine", config, oq, oracle)
+    quantization = {"group_size": 64, "bits": 8, "mode": "affine", **qmap}
+    check_oq_round_trip(mx, oq, quantization, weights, quant, config)
+    write(mx, args.out / "tiny-oq-affine", {**top, "quantization": quantization}, oq, oracle)
 
 
 if __name__ == "__main__":
