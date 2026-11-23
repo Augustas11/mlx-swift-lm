@@ -498,7 +498,7 @@ public struct Inkling2ExpertFormat: Equatable, Sendable {
         self.groupSize = groupSize
     }
 
-    /// NVFP4 with a per-expert float32 `global_scale` (layers 0-19 of every Mini build).
+    /// NVFP4 with a per-expert float32 tensor scale (layers 0-19 of every Mini build).
     public static let nvfp4 = Inkling2ExpertFormat(mode: .nvfp4, bits: 4, groupSize: 16)
     /// MXFP8 (layers 20-23 of the source checkpoint).
     public static let mxfp8 = Inkling2ExpertFormat(mode: .mxfp8, bits: 8, groupSize: 32)
@@ -521,7 +521,7 @@ public struct Inkling2ExpertFormat: Equatable, Sendable {
         let bits = weight.dim(-1) * 32 / inputDims
         let groupSize = inputDims / scales.dim(-1)
         let hasBiases = weights["\(prefix).biases"] != nil
-        let hasGlobalScale = weights["\(prefix).global_scale"] != nil
+        let hasGlobalScale = weights["\(prefix).weight_scale_2"] != nil
         let format: Inkling2ExpertFormat
         if hasBiases {
             format = Inkling2ExpertFormat(mode: .affine, bits: bits, groupSize: groupSize)
@@ -541,6 +541,61 @@ public struct Inkling2ExpertFormat: Equatable, Sendable {
                 message: "\(prefix): unsupported expert storage (bits \(bits), group \(groupSize))")
         }
         return format
+    }
+}
+
+/// The source checkpoint's `hf_quant_config.json` (`quant_method` "inkling2"): parameter groups
+/// with a `weight_transform` each. `nvfp4_nearest` and `mxfp8_nearest` name expert tensors
+/// (`...layers.N.mlp.experts.w13_weight` / `w2_weight`); `cast` groups keep their stored dtype.
+/// Read as mlx-vlm's `Model.quantization_from_metadata` reads it: a layer the file names for one
+/// projection only keeps NVFP4 for the other.
+public enum Inkling2QuantizationMetadata {
+    public struct LayerFormats: Equatable, Sendable {
+        public let gateUp: Inkling2ExpertFormat
+        public let down: Inkling2ExpertFormat
+    }
+
+    /// Declared formats by layer, or nil when the file is not Inkling 2 metadata.
+    public static func expertFormats(from data: Data, layers: Int) throws -> [Int: LayerFormats]? {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            root["quant_method"] as? String == "inkling2"
+        else { return nil }
+        guard let model = root["model"] as? [String: Any],
+            let groups = model["parameter_groups"] as? [[String: Any]]
+        else {
+            throw Inkling2ConfigurationError(message: "hf_quant_config.json has no model.parameter_groups")
+        }
+        var gateUps = [Int: Inkling2ExpertFormat]()
+        var downs = [Int: Inkling2ExpertFormat]()
+        for group in groups {
+            let transform = group["weight_transform"] as? String ?? "(none)"
+            let format: Inkling2ExpertFormat
+            switch transform {
+            case "cast": continue
+            case "nvfp4_nearest": format = .nvfp4
+            case "mxfp8_nearest": format = .mxfp8
+            default:
+                throw Inkling2ConfigurationError(message: "unsupported Inkling 2 weight transform \(transform)")
+            }
+            for tensor in group["tensors"] as? [String] ?? [] {
+                guard let marker = tensor.range(of: "layers."),
+                    let layer = Int(tensor[marker.upperBound...].prefix { $0 != "." }),
+                    (0 ..< layers).contains(layer)
+                else {
+                    throw Inkling2ConfigurationError(message: "hf_quant_config.json names \(tensor)")
+                }
+                if tensor.hasSuffix("w13_weight") {
+                    gateUps[layer] = format
+                } else {
+                    downs[layer] = format
+                }
+            }
+        }
+        var result = [Int: LayerFormats]()
+        for layer in Set(gateUps.keys).union(downs.keys) {
+            result[layer] = LayerFormats(gateUp: gateUps[layer] ?? .nvfp4, down: downs[layer] ?? .nvfp4)
+        }
+        return result
     }
 }
 
@@ -711,9 +766,9 @@ final class Inkling2ExpertProjection: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     @ParameterInfo(key: "scales") var scales: MLXArray
     @ParameterInfo(key: "biases") var biases: MLXArray?
-    /// NVFP4 only: the per-expert amax in MLX's convention; the product is multiplied by
-    /// `global_scale / (6 * 448)`.
-    @ParameterInfo(key: "global_scale") var globalScale: MLXArray?
+    /// NVFP4 only: the per-expert tensor scale the product is multiplied by, mlx-vlm's
+    /// `weight_scale_2` (source: `amax / outer_scale_denominator`; oQ: `global_scale / 2688`).
+    @ParameterInfo(key: "weight_scale_2") var tensorScale: MLXArray?
 
     init(experts: Int, inputDims: Int, outputDims: Int, format: Inkling2ExpertFormat) {
         self.format = format
@@ -727,7 +782,7 @@ final class Inkling2ExpertProjection: Module {
         _biases.wrappedValue =
             format.hasBiases
             ? MLXArray.zeros([experts, outputDims, groups], dtype: .bfloat16) : nil
-        _globalScale.wrappedValue =
+        _tensorScale.wrappedValue =
             format.hasGlobalScale ? MLXArray.zeros([experts], dtype: .float32) : nil
         super.init()
     }
@@ -735,17 +790,16 @@ final class Inkling2ExpertProjection: Module {
     /// `x [..., 1, inputDims]` through the experts `indices` names: `[..., 1, outputDims]`.
     ///
     /// NVFP4 follows the reference's `ScaledQuantizedSwitchLinear` portable path: the product is
-    /// taken in float32, multiplied by the expert's `weight_scale_2` (`global_scale / 2688`) and
-    /// rounded to the input dtype once. The pinned `gatherQuantizedMM` has no global-scale
+    /// taken in float32, multiplied by the routed expert's `weight_scale_2` after the product,
+    /// and rounded to the input dtype once. The pinned `gatherQuantizedMM` has no global-scale
     /// argument, so the reference's in-kernel scaling on the GPU is not reproduced.
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool) -> MLXArray {
-        if let globalScale {
+        if let tensorScale {
             let product = gatherQuantizedMM(
                 x.asType(.float32), weight, scales: scales, biases: nil, rhsIndices: indices,
                 transpose: true, groupSize: format.groupSize, bits: format.bits,
                 mode: format.mode, sortedIndices: sortedIndices)
-            let factor = (globalScale.asType(.float32) / Inkling2WeightLayout.nvfp4Denominator)[
-                indices]
+            let factor = tensorScale.asType(.float32)[indices]
             return (product * factor.reshaped(indices.shape + [1, 1])).asType(x.dtype)
         }
         return gatherQuantizedMM(
@@ -1310,14 +1364,34 @@ public final class Inkling2Model: Module, LLMModel {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         guard let converted = try? Inkling2WeightLayout.convert(weights, configuration: configuration.text)
         else { return weights }
-        try? setExpertFormats(from: converted)
+        // A layer whose tensors contradict the declared formats leaves the checkpoint unconverted,
+        // so the loader's key check reports it.
+        do { try setExpertFormats(from: converted) } catch { return weights }
         return converted
+    }
+
+    /// The expert formats the source checkpoint's `hf_quant_config.json` declares, by layer.
+    private(set) var declaredExpertFormats = [Int: Inkling2QuantizationMetadata.LayerFormats]()
+
+    /// Reads `hf_quant_config.json` from `directory` when it is there (the source checkpoint) and
+    /// sets each layer it names to the declared expert formats, as mlx-vlm's
+    /// `quantization_from_metadata` does. ``sanitize(weights:)`` then refuses tensors that hold
+    /// another format. Without the file the formats come from the tensors alone.
+    public func applyQuantizationMetadata(directory: URL) throws {
+        let url = directory.appendingPathComponent("hf_quant_config.json")
+        guard FileManager.default.fileExists(atPath: url.path),
+            let formats = try Inkling2QuantizationMetadata.expertFormats(
+                from: Data(contentsOf: url), layers: configuration.text.hiddenLayers)
+        else { return }
+        declaredExpertFormats = formats
+        try rebuildExperts(formats)
     }
 
     /// Rebuilds each layer's experts whose checkpoint storage differs from the module's.
     func setExpertFormats(from weights: [String: MLXArray]) throws {
         let text = configuration.text
-        for (index, layer) in model.layers.enumerated() {
+        var detected = [Int: Inkling2QuantizationMetadata.LayerFormats]()
+        for index in model.layers.indices {
             let prefix = "model.layers.\(index).mlp.experts"
             guard
                 let gateUp = try Inkling2ExpertFormat.detect(
@@ -1325,11 +1399,27 @@ public final class Inkling2Model: Module, LLMModel {
                 let down = try Inkling2ExpertFormat.detect(
                     prefix: "\(prefix).w2", in: weights, inputDims: text.intermediateSize)
             else { continue }
+            if let declared = declaredExpertFormats[index],
+                declared.gateUp != gateUp || declared.down != down
+            {
+                throw Inkling2ConfigurationError(
+                    message: "layer \(index): hf_quant_config.json declares other expert formats than its tensors hold")
+            }
+            detected[index] = Inkling2QuantizationMetadata.LayerFormats(gateUp: gateUp, down: down)
+        }
+        try rebuildExperts(detected)
+    }
+
+    private func rebuildExperts(_ formats: [Int: Inkling2QuantizationMetadata.LayerFormats]) throws {
+        let text = configuration.text
+        for (index, wanted) in formats {
+            let layer = model.layers[index]
             let experts = layer.mlp.experts
-            if experts.gateUp.format != gateUp || experts.down.format != down {
+            if experts.gateUp.format != wanted.gateUp || experts.down.format != wanted.down {
                 try layer.mlp.update(
                     modules: ModuleChildren(values: [
-                        "experts": .value(Inkling2Experts(text, gateUp: gateUp, down: down))
+                        "experts": .value(
+                            Inkling2Experts(text, gateUp: wanted.gateUp, down: wanted.down))
                     ]), verify: [])
             }
         }
@@ -1346,8 +1436,8 @@ public final class Inkling2Model: Module, LLMModel {
 /// Maps the source checkpoint (thinkingmachines/Inkling-2-Mini, `model.llm.*`) onto the oQ
 /// layout, as oMLX's `oq_layout.sanitizer` and `loader.sanitize_weights` do. The oQ layout
 /// (mlx-community/Inkling-2-Mini-oQ4e-mtp) passes through. Only key renames, row
-/// concatenations, reshapes, transposes, dtype views and the global-scale rescale run, so the
-/// conversion is exact.
+/// concatenations, reshapes, transposes, dtype views and the NVFP4 tensor scale (mlx-vlm's
+/// `weight_scale_2` expression for each layout) run.
 public enum Inkling2WeightLayout {
     /// ModelOpt stores the NVFP4 tensor scale as amax / (E4M3 max x E2M1 max); the oQ layout keeps
     /// amax rescaled to this denominator.
@@ -1389,9 +1479,25 @@ public enum Inkling2WeightLayout {
     {
         let kept = weights.filter { !isDropped($0.key) }
         switch try kind(of: kept.keys) {
-        case .oq: return kept
+        case .oq: return convertOQ(kept)
         case .source: return try convertSource(kept, configuration: configuration)
         }
+    }
+
+    /// The oQ layout as loaded: each NVFP4 `global_scale` (amax rescaled to 2688) becomes the
+    /// tensor scale the product is multiplied by, `global_scale / 2688` in float32, the value an
+    /// mlx-vlm reading of the oQ bytes uses as `weight_scale_2`.
+    static func convertOQ(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        var out = [String: MLXArray]()
+        for (key, value) in weights {
+            if key.hasSuffix(".global_scale") {
+                let prefix = String(key.dropLast(".global_scale".count))
+                out[prefix + ".weight_scale_2"] = value.asType(.float32) / nvfp4Denominator
+            } else {
+                out[key] = value
+            }
+        }
+        return out
     }
 
     static func convertSource(_ weights: [String: MLXArray], configuration c: Inkling2TextConfiguration)
@@ -1515,9 +1621,10 @@ public enum Inkling2WeightLayout {
             out[base + ".weight"] = try take("mlp.experts.\(which)_weight").view(dtype: .uint32)
             out[base + ".scales"] = try take("mlp.experts.\(which)_weight_scale")
             if let amax = d.removeValue(forKey: "mlp.experts.\(which)_weight_amax") {
+                // mlx-vlm's `amax / outer_scale_denominator`, both float32 in the checkpoint.
+                // Going through the oQ `global_scale` (x 2688, then / 2688) can be one ulp off.
                 let denominator = try take("mlp.experts.\(which)_weight_outer_scale_denominator")
-                out[base + ".global_scale"] =
-                    amax.asType(.float32) * (nvfp4Denominator / denominator.asType(.float32))
+                out[base + ".weight_scale_2"] = amax.asType(.float32) / denominator.asType(.float32)
             }
         }
         if c.isCore(layer) {
