@@ -166,6 +166,9 @@ final class Inkling2ParityTests: XCTestCase {
 /// `INKLING2_REAL_REPORT` writes the numbers as JSON. Runs on the GPU unless
 /// `INKLING2_REAL_DEVICE=cpu`; use the oracle's device.
 ///
+/// The path follows ``Inkling2FastPath``: compiled and fused by default, the plain op-by-op
+/// path (mlx-vlm's portable path) with `INKLING2_COMPILED=0`.
+///
 /// Where the logits differ, per decode step: the largest |Δlogit| and the vocabulary id it sits
 /// at, that id's rank and logit in the oracle row, the largest |Δlogit| over the oracle's top
 /// ``topK`` ids, the mean |Δlogit| and the KL divergence. The worst step is repeated at the top
@@ -186,6 +189,8 @@ final class Inkling2RealParityTests: XCTestCase {
 
     private struct Row: Encodable {
         let layout: String
+        /// `compiled` (``Inkling2FastPath``, the default) or `plain` (`INKLING2_COMPILED=0`).
+        let path: String
         let length: Int
         let steps: Int
         let firstMismatch: Int?
@@ -342,7 +347,8 @@ final class Inkling2RealParityTests: XCTestCase {
                 let worst = steps.indices.max { steps[$0].maxLogitDifference < steps[$1].maxLogitDifference } ?? 0
                 let worstKL = steps.indices.max { steps[$0].kl < steps[$1].kl } ?? 0
                 let result = Row(
-                    layout: layout, length: prompt.size, steps: expected.count,
+                    layout: layout, path: Inkling2FastPath.enabled ? "compiled" : "plain",
+                    length: prompt.size, steps: expected.count,
                     firstMismatch: zip(tokens, expected).enumerated()
                         .first { $0.element.0 != $0.element.1 }?.offset,
                     matchingTokens: zip(tokens, expected).filter { $0 == $1 }.count,
@@ -364,7 +370,7 @@ final class Inkling2RealParityTests: XCTestCase {
                 let mismatch = result.firstMismatch.map { "\($0)" } ?? "none"
                 let stepMaxima = steps.map { ($0.maxLogitDifference * 100).rounded() / 100 }
                 let fields: [String] = [
-                    "inkling2 real parity layout=\(layout) length=\(result.length)",
+                    "inkling2 real parity layout=\(layout) path=\(result.path) length=\(result.length)",
                     "matching=\(result.matchingTokens)/\(result.steps) firstMismatch=\(mismatch)",
                     "meanKL=\(result.meanKL) maxKL=\(result.maxKL)@step\(result.maxKLStep)",
                     "maxDiff=\(result.maxLogitDifference)@step\(result.maxDifferenceStep)/id\(result.maxDifferenceVocabularyId)",
