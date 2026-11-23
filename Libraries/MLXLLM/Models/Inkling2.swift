@@ -380,15 +380,19 @@ public struct Inkling2LoopSchedule: Sendable, Equatable {
     public let passes: Int
 
     public init(_ text: Inkling2TextConfiguration) {
-        coreStart = text.loop?.coreStart ?? text.hiddenLayers
-        coreEnd = text.loop?.coreEnd ?? text.hiddenLayers
+        // Locals, not the stored properties: the closure below may not capture `self` before
+        // `visits` is set.
+        let start = text.loop?.coreStart ?? text.hiddenLayers
+        let end = text.loop?.coreEnd ?? text.hiddenLayers
+        coreStart = start
+        coreEnd = end
         passes = text.loop?.passes ?? 1
-        let coreLength = coreEnd - coreStart
+        let coreLength = end - start
         visits = text.layerVisits.enumerated().map { index, layer in
             let inCore = text.isCore(layer)
             return Visit(
                 index: index, layer: layer,
-                pass: inCore ? (index - coreStart) / coreLength : 0,
+                pass: inCore ? (index - start) / coreLength : 0,
                 inCore: inCore, isSliding: text.isSliding(layer),
                 closesBlock: text.closesBlock(layer))
         }
