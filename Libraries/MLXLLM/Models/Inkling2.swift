@@ -752,7 +752,9 @@ private func inkling2ShortConvolution(
 private func inkling2DynamicShortConvolution(
     _ x: MLXArray, dynamicTaps: MLXArray, staticTaps: MLXArray, heads: Int,
     state: ArraysCache?, slot: Int,
-    compiled: (@Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray)? = nil
+    compiled: (
+        @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray, MLXArray, MLXArray)
+    )? = nil
 ) -> MLXArray {
     let (batch, length, channels) = (x.dim(0), x.dim(1), x.dim(2))
     let kernel = staticTaps.dim(0)
@@ -760,7 +762,10 @@ private func inkling2DynamicShortConvolution(
     let previous = state?[slot] ?? MLXArray.zeros([batch, kernel - 1, channels], dtype: .float32)
     let context = concatenated([previous, xf], axis: 1)
     state?[slot] = context[0..., (context.dim(1) - (kernel - 1))..., 0...]
-    if let compiled { return compiled(context, x, dynamicTaps, staticTaps) }
+    if let compiled, kernel == 4 {
+        let (p0, p1, p2, p3) = compiled(context, x, dynamicTaps, staticTaps)
+        return inkling2CompiledDynamicSum(p0, p1, p2, p3, x)
+    }
     let dynamic = dynamicTaps.asType(.float32).reshaped(batch, length, heads, 1, kernel)
     let weights = staticTaps.transposed().reshaped(heads, -1, kernel) + dynamic
     var out = MLXArray.zeros([batch, length, heads, channels / heads], dtype: .float32)
@@ -833,15 +838,27 @@ public enum Inkling2FastPath {
         /// Float32 stacks of completed residual blocks, built once per forward pass.
         case blockStack = "blockstack"
         /// Compiled elementwise tails: message controllers, output gate, residual adds,
-        /// dynamic convolutions, log scaling.
+        /// dynamic convolutions, log scaling. No fused kernel adds a product it computes.
         case fusedTails = "tails"
     }
 
     /// Levers switched off, for A/B measurement only: `INKLING2_FAST_OFF`, a comma list of
-    /// ``Lever`` raw values.
-    nonisolated(unsafe) public static var off: Set<Lever> = Set(
-        (ProcessInfo.processInfo.environment["INKLING2_FAST_OFF"] ?? "").split(separator: ",")
-            .compactMap { Lever(rawValue: String($0)) })
+    /// ``Lever`` raw values. An unknown name stops the process, so a typo cannot leave a lever on
+    /// while its A/B is read as off.
+    nonisolated(unsafe) public static var off: Set<Lever> = levers(
+        ProcessInfo.processInfo.environment["INKLING2_FAST_OFF"] ?? "")
+
+    static func levers(_ list: String) -> Set<Lever> {
+        Set(
+            list.split(separator: ",").map { name in
+                guard let lever = Lever(rawValue: String(name)) else {
+                    fatalError(
+                        "INKLING2_FAST_OFF: unknown lever \(name); known: "
+                            + Lever.allCases.map(\.rawValue).joined(separator: ","))
+                }
+                return lever
+            })
+    }
 
     static func uses(_ lever: Lever) -> Bool { enabled && !off.contains(lever) }
 
@@ -918,11 +935,18 @@ private let inkling2CompiledScaleProduct: @Sendable (MLXArray, MLXArray, MLXArra
         (product * factor).asType(like.dtype)
     }
 
-/// `MessageController.__call__`, compiled (fast-path lever ``Inkling2FastPath/Lever/fusedTails``):
-/// the reference's ops in its order, with the elementwise tail `(1 - tanh(f)) x + tanh(g) m` in
-/// one kernel instead of six. `down` is `[2H, rank]`, `gainForget` `[rank, 2H]` (gain, forget).
-private func inkling2CompiledBlend(eps: Float)
-    -> @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray
+// The fused tails (fast-path lever ``Inkling2FastPath/Lever/fusedTails``) keep the reference's
+// ops in its order. No fused kernel holds a product that feeds an addition: the Metal compiler
+// could contract the pair into one fused multiply-add, which rounds once where the reference's
+// separate kernels round twice. Where the reference adds products, the products come out of one
+// compiled function and the sum is a separate one.
+
+/// `MessageController.__call__` up to its last addition, compiled: the two unit RMS norms, the
+/// down/gain/forget products and `((1 - tanh(f)) x, tanh(g) m)`, which the caller adds. Four
+/// elementwise kernels fewer than the op-by-op blend. `down` is `[2H, rank]`, `gainForget`
+/// `[rank, 2H]` (gain, then forget).
+private func inkling2CompiledBlendTerms(eps: Float)
+    -> @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray)
 {
     compile(shapeless: false) { x, message, down, gainForget in
         let width = x.dim(-1)
@@ -934,7 +958,7 @@ private func inkling2CompiledBlend(eps: Float)
         let hidden = matmul(pair.asType(down.dtype), down).asType(.float32)
         let gain = tanh(matmul(hidden, gainForget[0..., ..<width]))
         let forget = tanh(matmul(hidden, gainForget[0..., width...]))
-        return (Float(1) - forget) * x + gain * message
+        return ((Float(1) - forget) * x, gain * message)
     }
 }
 
@@ -958,44 +982,49 @@ private let inkling2CompiledLayerOutput: @Sendable (MLXArray, MLXArray, MLXArray
         (residual + convolved.asType(.float32)).asType(like.dtype)
     }
 
-/// The global layers' log scaling of queries and relative queries, compiled:
-/// `tau = 1 + alpha log(max(position / floor, 1))` for float32 positions counted from 1.
-private func inkling2CompiledLogScaling(alpha: Float, floor: Int)
-    -> @Sendable (MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray)
-{
-    compile(shapeless: false) { queries, relative, positions in
-        let tau = (Float(1) + alpha * log(maximum(positions / Float(floor), Float(1))))
-            .reshaped(-1, 1, 1)
-        return (
-            (queries.asType(.float32) * tau).asType(queries.dtype),
-            (relative.asType(.float32) * tau).asType(relative.dtype)
-        )
-    }
-}
+/// The global layers' log scaling applied to queries and relative queries, compiled: both
+/// `(v * tau)` in float32, cast back. `tau` is `[L, 1, 1]`, computed op by op by the caller.
+private let inkling2CompiledLogScaling:
+    @Sendable (MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray) =
+        compile(shapeless: false) { queries, relative, tau in
+            (
+                (queries.asType(.float32) * tau).asType(queries.dtype),
+                (relative.asType(.float32) * tau).asType(relative.dtype)
+            )
+        }
 
-/// The dynamic short convolution after its state concatenation, compiled: tap weights, the
-/// lag sum in the reference's order (starting from 0), the residual and the scale. The zero the
-/// sum starts from is a broadcast scalar, so it fuses instead of filling an array.
-private func inkling2CompiledDynamicShortConvolution(heads: Int)
-    -> @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray
+/// The dynamic short convolution's lag products, compiled: the tap weights (static plus
+/// dynamic) and `context[lag window] * weights[..., lag]` for each of the 4 lags, lag 0 first.
+/// Kernel size 4 only.
+private func inkling2CompiledDynamicProducts(heads: Int)
+    -> @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray, MLXArray, MLXArray)
 {
     compile(shapeless: false) { context, x, dynamicTaps, staticTaps in
         let (batch, length, channels) = (x.dim(0), x.dim(1), x.dim(2))
         let kernel = staticTaps.dim(0)
-        let xf = x.asType(.float32)
         let dynamic = dynamicTaps.asType(.float32).reshaped(batch, length, heads, 1, kernel)
         let weights = staticTaps.transposed().reshaped(heads, -1, kernel) + dynamic
         let shape = [batch, length, heads, channels / heads]
-        var out = broadcast(MLXArray(Float(0)), to: shape)
-        for lag in 0 ..< kernel {
+        let products = (0 ..< kernel).map { lag -> MLXArray in
             let start = kernel - 1 - lag
-            let values = context[0..., start ..< (start + length), 0...].reshaped(shape)
-            out = out + values * weights[.ellipsis, lag]
+            return context[0..., start ..< (start + length), 0...].reshaped(shape)
+                * weights[.ellipsis, lag]
         }
-        return ((out.reshaped(x.shape) + xf) / Float(Double(2 * kernel + 1).squareRoot()))
-            .asType(x.dtype)
+        return (products[0], products[1], products[2], products[3])
     }
 }
+
+/// The dynamic short convolution's sum, compiled: `0 + p0 + p1 + p2 + p3` in the reference's
+/// order (from a broadcast zero, as `zeros_like` starts it), the residual, the
+/// `1 / sqrt(2 kernel + 1)` scale and the cast to the dtype of `x`. Kernel size 4 only.
+private let inkling2CompiledDynamicSum:
+    @Sendable (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray =
+        compile(shapeless: false) { p0, p1, p2, p3, x in
+            var out = broadcast(MLXArray(Float(0)), to: p0.shape)
+            for product in [p0, p1, p2, p3] { out = out + product }
+            return ((out.reshaped(x.shape) + x.asType(.float32)) / Float(Double(9).squareRoot()))
+                .asType(x.dtype)
+        }
 
 private final class Inkling2Kernels: @unchecked Sendable {
     static let shared = Inkling2Kernels()
@@ -1182,14 +1211,14 @@ final class Inkling2HeadProjectionCache {
 
 /// Constant zero arrays built and evaluated once per shape and dtype. Not a module parameter.
 final class Inkling2Constants {
-    private var zeros = [String: MLXArray]()
+    private var arrays = [String: MLXArray]()
 
     func zeros(_ shape: [Int], _ dtype: DType) -> MLXArray {
         let key = "\(shape) \(dtype)"
-        if let cached = zeros[key] { return cached }
+        if let cached = arrays[key] { return cached }
         let value = MLXArray.zeros(shape, dtype: dtype)
         eval(value)
-        zeros[key] = value
+        arrays[key] = value
         return value
     }
 }
@@ -1461,8 +1490,8 @@ final class Inkling2Attention: Module {
     private let constants = Inkling2Constants()
     /// Fused tails (``Inkling2FastPath/Lever/fusedTails``): global layers' dynamic K/V
     /// convolutions and log scaling.
-    private let dynamicConvolution: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray
-    private let logScaling: (@Sendable (MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray))?
+    private let dynamicProducts:
+        @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray, MLXArray, MLXArray)
 
     @ModuleInfo(key: "in_proj") var inProj: Linear?
     @ModuleInfo(key: "q_proj") var queryProj: Linear?
@@ -1503,10 +1532,7 @@ final class Inkling2Attention: Module {
         queryClip = inkling2CompiledScaledL2Clip(threshold: config.qkClipThreshold)
         keyClip = inkling2CompiledL2Clip(threshold: config.qkClipThreshold)
         relativeClip = inkling2CompiledScaledL2Clip(threshold: config.relativeClipThreshold)
-        dynamicConvolution = inkling2CompiledDynamicShortConvolution(heads: kvHeads)
-        logScaling = config.logScalingFloor.map {
-            inkling2CompiledLogScaling(alpha: config.logScalingAlpha, floor: $0)
-        }
+        dynamicProducts = inkling2CompiledDynamicProducts(heads: kvHeads)
         if sliding {
             _inProj.wrappedValue = Linear(h, querySplits.reduce(0, +), bias: false)
             _keyConv.wrappedValue = MLXArray.zeros([kv, kernel], dtype: .bfloat16)
@@ -1561,12 +1587,12 @@ final class Inkling2Attention: Module {
             keys = Inkling2PhaseProfiler.measure(.shortConvolutions, inputs: [k, kTaps]) {
                 inkling2DynamicShortConvolution(
                     k, dynamicTaps: kTaps, staticTaps: keyStatic, heads: kvHeads, state: conv,
-                    slot: 0, compiled: Inkling2FastPath.uses(.fusedTails) ? dynamicConvolution : nil)
+                    slot: 0, compiled: Inkling2FastPath.uses(.fusedTails) ? dynamicProducts : nil)
             }
             values = Inkling2PhaseProfiler.measure(.shortConvolutions, inputs: [v, vTaps]) {
                 inkling2DynamicShortConvolution(
                     v, dynamicTaps: vTaps, staticTaps: valueStatic, heads: kvHeads, state: conv,
-                    slot: 1, compiled: Inkling2FastPath.uses(.fusedTails) ? dynamicConvolution : nil)
+                    slot: 1, compiled: Inkling2FastPath.uses(.fusedTails) ? dynamicProducts : nil)
             }
         } else {
             fatalError("Inkling 2 attention has neither the local nor the global projections")
@@ -1594,24 +1620,27 @@ final class Inkling2Attention: Module {
             ? relativeClip(relativeInput, relativeScale)
             : inkling2L2Clip(
                 relativeInput, threshold: c.relativeClipThreshold, scale: relativeScale)
-        if !isSliding, let logScaling, Inkling2FastPath.uses(.fusedTails),
-            queries.dtype == dtype, relative.dtype == dtype
-        {
-            // Float32 positions from the host: exact below 2^24, as the cast below is.
-            let offset = attentionCache?.offset ?? 0
-            let positions = MLXArray((0 ..< length).map { Float(offset + 1 + $0) })
-            (queries, relative) = logScaling(queries, relative, positions)
-        } else if !isSliding, let floor = c.logScalingFloor {
+        if !isSliding, let floor = c.logScalingFloor {
             // tau = 1 + alpha log(max(position / floor, 1)), positions counted from 1.
             let offset = attentionCache?.offset ?? 0
-            let positions = MLXArray((0 ..< length).map { Int32(offset + 1 + $0) })
-                .asType(.float32)
+            let fused =
+                Inkling2FastPath.uses(.fusedTails) && queries.dtype == dtype
+                && relative.dtype == dtype
+            // Fused: float32 positions straight from the host, exact below 2^24 as the cast is.
+            let positions =
+                fused
+                ? MLXArray((0 ..< length).map { Float(offset + 1 + $0) })
+                : MLXArray((0 ..< length).map { Int32(offset + 1 + $0) }).asType(.float32)
             let tau =
                 (Float(1)
                 + c.logScalingAlpha * log(maximum(positions / Float(floor), Float(1))))
                 .reshaped(length, 1, 1)
-            queries = (queries.asType(.float32) * tau).asType(dtype)
-            relative = (relative.asType(.float32) * tau).asType(dtype)
+            if fused {
+                (queries, relative) = inkling2CompiledLogScaling(queries, relative, tau)
+            } else {
+                queries = (queries.asType(.float32) * tau).asType(dtype)
+                relative = (relative.asType(.float32) * tau).asType(dtype)
+            }
         }
         queries = queries.transposed(0, 2, 1, 3)
         keys = keys.transposed(0, 2, 1, 3)
@@ -1682,7 +1711,8 @@ final class Inkling2DecoderLayer: Module {
     @ParameterInfo(key: "loop_gain_forget") var loopGainForget: MLXArray?
     @ModuleInfo(key: "loop_message") var loopMessage: Inkling2LoopMessage?
     /// Fused tails (``Inkling2FastPath/Lever/fusedTails``): the message controller.
-    private let compiledBlend: @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> MLXArray
+    private let compiledBlendTerms:
+        @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray)
 
     init(
         _ config: Inkling2TextConfiguration, layer: Int,
@@ -1693,7 +1723,7 @@ final class Inkling2DecoderLayer: Module {
         isSliding = sliding
         closesBlock = config.closesBlock(layer)
         eps = config.rmsNormEps
-        compiledBlend = inkling2CompiledBlend(eps: config.rmsNormEps)
+        compiledBlendTerms = inkling2CompiledBlendTerms(eps: config.rmsNormEps)
         let h = config.hiddenSize
         let normalizes = config.attentionResidualNormalizesValues
         _attention.wrappedValue = Inkling2Attention(config, layer: layer)
@@ -1731,7 +1761,9 @@ final class Inkling2DecoderLayer: Module {
         }
         let width = x.dim(-1)
         if Inkling2FastPath.uses(.fusedTails) {
-            return compiledBlend(x, message, loopDown[m].reshaped(2 * width, -1), loopGainForget[m])
+            let (kept, added) = compiledBlendTerms(
+                x, message, loopDown[m].reshaped(2 * width, -1), loopGainForget[m])
+            return kept + added
         }
         let pair = concatenated(
             [inkling2UnitRMSNorm(x, eps: eps), inkling2UnitRMSNorm(message, eps: eps)], axis: -1)
