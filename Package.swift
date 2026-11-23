@@ -89,7 +89,9 @@ let package = Package(
         // QuantizedMatmul captures the route at graph build from a thread
         // scope (withSmallMRoute), so one process can run row-invariant and
         // stock-order forwards side by side.
-        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "aaa826550ca59184a5884b099f1d640714804fc5"),
+        // mlx-swift e7243b3 (#2451) is .26 plus the core's dense qmm_t 64-row
+        // tile from 1024 rows for affine bfloat16 group-64 weights.
+        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "e7243b3d792ea39da0a653990fba06630cc6ada6"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
