@@ -42,6 +42,15 @@ private func createQwen3CompatibleModel(configuration data: Data) throws -> any 
     return Qwen3Model(configuration)
 }
 
+/// Inkling 2 Mini builds its expert modules in the formats the checkpoint's per-layer
+/// quantization map names, so it reads the map along with its own configuration.
+private func createInkling2Model(configuration data: Data) throws -> any LanguageModel {
+    let configuration = try JSONDecoder.json5().decode(Inkling2Configuration.self, from: data)
+    try configuration.validateModelConfiguration()
+    let base = try JSONDecoder.json5().decode(BaseConfiguration.self, from: data)
+    return Inkling2Model(configuration, quantization: base.perLayerQuantization)
+}
+
 /// Registry of model type, e.g 'llama', to functions that can instantiate the model from configuration.
 ///
 /// Typically called via ``LLMModelFactory/loadContainer(from:using:configuration:useLatest:progressHandler:)``.
@@ -96,6 +105,7 @@ public enum LLMTypeRegistry {
         "glm5_next": create(GLM5NextConfiguration.self, GLM5NextModel.init),
         "glm5_next_text": create(GLM5NextConfiguration.self, GLM5NextTextModel.init),
         "ricursive": create(RicursiveConfiguration.self, RicursiveModel.init),
+        "inkling2_loop": createInkling2Model,
         "acereason": create(Qwen2Configuration.self, Qwen2Model.init),
         "falcon_h1": create(FalconH1Configuration.self, FalconH1Model.init),
         "bitnet": create(BitnetConfiguration.self, BitnetModel.init),
