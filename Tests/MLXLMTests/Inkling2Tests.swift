@@ -316,6 +316,47 @@ final class Inkling2Tests: XCTestCase {
         }
     }
 
+    /// `hf_quant_config.json` as mlx-vlm's `quantization_from_metadata` reads it, and a declared
+    /// format the tensors contradict.
+    func testQuantizationMetadataDeclaresExpertFormats() throws {
+        let sidecar = """
+            {"quant_method": "inkling2", "model": {"parameter_groups": [
+              {"weight_transform": "nvfp4_nearest", "tensors": [
+                "model.llm.layers.0.mlp.experts.w13_weight", "model.llm.layers.0.mlp.experts.w2_weight"]},
+              {"weight_transform": "mxfp8_nearest", "tensors": [
+                "model.llm.layers.23.mlp.experts.w13_weight", "model.llm.layers.23.mlp.experts.w2_weight"]},
+              {"weight_transform": "cast", "tensors": ["model.llm.unembed.weight"]}]}}
+            """
+        let formats = try XCTUnwrap(
+            Inkling2QuantizationMetadata.expertFormats(from: Data(sidecar.utf8), layers: 24))
+        XCTAssertEqual(formats.count, 2)
+        XCTAssertEqual(formats[0], Inkling2QuantizationMetadata.LayerFormats(gateUp: .nvfp4, down: .nvfp4))
+        XCTAssertEqual(formats[23], Inkling2QuantizationMetadata.LayerFormats(gateUp: .mxfp8, down: .mxfp8))
+        XCTAssertNil(
+            try Inkling2QuantizationMetadata.expertFormats(
+                from: Data(#"{"quant_method": "modelopt"}"#.utf8), layers: 24))
+        XCTAssertThrowsError(
+            try Inkling2QuantizationMetadata.expertFormats(
+                from: Data(
+                    #"{"quant_method": "inkling2", "model": {"parameter_groups": [{"weight_transform": "int4", "tensors": []}]}}"#
+                        .utf8), layers: 24))
+
+        try Device.withDefaultDevice(.cpu) {
+            // Layer 23 of the source holds MXFP8; a sidecar that says NVFP4 is refused.
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("inkling2-sidecar-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            try Data(sidecar.replacingOccurrences(of: "mxfp8_nearest", with: "nvfp4_nearest").utf8)
+                .write(to: directory.appendingPathComponent("hf_quant_config.json"))
+            let config = try configuration("source")
+            let model = Inkling2Model(config)
+            try model.applyQuantizationMetadata(directory: directory)
+            let weights = try Inkling2WeightLayout.convert(try placeholders("source"), configuration: config.text)
+            XCTAssertThrowsError(try model.setExpertFormats(from: weights))
+        }
+    }
+
     /// oMLX wrote the oQ build from the source checkpoint: the converted source must have the oQ
     /// build's keys, and every tensor the oQ build left unquantized must have its shape.
     func testSourceConversionReproducesTheOQLayout() throws {
@@ -324,7 +365,7 @@ final class Inkling2Tests: XCTestCase {
             let source = try Inkling2WeightLayout.convert(try placeholders("source"), configuration: config)
             let oq = try Inkling2WeightLayout.convert(try placeholders("oq4e"), configuration: config)
             func quantizedPrefix(_ key: String) -> String? {
-                for suffix in [".weight", ".scales", ".biases", ".global_scale"] where key.hasSuffix(suffix) {
+                for suffix in [".weight", ".scales", ".biases", ".weight_scale_2"] where key.hasSuffix(suffix) {
                     let prefix = String(key.dropLast(suffix.count))
                     if oq["\(prefix).scales"] != nil { return prefix }
                 }
@@ -348,7 +389,7 @@ final class Inkling2Tests: XCTestCase {
             for layer in 0 ..< 20 {
                 for which in ["w13", "w2"] {
                     let prefix = "model.layers.\(layer).mlp.experts.\(which)"
-                    for suffix in ["weight", "scales", "global_scale"] {
+                    for suffix in ["weight", "scales", "weight_scale_2"] {
                         XCTAssertEqual(
                             source["\(prefix).\(suffix)"]?.shape, oq["\(prefix).\(suffix)"]?.shape,
                             "\(prefix).\(suffix)")
