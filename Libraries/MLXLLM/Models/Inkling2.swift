@@ -1113,6 +1113,35 @@ final class Inkling2Constants {
     }
 }
 
+/// Float32 stacks of completed residual blocks, `[B, L, n, H]`, for one forward pass.
+///
+/// Every residual mix stacks the completed blocks with the current partial state. The block list
+/// only grows by appends and goes back to the prelude's list at each pass, so its stack is built
+/// once per list (extending the longest cached prefix, by array identity) and every mix adds the
+/// partial alone: two copies instead of a cast per bf16 block and a copy per block. The values
+/// and their order are those of `stack([*blocks, partial])`.
+final class Inkling2BlockStacks {
+    private var entries = [(blocks: [MLXArray], stacked: MLXArray)]()
+
+    /// `stack(blocks, axis: -2)` in float32; `blocks` must not be empty.
+    func stacked(_ blocks: [MLXArray]) -> MLXArray {
+        var prefix: (count: Int, stacked: MLXArray)?
+        for entry in entries where entry.blocks.count <= blocks.count {
+            if let prefix, entry.blocks.count <= prefix.count { continue }
+            if zip(entry.blocks, blocks).allSatisfy({ $0 === $1 }) {
+                prefix = (entry.blocks.count, entry.stacked)
+            }
+        }
+        if let prefix, prefix.count == blocks.count { return prefix.stacked }
+        let rest = blocks[(prefix?.count ?? 0)...].map {
+            $0.asType(.float32).expandedDimensions(axis: -2)
+        }
+        let result = concatenated((prefix.map { [$0.stacked] } ?? []) + rest, axis: -2)
+        entries.append((blocks, result))
+        return result
+    }
+}
+
 // MARK: - Modules
 
 /// Softmax mix over completed blocks and the current partial state ("attention residual").
@@ -1132,8 +1161,19 @@ final class Inkling2AttentionResidual: Module {
 
     /// `_attention_residual(stack([*blocks, partial], axis=-2), query)`: `[B, L, queries, H]`,
     /// float32.
-    func callAsFunction(_ blocks: [MLXArray], _ partial: MLXArray) -> MLXArray {
-        let states = stacked((blocks + [partial]).map { $0.asType(.float32) }, axis: -2)
+    ///
+    /// - Parameter stacks: the forward pass's block stacks (fast path), or nil.
+    func callAsFunction(
+        _ blocks: [MLXArray], _ partial: MLXArray, stacks: Inkling2BlockStacks? = nil
+    ) -> MLXArray {
+        let states: MLXArray
+        if let stacks, !blocks.isEmpty {
+            states = concatenated(
+                [stacks.stacked(blocks), partial.asType(.float32).expandedDimensions(axis: -2)],
+                axis: -2)
+        } else {
+            states = stacked((blocks + [partial]).map { $0.asType(.float32) }, axis: -2)
+        }
         if Inkling2FastPath.enabled { return compiled(states, query) }
         let width = states.dim(-1)
         let keys = inkling2UnitRMSNorm(states, eps: 1e-6)
@@ -1604,13 +1644,15 @@ final class Inkling2DecoderLayer: Module {
     ///   - blocks: completed residual blocks; a block-closing layer appends its input.
     ///   - cache: this visit's `(attention cache, ArraysCache(4))`.
     ///   - messages: `[B, L, 4, H]` in passes after the first through the core, else nil.
+    ///   - stacks: the forward pass's block stacks (fast path), or nil.
     func callAsFunction(
-        _ x: MLXArray, blocks: inout [MLXArray], cache: CacheList?, messages: MLXArray?
+        _ x: MLXArray, blocks: inout [MLXArray], cache: CacheList?, messages: MLXArray?,
+        stacks: Inkling2BlockStacks? = nil
     ) -> MLXArray {
         let dtype = x.dtype
         let conv = cache?[1] as? ArraysCache
         let mixed = Inkling2PhaseProfiler.measure(.residualMix) {
-            attentionInput.map { $0(blocks, x) } ?? x.expandedDimensions(axis: -2)
+            attentionInput.map { $0(blocks, x, stacks: stacks) } ?? x.expandedDimensions(axis: -2)
         }
         let attended: MLXArray
         if isSliding, messages == nil, let attentionNorm {
@@ -1651,7 +1693,7 @@ final class Inkling2DecoderLayer: Module {
             residual = residual + x.asType(.float32)
         }
         var hidden = Inkling2PhaseProfiler.measure(.residualMix) {
-            mlpInput(blocks, residual)[.ellipsis, 0, 0...]
+            mlpInput(blocks, residual, stacks: stacks)[.ellipsis, 0, 0...]
         }
         if let messages {
             hidden = Inkling2PhaseProfiler.measure(.messages) {
@@ -1702,6 +1744,7 @@ public final class Inkling2TextModel: Module {
             cache == nil || cache?.count == schedule.count,
             "Inkling 2 requires a separate cache for every layer visit")
         let x = Inkling2PhaseProfiler.measure(.embed) { embedNorm(embed(inputs)) }
+        let stacks = Inkling2FastPath.uses(.blockStack) ? Inkling2BlockStacks() : nil
         let result = Inkling2LoopDriver.run(
             schedule: schedule, hidden: x,
             messageQuery: { (layer: Int) -> MLXArray in
@@ -1718,10 +1761,10 @@ public final class Inkling2TextModel: Module {
                 return list
             }
             return layers[step.layer](
-                hidden, blocks: &blocks, cache: visitCache, messages: messages)
+                hidden, blocks: &blocks, cache: visitCache, messages: messages, stacks: stacks)
         }
         return Inkling2PhaseProfiler.measure(.residualMix) {
-            finalInput(result.blocks, result.hidden)[.ellipsis, 0, 0...]
+            finalInput(result.blocks, result.hidden, stacks: stacks)[.ellipsis, 0, 0...]
         }
     }
 }
