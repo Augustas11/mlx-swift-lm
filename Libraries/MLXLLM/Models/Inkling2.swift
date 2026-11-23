@@ -823,6 +823,26 @@ public enum Inkling2FastPath {
     nonisolated(unsafe) public static var enabled: Bool =
         ProcessInfo.processInfo.environment["INKLING2_COMPILED"] != "0"
 
+    /// Decode levers of the fast path beyond the reference's own fusions. Each is exact (the
+    /// same values in the same op order) and on by default.
+    public enum Lever: String, CaseIterable, Sendable {
+        /// The short-convolution kernel also writes the next float32 state.
+        case convState = "convstate"
+        /// Float32 stacks of completed residual blocks, built once per forward pass.
+        case blockStack = "blockstack"
+        /// Compiled elementwise tails: message controllers, output gate, residual adds,
+        /// dynamic convolutions, log scaling.
+        case fusedTails = "tails"
+    }
+
+    /// Levers switched off, for A/B measurement only: `INKLING2_FAST_OFF`, a comma list of
+    /// ``Lever`` raw values.
+    nonisolated(unsafe) public static var off: Set<Lever> = Set(
+        (ProcessInfo.processInfo.environment["INKLING2_FAST_OFF"] ?? "").split(separator: ",")
+            .compactMap { Lever(rawValue: String($0)) })
+
+    static func uses(_ lever: Lever) -> Bool { enabled && !off.contains(lever) }
+
     static var onGPU: Bool { Device.defaultDevice().deviceType == .gpu }
 }
 
@@ -932,6 +952,46 @@ private final class Inkling2Kernels: @unchecked Sendable {
             """,
         ensureRowContiguous: false)
 
+    /// ``shortConvolution`` with a second output, `nstate [B, W - 1, C]` float32: the last
+    /// `W - 1` rows of the virtual state/input concatenation, the reference's
+    /// `concatenate([state, x], axis=1)[:, -(W - 1):]` (no mask). `out` is computed as in the
+    /// reference kernel; the state rows are copies, so both outputs are exact. The thread of
+    /// each channel's last token writes that channel's state.
+    let shortConvolutionWithState = MLXFast.metalKernel(
+        name: "inkling2_virtual_short_convolution_state",
+        inputNames: ["state", "weight", "x", "mask", "divisor"],
+        outputNames: ["out", "nstate"],
+        source: """
+                uint i = thread_position_in_grid.x;
+                int B = x_shape[0], L = x_shape[1], C = x_shape[2];
+                if (i >= B * L * C) return;
+                int c = i % C, t = (i / C) % L, b = i / (C * L);
+                float value = 0;
+                for (int j = 0; j < W; ++j) {
+                    int p = t + j - W + 1;
+                    float xv = p < 0
+                        ? float(state[b * state_strides[0] + (p + W - 1) * state_strides[1]
+                                      + c * state_strides[2]])
+                        : ((HAS_MASK && !mask[b * mask_strides[0] + p * mask_strides[1]])
+                            ? 0.0f
+                            : float(x[b * x_strides[0] + p * x_strides[1] + c * x_strides[2]]));
+                    float w = weight[c * weight_strides[0] + j * weight_strides[1]];
+                    value = value + xv * w;
+                }
+                out[i] = T((value + float(x[b * x_strides[0] + t * x_strides[1]
+                                           + c * x_strides[2]])) / divisor);
+                if (t == L - 1) {
+                    for (int s = 0; s < W - 1; ++s) {
+                        int p = L + s - (W - 1);
+                        nstate[(b * (W - 1) + s) * C + c] = p < 0
+                            ? float(state[b * state_strides[0] + (p + W - 1) * state_strides[1]
+                                          + c * state_strides[2]])
+                            : float(x[b * x_strides[0] + p * x_strides[1] + c * x_strides[2]]);
+                    }
+                }
+            """,
+        ensureRowContiguous: false)
+
     /// mlx-vlm `models/inkling/language.py` `_mask_v2_kernel`.
     let bandedMask = MLXFast.metalKernel(
         name: "inkling_banded_mask_v2",
@@ -982,16 +1042,26 @@ private func inkling2KernelShortConvolution(
     else { return nil }
     let (batch, channels) = (x.dim(0), x.dim(2))
     let previous = state?[slot] ?? MLXArray.zeros([batch, kernel - 1, channels], dtype: .float32)
+    let kernels = Inkling2Kernels.shared
+    let inputs: [any ScalarOrArray] = [previous, taps, x, kernels.noMask, kernels.divisor4]
+    let template: [(String, any KernelTemplateArg)] = [
+        ("T", x.dtype), ("W", kernel), ("HAS_MASK", false),
+    ]
+    if Inkling2FastPath.uses(.convState) {
+        // One dispatch instead of the kernel plus a cast and a two-part concatenation.
+        let results = kernels.shortConvolutionWithState(
+            inputs, template: template, grid: (x.size, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [x.shape, [batch, kernel - 1, channels]],
+            outputDTypes: [x.dtype, .float32])
+        state?[slot] = results[1]
+        return results[0]
+    }
     if let state {
         let context = concatenated([previous, x.asType(.float32)], axis: 1)
         state[slot] = context[0..., (context.dim(1) - (kernel - 1))..., 0...]
     }
-    return Inkling2Kernels.shared.shortConvolution(
-        [
-            previous, taps, x, Inkling2Kernels.shared.noMask, Inkling2Kernels.shared.divisor4,
-        ],
-        template: [("T", x.dtype), ("W", kernel), ("HAS_MASK", false)],
-        grid: (x.size, 1, 1), threadGroup: (256, 1, 1),
+    return kernels.shortConvolution(
+        inputs, template: template, grid: (x.size, 1, 1), threadGroup: (256, 1, 1),
         outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
 }
 
