@@ -161,20 +161,76 @@ final class Inkling2ParityTests: XCTestCase {
 /// dump's output directory). `INKLING2_REAL_MODE=exact` (the default) requires every greedy
 /// token to match; `report` only records the comparison. `INKLING2_REAL_REPORT` writes the
 /// numbers as JSON. Runs on the GPU unless `INKLING2_REAL_DEVICE=cpu`; use the oracle's device.
+///
+/// Where the logits differ, per decode step: the largest |Δlogit| and the vocabulary id it sits
+/// at, that id's rank and logit in the oracle row, the largest |Δlogit| over the oracle's top
+/// ``topK`` ids, the mean |Δlogit| and the KL divergence. The worst step is repeated at the top
+/// of each row, so a tail-only difference (large max, small top-k difference and KL) is told
+/// apart from one bad step or one bad vocabulary row.
 final class Inkling2RealParityTests: XCTestCase {
+    private struct Step: Encodable {
+        let maxLogitDifference: Float
+        let maxDifferenceVocabularyId: Int
+        /// The oracle's logit at that id, ours, and the id's rank in the oracle row (0 = top).
+        let referenceLogit: Float
+        let portLogit: Float
+        let referenceRank: Int
+        let topKLogitDifference: Float
+        let meanAbsoluteLogitDifference: Float
+        let kl: Float
+    }
+
     private struct Row: Encodable {
         let length: Int
         let steps: Int
         let firstMismatch: Int?
         let matchingTokens: Int
         let meanKL: Float
+        let maxKL: Float
+        let maxKLStep: Int
         let maxLogitDifference: Float
+        let maxDifferenceStep: Int
+        let maxDifferenceVocabularyId: Int
+        let maxDifferenceReferenceLogit: Float
+        let maxDifferencePortLogit: Float
+        let maxDifferenceReferenceRank: Int
+        /// Largest |Δlogit| over the oracle's top-k ids, across all steps.
+        let maxTopKLogitDifference: Float
+        let topK: Int
         let prefillSeconds: Double
+        /// Forward, argmax and cache evaluation only; the diagnostics above are not timed.
         let decodeTokensPerSecond: Double
+        let perStep: [Step]
     }
 
     /// The oracle's schedule: chunks of 2048 over all prompt tokens but the last.
     private static let prefillStep = 2048
+    private static let topK = 20
+
+    /// Compares one row of our logits with the oracle's row; both float32 `[vocabulary]`.
+    private func compare(_ row: MLXArray, _ reference: MLXArray) -> Step {
+        let referenceLog = reference - logSumExp(reference, axis: -1, keepDims: true)
+        let log = row - logSumExp(row, axis: -1, keepDims: true)
+        let kl = (exp(referenceLog) * (referenceLog - log)).sum()
+        let difference = abs(row - reference)
+        let worst = argMax(difference)
+        let top = argPartition(-reference, kth: Self.topK - 1)[..<Self.topK]
+        let topDifference = take(difference, top).max()
+        let referenceAtWorst = take(reference, worst)
+        let rank = (reference .> referenceAtWorst).asType(.int32).sum()
+        let mean = difference.mean()
+        eval(kl, worst, topDifference, referenceAtWorst, rank, mean)
+        let id = worst.item(Int.self)
+        return Step(
+            maxLogitDifference: difference[id].item(Float.self),
+            maxDifferenceVocabularyId: id,
+            referenceLogit: referenceAtWorst.item(Float.self),
+            portLogit: row[id].item(Float.self),
+            referenceRank: rank.item(Int.self),
+            topKLogitDifference: topDifference.item(Float.self),
+            meanAbsoluteLogitDifference: mean.item(Float.self),
+            kl: kl.item(Float.self))
+    }
 
     func testGreedyTokensMatchMLXVLMOracle() throws {
         let environment = ProcessInfo.processInfo.environment
@@ -230,38 +286,57 @@ final class Inkling2RealParityTests: XCTestCase {
 
                 var input = rest.tokens.reshaped(1, rest.tokens.size)
                 var tokens = [Int]()
-                var divergences = [Float]()
-                var worst: Float = 0
-                let decodeBegin = Date()
+                var steps = [Step]()
+                var decodeSeconds = 0.0
                 for step in expected.indices {
+                    let stepBegin = Date()
                     let row = model(input, cache: cache)[0, -1].asType(.float32)
                     eval(row)
                     eval(cache)
                     tokens.append(argMax(row, axis: -1).item(Int.self))
+                    decodeSeconds += Date().timeIntervalSince(stepBegin)
 
-                    let reference = logits[step]
-                    let referenceLog = reference - logSumExp(reference, axis: -1, keepDims: true)
-                    let log = row - logSumExp(row, axis: -1, keepDims: true)
-                    divergences.append(
-                        (exp(referenceLog) * (referenceLog - log)).sum().item(Float.self))
-                    worst = max(worst, abs(row - reference).max().item(Float.self))
+                    steps.append(compare(row, logits[step]))
 
                     // Follow the oracle's token so one miss does not corrupt later comparisons.
                     input = MLXArray([Int32(expected[step])]).reshaped(1, 1)
                 }
-                let decodeSeconds = Date().timeIntervalSince(decodeBegin)
 
+                let worst = steps.indices.max { steps[$0].maxLogitDifference < steps[$1].maxLogitDifference } ?? 0
+                let worstKL = steps.indices.max { steps[$0].kl < steps[$1].kl } ?? 0
                 let result = Row(
                     length: prompt.size, steps: expected.count,
                     firstMismatch: zip(tokens, expected).enumerated()
                         .first { $0.element.0 != $0.element.1 }?.offset,
                     matchingTokens: zip(tokens, expected).filter { $0 == $1 }.count,
-                    meanKL: divergences.reduce(0, +) / Float(max(divergences.count, 1)),
-                    maxLogitDifference: worst,
+                    meanKL: steps.map(\.kl).reduce(0, +) / Float(max(steps.count, 1)),
+                    maxKL: steps.isEmpty ? 0 : steps[worstKL].kl,
+                    maxKLStep: worstKL,
+                    maxLogitDifference: steps.isEmpty ? 0 : steps[worst].maxLogitDifference,
+                    maxDifferenceStep: worst,
+                    maxDifferenceVocabularyId: steps.isEmpty ? -1 : steps[worst].maxDifferenceVocabularyId,
+                    maxDifferenceReferenceLogit: steps.isEmpty ? 0 : steps[worst].referenceLogit,
+                    maxDifferencePortLogit: steps.isEmpty ? 0 : steps[worst].portLogit,
+                    maxDifferenceReferenceRank: steps.isEmpty ? -1 : steps[worst].referenceRank,
+                    maxTopKLogitDifference: steps.map(\.topKLogitDifference).max() ?? 0,
+                    topK: Self.topK,
                     prefillSeconds: prefillSeconds,
-                    decodeTokensPerSecond: Double(expected.count) / decodeSeconds)
+                    decodeTokensPerSecond: Double(expected.count) / decodeSeconds,
+                    perStep: steps)
                 report.append(result)
-                print("inkling2 real parity \(result)")
+                let mismatch = result.firstMismatch.map { "\($0)" } ?? "none"
+                let stepMaxima = steps.map { ($0.maxLogitDifference * 100).rounded() / 100 }
+                let fields: [String] = [
+                    "inkling2 real parity length=\(result.length)",
+                    "matching=\(result.matchingTokens)/\(result.steps) firstMismatch=\(mismatch)",
+                    "meanKL=\(result.meanKL) maxKL=\(result.maxKL)@step\(result.maxKLStep)",
+                    "maxDiff=\(result.maxLogitDifference)@step\(result.maxDifferenceStep)/id\(result.maxDifferenceVocabularyId)",
+                    "oracleLogit=\(result.maxDifferenceReferenceLogit) oracleRank=\(result.maxDifferenceReferenceRank)",
+                    "portLogit=\(result.maxDifferencePortLogit) top\(Self.topK)Diff=\(result.maxTopKLogitDifference)",
+                    "prefill=\(result.prefillSeconds)s decode=\(result.decodeTokensPerSecond)tok/s",
+                    "stepMaxDiffs=\(stepMaxima)",
+                ]
+                print(fields.joined(separator: " "))
                 if exact {
                     XCTAssertEqual(tokens, expected, "greedy tokens at prompt length \(prompt.size)")
                 }
