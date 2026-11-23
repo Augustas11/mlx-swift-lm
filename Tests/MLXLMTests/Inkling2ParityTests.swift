@@ -161,9 +161,10 @@ final class Inkling2ParityTests: XCTestCase {
 /// (the dump's output directory for that checkpoint). The layout is read from the checkpoint's
 /// index with the loader's own `Inkling2WeightLayout.kind`; `INKLING2_REAL_LAYOUT` (`source` or
 /// `oq`), when set, must agree, and so must the layout the oracle's `oracle.json` records
-/// (oracles written before it recorded one are source oracles). `INKLING2_REAL_MODE=exact` (the default) requires every greedy
-/// token to match; `report` only records the comparison. `INKLING2_REAL_REPORT` writes the
-/// numbers as JSON. Runs on the GPU unless `INKLING2_REAL_DEVICE=cpu`; use the oracle's device.
+/// (oracles written before it recorded one are source oracles). `INKLING2_REAL_MODE=exact` (the
+/// default) requires every greedy token to match; `report` only records the comparison.
+/// `INKLING2_REAL_REPORT` writes the numbers as JSON. Runs on the GPU unless
+/// `INKLING2_REAL_DEVICE=cpu`; use the oracle's device.
 ///
 /// Where the logits differ, per decode step: the largest |Δlogit| and the vocabulary id it sits
 /// at, that id's rank and logit in the oracle row, the largest |Δlogit| over the oracle's top
