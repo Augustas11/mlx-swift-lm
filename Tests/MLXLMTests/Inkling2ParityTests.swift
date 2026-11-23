@@ -155,10 +155,13 @@ final class Inkling2ParityTests: XCTestCase {
     }
 }
 
-/// Real-weight parity against `tools/inkling2_parity/dump_real_oracle.py` (mlx-vlm f1618d6d on
-/// the source checkpoint, 1024 and 8192 tokens, prefill 2048). Needs `INKLING2_REAL_MODEL` (the
-/// source checkpoint directory, with `hf_quant_config.json`) and `INKLING2_REAL_ORACLE` (the
-/// dump's output directory). `INKLING2_REAL_MODE=exact` (the default) requires every greedy
+/// Real-weight parity against `tools/inkling2_parity/dump_real_oracle.py` (mlx-vlm f1618d6d,
+/// 1024 and 8192 tokens, prefill 2048). Needs `INKLING2_REAL_MODEL` (the source checkpoint
+/// directory, with `hf_quant_config.json`, or the oQ4e-mtp directory) and `INKLING2_REAL_ORACLE`
+/// (the dump's output directory for that checkpoint). The layout is read from the checkpoint's
+/// index with the loader's own `Inkling2WeightLayout.kind`; `INKLING2_REAL_LAYOUT` (`source` or
+/// `oq`), when set, must agree, and so must the layout the oracle's `oracle.json` records
+/// (oracles written before it recorded one are source oracles). `INKLING2_REAL_MODE=exact` (the default) requires every greedy
 /// token to match; `report` only records the comparison. `INKLING2_REAL_REPORT` writes the
 /// numbers as JSON. Runs on the GPU unless `INKLING2_REAL_DEVICE=cpu`; use the oracle's device.
 ///
@@ -181,6 +184,7 @@ final class Inkling2RealParityTests: XCTestCase {
     }
 
     private struct Row: Encodable {
+        let layout: String
         let length: Int
         let steps: Int
         let firstMismatch: Int?
@@ -206,6 +210,29 @@ final class Inkling2RealParityTests: XCTestCase {
     /// The oracle's schedule: chunks of 2048 over all prompt tokens but the last.
     private static let prefillStep = 2048
     private static let topK = 20
+
+    /// `source` or `oq`, from the tensor names in `model.safetensors.index.json`.
+    private static func layout(of directory: URL) throws -> String {
+        let url = directory.appendingPathComponent("model.safetensors.index.json")
+        guard
+            let index = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any],
+            let map = index["weight_map"] as? [String: Any]
+        else {
+            throw XCTSkip("\(url.path) has no weight_map")
+        }
+        switch try Inkling2WeightLayout.kind(of: map.keys.filter { !Inkling2WeightLayout.isDropped($0) }) {
+        case .oq: return "oq"
+        case .source: return "source"
+        }
+    }
+
+    /// The layout `oracle.json` records; oracles from before slice 4 are source oracles.
+    private static func oracleLayout(_ directory: URL) throws -> String {
+        let url = directory.appendingPathComponent("oracle.json")
+        guard FileManager.default.fileExists(atPath: url.path) else { return "source" }
+        let meta = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+        return meta?["layout"] as? String ?? "source"
+    }
 
     /// Compares one row of our logits with the oracle's row; both float32 `[vocabulary]`.
     private func compare(_ row: MLXArray, _ reference: MLXArray) -> Step {
@@ -244,6 +271,16 @@ final class Inkling2RealParityTests: XCTestCase {
 
         try Device.withDefaultDevice(device) {
             let directory = URL(fileURLWithPath: (modelPath as NSString).expandingTildeInPath)
+            let oracleDirectory = URL(fileURLWithPath: (oraclePath as NSString).expandingTildeInPath)
+            let layout = try Self.layout(of: directory)
+            if let wanted = environment["INKLING2_REAL_LAYOUT"] {
+                XCTAssertEqual(layout, wanted, "INKLING2_REAL_LAYOUT disagrees with \(modelPath)")
+                guard layout == wanted else { return }
+            }
+            let oracleLayout = try Self.oracleLayout(oracleDirectory)
+            XCTAssertEqual(oracleLayout, layout, "the oracle in \(oraclePath) is for the other layout")
+            guard oracleLayout == layout else { return }
+            print("inkling2 real parity layout=\(layout) model=\(modelPath) oracle=\(oraclePath)")
             let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
             let configuration = try JSONDecoder().decode(Inkling2Configuration.self, from: data)
             try configuration.validateModelConfiguration()
@@ -255,7 +292,6 @@ final class Inkling2RealParityTests: XCTestCase {
                 perLayerQuantization: base.perLayerQuantization)
             model.train(false)
 
-            let oracleDirectory = URL(fileURLWithPath: (oraclePath as NSString).expandingTildeInPath)
             let oracles = try FileManager.default.contentsOfDirectory(
                 at: oracleDirectory, includingPropertiesForKeys: nil
             )
@@ -305,7 +341,7 @@ final class Inkling2RealParityTests: XCTestCase {
                 let worst = steps.indices.max { steps[$0].maxLogitDifference < steps[$1].maxLogitDifference } ?? 0
                 let worstKL = steps.indices.max { steps[$0].kl < steps[$1].kl } ?? 0
                 let result = Row(
-                    length: prompt.size, steps: expected.count,
+                    layout: layout, length: prompt.size, steps: expected.count,
                     firstMismatch: zip(tokens, expected).enumerated()
                         .first { $0.element.0 != $0.element.1 }?.offset,
                     matchingTokens: zip(tokens, expected).filter { $0 == $1 }.count,
@@ -327,7 +363,7 @@ final class Inkling2RealParityTests: XCTestCase {
                 let mismatch = result.firstMismatch.map { "\($0)" } ?? "none"
                 let stepMaxima = steps.map { ($0.maxLogitDifference * 100).rounded() / 100 }
                 let fields: [String] = [
-                    "inkling2 real parity length=\(result.length)",
+                    "inkling2 real parity layout=\(layout) length=\(result.length)",
                     "matching=\(result.matchingTokens)/\(result.steps) firstMismatch=\(mismatch)",
                     "meanKL=\(result.meanKL) maxKL=\(result.maxKL)@step\(result.maxKLStep)",
                     "maxDiff=\(result.maxLogitDifference)@step\(result.maxDifferenceStep)/id\(result.maxDifferenceVocabularyId)",
