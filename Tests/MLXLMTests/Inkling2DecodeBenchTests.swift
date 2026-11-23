@@ -11,7 +11,9 @@ import XCTest
 /// otherwise. Run it alone in a Studio window, release build, GPU.
 ///
 /// For each path in `INKLING2_BENCH_PATHS` (default `compiled,plain`; ``Inkling2FastPath``) and
-/// each context in `INKLING2_BENCH_CONTEXTS` (default `1024,8192,32768`):
+/// each context in `INKLING2_BENCH_CONTEXTS` (default `1024,8192,32768`). A compiled path may name
+/// fast-path levers to switch off for an A/B, `compiled~tails~blockstack` (raw values of
+/// ``Inkling2FastPath/Lever``); the row prints that name.
 ///
 /// 1. warm-up: a prefill of `min(context, 4096)` tokens on a fresh cache, which traces every
 ///    compiled function and kernel for the chunk shapes the timed prefill uses;
@@ -92,7 +94,11 @@ final class Inkling2DecodeBenchTests: XCTestCase {
         let steps = Int(environment["INKLING2_BENCH_STEPS"] ?? "") ?? 64
         let profiledSteps = Int(environment["INKLING2_BENCH_PROFILE_STEPS"] ?? "") ?? 16
         let wasEnabled = Inkling2FastPath.enabled
-        defer { Inkling2FastPath.enabled = wasEnabled }
+        let wasOff = Inkling2FastPath.off
+        defer {
+            Inkling2FastPath.enabled = wasEnabled
+            Inkling2FastPath.off = wasOff
+        }
 
         try Device.withDefaultDevice(.gpu) {
             let directory = URL(fileURLWithPath: (modelPath as NSString).expandingTildeInPath)
@@ -109,8 +115,14 @@ final class Inkling2DecodeBenchTests: XCTestCase {
 
             var report = [Row]()
             for path in paths {
-                XCTAssertTrue(["compiled", "plain"].contains(path), "unknown path \(path)")
-                Inkling2FastPath.enabled = path == "compiled"
+                let parts = path.split(separator: "~").map(String.init)
+                let off = parts.dropFirst().compactMap(Inkling2FastPath.Lever.init(rawValue:))
+                XCTAssertTrue(
+                    ["compiled", "plain"].contains(parts.first ?? "")
+                        && off.count == parts.count - 1 && (off.isEmpty || parts[0] == "compiled"),
+                    "unknown path \(path)")
+                Inkling2FastPath.enabled = parts.first == "compiled"
+                Inkling2FastPath.off = Set(off)
                 for context in contexts {
                     let tokens = prompt(length: context)
 
