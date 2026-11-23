@@ -764,6 +764,9 @@ public final class LLMModelFactory: GenericModelFactory {
         async let tokenizerTask = tokenizerLoader.load(
             from: configuration.tokenizerDirectory)
 
+        // The Inkling 2 source checkpoint declares its expert formats in a sidecar file.
+        try (model as? Inkling2Model)?.applyQuantizationMetadata(directory: modelDirectory)
+
         try await loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization,
