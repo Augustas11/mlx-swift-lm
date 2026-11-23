@@ -473,8 +473,7 @@ public enum Inkling2LoopDriver {
     /// `rms_norm(stack(states, axis: -2), None, eps)` in float32: `[..., n, H]`.
     static func messageBank(_ states: [MLXArray], eps: Float) -> MLXArray {
         let states = MLX.stacked(states, axis: -2).asType(.float32)
-        return MLXFast.rmsNorm(
-            states, weight: MLXArray.ones([states.dim(-1)], dtype: .float32), eps: eps)
+        return MLXFast.rmsNorm(states, weight: MLXArray.mlxNone, eps: eps)
     }
 
     /// `softmax(query @ bank^T / sqrt(H)) @ bank` for `[4, H]` queries: `[..., 4, H]`.
@@ -679,9 +678,10 @@ public enum Inkling2QuantizationMetadata {
 
 // MARK: - Arithmetic helpers
 
-/// `mx.fast.rms_norm(x, None, eps)`: RMS normalisation without a gain.
+/// `mx.fast.rms_norm(x, None, eps)`: RMS normalisation without a gain. No weight array is
+/// passed (the reference's call), so no ones vector is filled on the GPU on every call.
 private func inkling2UnitRMSNorm(_ x: MLXArray, eps: Float) -> MLXArray {
-    MLXFast.rmsNorm(x, weight: MLXArray.ones([x.dim(-1)], dtype: x.dtype), eps: eps)
+    MLXFast.rmsNorm(x, weight: MLXArray.mlxNone, eps: eps)
 }
 
 /// `l2_clip`: scale rows whose L2 norm exceeds `threshold` down to it, in float32.
@@ -814,8 +814,7 @@ private func inkling2BandedMask(
 ///   heads, at most 15 rows, GPU).
 ///
 /// Not mirrored: the NVFP4 tensor scale inside `gather_qmm` (the pinned mlx-swift binding has no
-/// `global_scale` argument; the product is scaled after it, in one compiled multiply and cast),
-/// and `rms_norm(x, None)` (mlx-swift needs a weight; a ones vector is passed).
+/// `global_scale` argument; the product is scaled after it, in one compiled multiply and cast).
 ///
 /// The fast path is not the same op sequence as the portable path (fused kernels accumulate in
 /// float32 where the portable mask runs a bf16 matmul), so the plain path stays as the parity
@@ -882,8 +881,7 @@ private func inkling2CompiledAttentionResidual(normalizesValues: Bool)
 {
     compile(shapeless: false) { states, query in
         let width = states.dim(-1)
-        let keys = MLXFast.rmsNorm(
-            states, weight: MLXArray.ones([width], dtype: .float32), eps: 1e-6)
+        let keys = MLXFast.rmsNorm(states, weight: MLXArray.mlxNone, eps: 1e-6)
         let scores =
             matmul(keys, query.reshaped(-1, width).transposed()) * inkling2InverseSquareRoot(width)
         let weights = softmax(scores, axis: -2).swappedAxes(-1, -2)
@@ -900,6 +898,12 @@ private let inkling2CompiledScaleProduct: @Sendable (MLXArray, MLXArray, MLXArra
 
 private final class Inkling2Kernels: @unchecked Sendable {
     static let shared = Inkling2Kernels()
+
+    /// The short convolution's unread mask (`HAS_MASK` false) and its `sqrt(width + 1)` divisor
+    /// for width 4, as the reference passes them, but held once: host data, so no fill kernel
+    /// runs per call.
+    let noMask = MLXArray([false], [1, 1])
+    let divisor4 = MLXArray(Float(Double(5).squareRoot()))
 
     /// mlx-vlm `models/inkling2/kernels.py` `_short_convolution` (math mode safe, MLX's default).
     let shortConvolution = MLXFast.metalKernel(
@@ -984,8 +988,7 @@ private func inkling2KernelShortConvolution(
     }
     return Inkling2Kernels.shared.shortConvolution(
         [
-            previous, taps, x, MLXArray.zeros([1, 1], dtype: .bool),
-            MLXArray(Float(Double(kernel + 1).squareRoot())),
+            previous, taps, x, Inkling2Kernels.shared.noMask, Inkling2Kernels.shared.divisor4,
         ],
         template: [("T", x.dtype), ("W", kernel), ("HAS_MASK", false)],
         grid: (x.size, 1, 1), threadGroup: (256, 1, 1),
@@ -1023,6 +1026,20 @@ final class Inkling2HeadProjectionCache {
         source = weight
         projected = converted
         return converted
+    }
+}
+
+/// Constant zero arrays built and evaluated once per shape and dtype. Not a module parameter.
+final class Inkling2Constants {
+    private var zeros = [String: MLXArray]()
+
+    func zeros(_ shape: [Int], _ dtype: DType) -> MLXArray {
+        let key = "\(shape) \(dtype)"
+        if let cached = zeros[key] { return cached }
+        let value = MLXArray.zeros(shape, dtype: dtype)
+        eval(value)
+        zeros[key] = value
+        return value
     }
 }
 
@@ -1249,6 +1266,8 @@ final class Inkling2Attention: Module {
     private let queryClip: @Sendable (MLXArray, MLXArray) -> MLXArray
     private let keyClip: @Sendable (MLXArray) -> MLXArray
     private let relativeClip: @Sendable (MLXArray, MLXArray) -> MLXArray
+    /// The sink's zero key/value row, filled once per shape instead of on every call.
+    private let constants = Inkling2Constants()
 
     @ModuleInfo(key: "in_proj") var inProj: Linear?
     @ModuleInfo(key: "q_proj") var queryProj: Linear?
@@ -1415,10 +1434,9 @@ final class Inkling2Attention: Module {
         let sinks = inkling2Project(projection, queryRanges[s], x).transposed(0, 2, 1)
             .expandedDimensions(axis: -1)
         mask = concatenated([mask, sinks], axis: -1)
-        keys = concatenated(
-            [keys, MLXArray.zeros([batch, kvHeads, 1, headDim], dtype: keys.dtype)], axis: 2)
-        values = concatenated(
-            [values, MLXArray.zeros([batch, kvHeads, 1, headDim], dtype: values.dtype)], axis: 2)
+        let row = [batch, kvHeads, 1, headDim]
+        keys = concatenated([keys, constants.zeros(row, keys.dtype)], axis: 2)
+        values = concatenated([values, constants.zeros(row, values.dtype)], axis: 2)
         var out = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values,
             scale: inkling2InverseSquareRoot(headDim), mask: mask)
