@@ -240,6 +240,27 @@ final class Inkling2RealParityTests: XCTestCase {
         return meta?["layout"] as? String ?? "source"
     }
 
+    private static func loadModel(_ directory: URL) throws -> Inkling2Model {
+        let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+        let configuration = try JSONDecoder().decode(Inkling2Configuration.self, from: data)
+        try configuration.validateModelConfiguration()
+        let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
+        let model = Inkling2Model(configuration, quantization: base.perLayerQuantization)
+        try model.applyQuantizationMetadata(directory: directory)
+        try loadWeights(
+            modelDirectory: directory, model: model,
+            perLayerQuantization: base.perLayerQuantization)
+        model.train(false)
+        return model
+    }
+
+    /// `oracle-<length>.safetensors` files, shortest prompt first.
+    private static func oracleFiles(_ directory: URL) throws -> [URL] {
+        try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix("oracle-") && $0.pathExtension == "safetensors" }
+            .sorted { $0.path.compare($1.path, options: .numeric) == .orderedAscending }
+    }
+
     /// Compares one row of our logits with the oracle's row; both float32 `[vocabulary]`.
     private func compare(_ row: MLXArray, _ reference: MLXArray) -> Step {
         let referenceLog = reference - logSumExp(reference, axis: -1, keepDims: true)
@@ -287,22 +308,9 @@ final class Inkling2RealParityTests: XCTestCase {
             XCTAssertEqual(oracleLayout, layout, "the oracle in \(oraclePath) is for the other layout")
             guard oracleLayout == layout else { return }
             print("inkling2 real parity layout=\(layout) model=\(modelPath) oracle=\(oraclePath)")
-            let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
-            let configuration = try JSONDecoder().decode(Inkling2Configuration.self, from: data)
-            try configuration.validateModelConfiguration()
-            let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
-            let model = Inkling2Model(configuration, quantization: base.perLayerQuantization)
-            try model.applyQuantizationMetadata(directory: directory)
-            try loadWeights(
-                modelDirectory: directory, model: model,
-                perLayerQuantization: base.perLayerQuantization)
-            model.train(false)
+            let model = try Self.loadModel(directory)
 
-            let oracles = try FileManager.default.contentsOfDirectory(
-                at: oracleDirectory, includingPropertiesForKeys: nil
-            )
-            .filter { $0.lastPathComponent.hasPrefix("oracle-") && $0.pathExtension == "safetensors" }
-            .sorted { $0.path.compare($1.path, options: .numeric) == .orderedAscending }
+            let oracles = try Self.oracleFiles(oracleDirectory)
             XCTAssertFalse(oracles.isEmpty, "no oracle files in \(oraclePath)")
 
             var report = [Row]()
@@ -389,6 +397,76 @@ final class Inkling2RealParityTests: XCTestCase {
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
                 try encoder.encode(report).write(to: URL(fileURLWithPath: path))
+            }
+        }
+    }
+
+    /// Every fast-path lever (``Inkling2FastPath/Lever``) leaves the logits bit-identical: on the
+    /// shortest oracle prompt, prefill and 16 decode steps with all levers off are the reference;
+    /// all levers on, and each lever alone, must give equal float32 logit rows, step by step, on
+    /// the same token sequence. Fast path only; skipped with `INKLING2_COMPILED=0`. Prints one
+    /// `inkling2 lever exactness` line per configuration.
+    func testFastPathLeversAreBitExact() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let modelPath = environment["INKLING2_REAL_MODEL"],
+            let oraclePath = environment["INKLING2_REAL_ORACLE"]
+        else {
+            throw XCTSkip("INKLING2_REAL_MODEL and INKLING2_REAL_ORACLE are not set")
+        }
+        guard Inkling2FastPath.enabled else {
+            throw XCTSkip("the levers belong to the fast path (INKLING2_COMPILED=0)")
+        }
+        let device: Device = environment["INKLING2_REAL_DEVICE"] == "cpu" ? .cpu : .gpu
+        let wasOff = Inkling2FastPath.off
+        defer { Inkling2FastPath.off = wasOff }
+        let steps = 16
+
+        try Device.withDefaultDevice(device) {
+            let directory = URL(fileURLWithPath: (modelPath as NSString).expandingTildeInPath)
+            let oracleDirectory = URL(fileURLWithPath: (oraclePath as NSString).expandingTildeInPath)
+            let model = try Self.loadModel(directory)
+            let url = try XCTUnwrap(try Self.oracleFiles(oracleDirectory).first, "no oracle files")
+            let prompt = try XCTUnwrap(try loadArrays(url: url)["prompt"])
+
+            /// Logit rows `[steps, vocabulary]` and the tokens fed; `feed` fixes the tokens.
+            func run(off: Set<Inkling2FastPath.Lever>, feed: [Int]?) throws -> (MLXArray, [Int]) {
+                Inkling2FastPath.off = off
+                let cache = try model.newCache(parameters: nil)
+                guard
+                    case .tokens(let rest) = try model.prepare(
+                        LMInput(tokens: prompt), cache: cache,
+                        prefill: PrefillParameters(stepSize: Self.prefillStep, chunking: .remainder))
+                else {
+                    throw XCTSkip("prepare did not hand tokens to the iterator")
+                }
+                var input = rest.tokens.reshaped(1, rest.tokens.size)
+                var rows = [MLXArray]()
+                var tokens = [Int]()
+                for step in 0 ..< steps {
+                    let row = model(input, cache: cache)[0, -1].asType(.float32)
+                    eval(row)
+                    eval(cache)
+                    let token = feed?[step] ?? argMax(row, axis: -1).item(Int.self)
+                    rows.append(row)
+                    tokens.append(token)
+                    input = MLXArray([Int32(token)]).reshaped(1, 1)
+                }
+                return (stacked(rows), tokens)
+            }
+
+            let all = Set(Inkling2FastPath.Lever.allCases)
+            let (reference, tokens) = try run(off: all, feed: nil)
+            let configurations: [(String, Set<Inkling2FastPath.Lever>)] =
+                [("all", [])]
+                + Inkling2FastPath.Lever.allCases.map { ($0.rawValue, all.subtracting([$0])) }
+            for (name, off) in configurations {
+                let (rows, _) = try run(off: off, feed: tokens)
+                let equal = arrayEqual(rows, reference).item(Bool.self)
+                let difference = abs(rows - reference).max().item(Float.self)
+                print(
+                    "inkling2 lever exactness levers=\(name) length=\(prompt.size) steps=\(steps) "
+                        + "equal=\(equal) maxDiff=\(difference)")
+                XCTAssertTrue(equal, "lever \(name) changes the logits (max |d| \(difference))")
             }
         }
     }
