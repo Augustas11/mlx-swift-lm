@@ -451,7 +451,7 @@ public enum Inkling2LoopDriver {
             if step.layer == schedule.coreStart && step.inCore {
                 if let saved = prelude {
                     let states = Array(blocks[(saved.blocks.count + 1)...]) + [x]
-                    bank = messageBank(states, eps: eps)
+                    bank = Inkling2PhaseProfiler.measure(.messages) { messageBank(states, eps: eps) }
                     x = saved.hidden
                     blocks = saved.blocks
                 } else {
@@ -460,7 +460,9 @@ public enum Inkling2LoopDriver {
             }
             var messages: MLXArray?
             if let bank, step.inCore {
-                messages = Self.messages(query: messageQuery(step.layer), bank: bank)
+                messages = Inkling2PhaseProfiler.measure(.messages) {
+                    Self.messages(query: messageQuery(step.layer), bank: bank)
+                }
             }
             if capturing.contains(step.index) { captures[step.index] = x }
             x = visit(step, x, &blocks, messages)
@@ -481,6 +483,82 @@ public enum Inkling2LoopDriver {
         let scale = Float(pow(Double(bank.dim(-1)), -0.5))
         let scores = matmul(query, bank.swappedAxes(-1, -2)) * scale
         return matmul(softmax(scores, axis: -1), bank)
+    }
+}
+
+// MARK: - Diagnostic phase timing
+
+/// Wall time per phase of Inkling 2 forward passes: the decode time split of slice 5. Off unless
+/// ``active`` is set. When it is set, every phase ends with an `eval` barrier, which removes the
+/// overlap between phases and between host graph building and GPU work, so read the shares, not
+/// the sum, against an unprofiled step. A phase's time includes building its graph on the host.
+/// A nested phase (the K/V convolutions inside attention) is subtracted from the phase that
+/// encloses it; its inputs are evaluated first, on the enclosing phase's clock. Lazy work outside
+/// every phase (slices, casts, the residual add) runs in whichever barrier comes next.
+/// Diagnostic only: never set it while serving.
+public final class Inkling2PhaseProfiler {
+    public enum Phase: String, CaseIterable, Sendable {
+        case embed
+        /// Attention residual mixes (sublayer inputs and the final input).
+        case residualMix
+        /// Sublayer input RMS norms.
+        case norms
+        /// Projections, clips, band mask, cache update and SDPA, output gate and projection.
+        case attention
+        /// Static and dynamic K/V convolutions and the two residual-path convolutions.
+        case shortConvolutions
+        case router
+        /// Expert products, activation and route combine.
+        case experts
+        /// Message bank, message queries and the controllers that blend messages in.
+        case messages
+        /// Final norm, head product, softcap and vocabulary slice.
+        case head
+    }
+
+    nonisolated(unsafe) public static var active: Inkling2PhaseProfiler?
+
+    public private(set) var seconds = [Phase: Double]()
+    public private(set) var calls = [Phase: Int]()
+    private var nested = [Double]()
+
+    public init() {}
+
+    public func reset() {
+        seconds = [:]
+        calls = [:]
+        nested = []
+    }
+
+    /// `inputs` is an autoclosure so that the unprofiled path allocates nothing.
+    static func measure(
+        _ phase: Phase, inputs: @autoclosure () -> [MLXArray] = [], _ body: () -> MLXArray
+    ) -> MLXArray {
+        measure(phase, inputs: inputs(), outputs: { [$0] }, body)
+    }
+
+    static func measure<T>(
+        _ phase: Phase, inputs: @autoclosure () -> [MLXArray] = [], outputs: (T) -> [MLXArray],
+        _ body: () -> T
+    ) -> T {
+        guard let profiler = active else { return body() }
+        return profiler.run(phase, inputs: inputs(), outputs: outputs, body)
+    }
+
+    private func run<T>(
+        _ phase: Phase, inputs: [MLXArray], outputs: (T) -> [MLXArray], _ body: () -> T
+    ) -> T {
+        if !inputs.isEmpty { eval(inputs) }
+        nested.append(0)
+        let start = DispatchTime.now().uptimeNanoseconds
+        let result = body()
+        eval(outputs(result))
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9
+        let inner = nested.removeLast()
+        seconds[phase, default: 0] += elapsed - inner
+        calls[phase, default: 0] += 1
+        if !nested.isEmpty { nested[nested.count - 1] += elapsed }
+        return result
     }
 }
 
@@ -892,11 +970,15 @@ final class Inkling2SparseMoE: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let (indices, weights) = route(x)
-        let out = experts(x, indices)
-        // `_combine_routes`.
-        return (out.asType(.float32) * weights.expandedDimensions(axis: -1)).sum(axis: -2)
-            .asType(out.dtype)
+        let (indices, weights) = Inkling2PhaseProfiler.measure(
+            .router, outputs: { (r: (indices: MLXArray, weights: MLXArray)) in [r.indices, r.weights] }
+        ) { route(x) }
+        return Inkling2PhaseProfiler.measure(.experts) {
+            let out = experts(x, indices)
+            // `_combine_routes`.
+            return (out.asType(.float32) * weights.expandedDimensions(axis: -1)).sum(axis: -2)
+                .asType(out.dtype)
+        }
     }
 }
 
@@ -990,22 +1072,30 @@ final class Inkling2Attention: Module {
         let projection: Linear
         if let inProj, let keyConv, let valueConv {
             projection = inProj
-            keys = inkling2ShortConvolution(
-                inkling2Project(inProj, queryRanges[1], keyInput), taps: keyConv, state: conv,
-                slot: 0)
-            values = inkling2ShortConvolution(
-                inkling2Project(inProj, queryRanges[2], valueInput), taps: valueConv,
-                state: conv, slot: 1)
+            let k = inkling2Project(inProj, queryRanges[1], keyInput)
+            let v = inkling2Project(inProj, queryRanges[2], valueInput)
+            keys = Inkling2PhaseProfiler.measure(.shortConvolutions, inputs: [k]) {
+                inkling2ShortConvolution(k, taps: keyConv, state: conv, slot: 0)
+            }
+            values = Inkling2PhaseProfiler.measure(.shortConvolutions, inputs: [v]) {
+                inkling2ShortConvolution(v, taps: valueConv, state: conv, slot: 1)
+            }
         } else if let queryProj, let keyProj, let valueProj, let keyStatic, let valueStatic {
             projection = queryProj
-            keys = inkling2DynamicShortConvolution(
-                inkling2Project(keyProj, keyValueRanges[0], keyInput),
-                dynamicTaps: inkling2Project(keyProj, keyValueRanges[1], keyInput),
-                staticTaps: keyStatic, heads: kvHeads, state: conv, slot: 0)
-            values = inkling2DynamicShortConvolution(
-                inkling2Project(valueProj, keyValueRanges[0], valueInput),
-                dynamicTaps: inkling2Project(valueProj, keyValueRanges[1], valueInput),
-                staticTaps: valueStatic, heads: kvHeads, state: conv, slot: 1)
+            let k = inkling2Project(keyProj, keyValueRanges[0], keyInput)
+            let kTaps = inkling2Project(keyProj, keyValueRanges[1], keyInput)
+            let v = inkling2Project(valueProj, keyValueRanges[0], valueInput)
+            let vTaps = inkling2Project(valueProj, keyValueRanges[1], valueInput)
+            keys = Inkling2PhaseProfiler.measure(.shortConvolutions, inputs: [k, kTaps]) {
+                inkling2DynamicShortConvolution(
+                    k, dynamicTaps: kTaps, staticTaps: keyStatic, heads: kvHeads, state: conv,
+                    slot: 0)
+            }
+            values = Inkling2PhaseProfiler.measure(.shortConvolutions, inputs: [v, vTaps]) {
+                inkling2DynamicShortConvolution(
+                    v, dynamicTaps: vTaps, staticTaps: valueStatic, heads: kvHeads, state: conv,
+                    slot: 1)
+            }
         } else {
             fatalError("Inkling 2 attention has neither the local nor the global projections")
         }
@@ -1166,17 +1256,25 @@ final class Inkling2DecoderLayer: Module {
     ) -> MLXArray {
         let dtype = x.dtype
         let conv = cache?[1] as? ArraysCache
-        let mixed = attentionInput.map { $0(blocks, x) } ?? x.expandedDimensions(axis: -2)
+        let mixed = Inkling2PhaseProfiler.measure(.residualMix) {
+            attentionInput.map { $0(blocks, x) } ?? x.expandedDimensions(axis: -2)
+        }
         let attended: MLXArray
         if isSliding, messages == nil, let attentionNorm {
-            let input = attentionNorm(mixed[.ellipsis, 0, 0...]).asType(dtype)
-            attended = attention(query: input, key: input, value: input, cache: cache)
+            let input = Inkling2PhaseProfiler.measure(.norms) {
+                attentionNorm(mixed[.ellipsis, 0, 0...]).asType(dtype)
+            }
+            attended = Inkling2PhaseProfiler.measure(.attention) {
+                attention(query: input, key: input, value: input, cache: cache)
+            }
         } else {
             let count = mixed.dim(-2)
             var parts = (0 ..< 3).map { mixed[.ellipsis, Swift.min($0, count - 1), 0...] }
             if let messages {
                 parts = parts.enumerated().map { (i, part) -> MLXArray in
-                    blend(part, messages[.ellipsis, i, 0...], controller: i)
+                    Inkling2PhaseProfiler.measure(.messages) {
+                        blend(part, messages[.ellipsis, i, 0...], controller: i)
+                    }
                 }
             }
             let norms: [RMSNorm?] =
@@ -1185,27 +1283,34 @@ final class Inkling2DecoderLayer: Module {
                 : [queryInputNorm, keyInputNorm, valueInputNorm]
             parts = zip(norms, parts).map { (norm, part) -> MLXArray in
                 guard let norm else { fatalError("Inkling 2 layer \(layer) has no input norm") }
-                return norm(part).asType(dtype)
+                return Inkling2PhaseProfiler.measure(.norms) { norm(part).asType(dtype) }
             }
-            attended = attention(query: parts[0], key: parts[1], value: parts[2], cache: cache)
+            attended = Inkling2PhaseProfiler.measure(.attention) {
+                attention(query: parts[0], key: parts[1], value: parts[2], cache: cache)
+            }
         }
-        var residual = inkling2ShortConvolution(
-            attended, taps: attentionConv, state: conv, slot: 2
-        ).asType(.float32)
+        var residual = Inkling2PhaseProfiler.measure(.shortConvolutions) {
+            inkling2ShortConvolution(attended, taps: attentionConv, state: conv, slot: 2)
+        }.asType(.float32)
         if closesBlock {
             blocks.append(x)
         } else {
             residual = residual + x.asType(.float32)
         }
-        var hidden = mlpInput(blocks, residual)[.ellipsis, 0, 0...]
-        if let messages {
-            hidden = blend(hidden, messages[.ellipsis, 3, 0...], controller: 3)
+        var hidden = Inkling2PhaseProfiler.measure(.residualMix) {
+            mlpInput(blocks, residual)[.ellipsis, 0, 0...]
         }
-        hidden = mlp(mlpNorm(hidden).asType(dtype))
-        let out =
-            (residual
-            + inkling2ShortConvolution(hidden, taps: mlpConv, state: conv, slot: 3)
-            .asType(.float32)).asType(dtype)
+        if let messages {
+            hidden = Inkling2PhaseProfiler.measure(.messages) {
+                blend(hidden, messages[.ellipsis, 3, 0...], controller: 3)
+            }
+        }
+        let normalized = Inkling2PhaseProfiler.measure(.norms) { mlpNorm(hidden).asType(dtype) }
+        hidden = mlp(normalized)
+        let convolved = Inkling2PhaseProfiler.measure(.shortConvolutions) {
+            inkling2ShortConvolution(hidden, taps: mlpConv, state: conv, slot: 3)
+        }
+        let out = (residual + convolved.asType(.float32)).asType(dtype)
         conv?.advance(x.dim(1))
         return out
     }
@@ -1243,7 +1348,7 @@ public final class Inkling2TextModel: Module {
         precondition(
             cache == nil || cache?.count == schedule.count,
             "Inkling 2 requires a separate cache for every layer visit")
-        let x = embedNorm(embed(inputs))
+        let x = Inkling2PhaseProfiler.measure(.embed) { embedNorm(embed(inputs)) }
         let result = Inkling2LoopDriver.run(
             schedule: schedule, hidden: x,
             messageQuery: { (layer: Int) -> MLXArray in
@@ -1262,7 +1367,9 @@ public final class Inkling2TextModel: Module {
             return layers[step.layer](
                 hidden, blocks: &blocks, cache: visitCache, messages: messages)
         }
-        return finalInput(result.blocks, result.hidden)[.ellipsis, 0, 0...]
+        return Inkling2PhaseProfiler.measure(.residualMix) {
+            finalInput(result.blocks, result.hidden)[.ellipsis, 0, 0...]
+        }
     }
 }
 
@@ -1308,7 +1415,8 @@ public final class Inkling2Model: Module, LLMModel {
 
     /// Logits `[B, L, unpadded vocabulary]` for token ids `[B, L]`.
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        logits(fromNormalized: model.norm(model(inputs, cache: cache, schedule: schedule)))
+        let hidden = model(inputs, cache: cache, schedule: schedule)
+        return Inkling2PhaseProfiler.measure(.head) { logits(fromNormalized: model.norm(hidden)) }
     }
 
     /// The reference `_logits_from_norm`: the normalised state rounded to the embedding dtype,
