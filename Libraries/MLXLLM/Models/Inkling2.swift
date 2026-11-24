@@ -1734,28 +1734,9 @@ final class Inkling2SparseMoE: Module {
         if verify, rows > 1 {
             // A speculative verify: a multi-row float32 product takes a different kernel (and K
             // order) from the one-row matrix-vector product, so near-tie experts could swap. Each
-            // row routes exactly as its one-row decode step does (oMLX `_row_matmul`), in one
-            // dispatch per step: the scores over a strided row batch (``inkling2RowBatch``; the
-            // float32 cast first, which the compiled scores then skip, as a cast to the same
-            // type returns its input), and the fused top-k, one threadgroup per row.
-            if Inkling2FastPath.uses(.router), Inkling2FastPath.onGPU {
-                let batch = inkling2RowBatch(x.asType(.float32))
-                let (scores, selection) = inkling2CompiledRouteScores(
-                    batch, routerWeight, routerBias)
-                if supportsFusedRouterTopK(selection[0], k: topK) {
-                    let top = fusedRouterTopK(
-                        selection: selection, values: scores, k: topK, normalize: false,
-                        order: .descending)
-                    // The weights row by row: their sum over one row's experts is a whole-array
-                    // reduction on one row and a row reduction on several, which add in different
-                    // orders.
-                    let weights = concatenated(
-                        (0 ..< rows).map { compiledRouteWeights(top.scores[$0 ..< ($0 + 1)]) },
-                        axis: 0)
-                    let shape = Array(x.shape.dropLast()) + [topK]
-                    return (top.indices.reshaped(shape), weights.reshaped(shape))
-                }
-            }
+            // row routes exactly as its one-row decode step does (oMLX `_row_matmul`). One
+            // dispatch over a strided row batch (``batchedScores(_:)``) does not reproduce the
+            // one-row scores on the GPU yet, so each row routes alone.
             // Each row in the rank and shape a one-row decode step routes.
             let one = Array(repeating: 1, count: x.ndim - 1) + [x.dim(-1)]
             let flat = x.reshaped(rows, x.dim(-1))
@@ -1791,6 +1772,17 @@ final class Inkling2SparseMoE: Module {
         let chosen = takeAlong(scores, indices, axis: -1)
         let weights = chosen / (chosen.sum(axis: -1, keepDims: true) + Float(1e-20)) * routeScale
         return (indices, weights)
+    }
+
+    /// The router scores and selection of every row of `x` in one dispatch over a strided row
+    /// batch (``inkling2RowBatch``), for the bit-equality check against one-row routing.
+    func batchedScores(_ x: MLXArray) -> (scores: MLXArray, selection: MLXArray) {
+        inkling2CompiledRouteScores(inkling2RowBatch(x.asType(.float32)), routerWeight, routerBias)
+    }
+
+    /// One row's router scores and selection as its decode step computes them.
+    func oneRowScores(_ x: MLXArray) -> (scores: MLXArray, selection: MLXArray) {
+        inkling2CompiledRouteScores(x, routerWeight, routerBias)
     }
 
     /// - Parameter verify: a speculative verify: each row routes as its one-row decode step does.

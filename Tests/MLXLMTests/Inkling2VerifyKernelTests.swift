@@ -105,6 +105,31 @@ final class Inkling2VerifyKernelTests: XCTestCase {
         }
     }
 
+    /// Diagnostic, prints only: whether one dispatch over a strided row batch reproduces the
+    /// one-row router scores (compiled and plain float32 products), and the largest difference.
+    func testRouterScoreBatchDiagnostic() throws {
+        try requireGPU()
+        try Device.withDefaultDevice(.gpu) {
+            MLXRandom.seed(19)
+            let weight = MLXRandom.normal([128, 2304]) * 0.02
+            for rows in [2, 8] {
+                let x = MLXRandom.normal([1, rows, 2304]).asType(.bfloat16)
+                let x32 = x.asType(.float32)
+                let plainBatch = matmul(inkling2RowBatch(x32), weight.transposed())
+                let contiguous = matmul(x32.reshaped(rows, 1, 2304), weight.transposed())
+                for row in 0 ..< rows {
+                    let one = matmul(x32[0..., row ..< (row + 1)], weight.transposed())
+                    for (name, batch) in [("strided", plainBatch), ("contiguous", contiguous)] {
+                        let b = batch[row ..< (row + 1)].reshaped(one.shape)
+                        let same = arrayEqual(b, one).item(Bool.self)
+                        let diff = abs(b - one).max().item(Float.self)
+                        print("INKLING2_ROUTER_DIAG \(name) rows=\(rows) row=\(row) equal=\(same) maxdiff=\(diff) strides=\(inkling2RowBatch(x32).strides)")
+                    }
+                }
+            }
+        }
+    }
+
     /// Attention of a verify with the rows folded into the head axis against each row's one-row
     /// call over its own keys, at 24 query and 8 key heads, for key counts on both sides of
     /// MLX's one-pass/two-pass switch. Where MLX would route a row differently from the fold
