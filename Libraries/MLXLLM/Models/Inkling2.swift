@@ -934,9 +934,12 @@ public enum Inkling2FastPath {
 
         public var isExact: Bool {
             switch self {
-            case .convState, .blockStack, .fusedTails, .convAdd, .oneProjection, .router:
+            case .convState, .blockStack, .fusedTails, .convAdd, .router:
                 return true
-            case .residualMix, .controllers, .attentionInputs, .sinkRing: return false
+            // One wide quantized product tiles its reduction differently from the per-part
+            // products (max |d| 1.53 on the real-weights check), so it is gated on token parity.
+            case .residualMix, .controllers, .attentionInputs, .oneProjection, .sinkRing:
+                return false
             }
         }
     }
