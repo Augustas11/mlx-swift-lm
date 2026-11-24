@@ -33,20 +33,25 @@ jobs:
       - name: Compile errors
         if: failure()
         run: grep -E "error:" build.log | sort -u | head -80
-      # CPU-only logic tests (tiny random models, no Metal): speculative verify and rollback
-      # must reproduce ordinary decode exactly.
+      # Loading the test bundle initialises MLX's Metal backend, which needs mlx.metallib even
+      # for CPU-only tests: build it from the resolved mlx-swift checkout.
+      - name: Build mlx.metallib
+        run: |
+          xcodebuild -downloadComponent MetalToolchain >/dev/null 2>&1 || true
+          curl -fsSL https://raw.githubusercontent.com/Augustas11/macprovider/main/phase3-binary/scripts/build-mlx-metallib.sh -o "$RUNNER_TEMP/build-mlx-metallib.sh"
+          MLX_SWIFT_CHECKOUT="$PWD/.build/checkouts/mlx-swift" bash "$RUNNER_TEMP/build-mlx-metallib.sh" "$RUNNER_TEMP/metallib"
+          for x in .build/arm64-apple-macosx/debug/*.xctest/Contents/MacOS; do cp "$RUNNER_TEMP/metallib/mlx.metallib" "$x/"; done
+          cp "$RUNNER_TEMP/metallib/mlx.metallib" .build/arm64-apple-macosx/debug/
+      # CPU-only logic tests (tiny random models): speculative verify and rollback must
+      # reproduce ordinary decode exactly.
       - name: CPU speculative-round tests
         run: |
           swift test --skip-build --filter "Inkling2SpeculativeRoundTests|ConvolutionTailRound|KVCacheRoundTests" 2>&1 | tee test.log
           exit ${PIPESTATUS[0]}
-      # The runner's paravirtual GPU: build mlx.metallib from the resolved mlx-swift and run the
-      # bit-exact verify-row test. Informational until the runner's Metal support is proven.
+      # The runner's paravirtual GPU: the bit-exact verify-row test. Informational until the
+      # runner's Metal support is proven.
       - name: GPU verify-row bit-exactness (hosted GPU)
         continue-on-error: true
         run: |
-          xcodebuild -downloadComponent MetalToolchain >/dev/null 2>&1 || true
-          curl -fsSL https://raw.githubusercontent.com/Augustas11/macprovider/main/phase3-binary/scripts/build-mlx-metallib.sh -o /tmp/build-mlx-metallib.sh
-          MLX_SWIFT_CHECKOUT="$PWD/.build/checkouts/mlx-swift" bash /tmp/build-mlx-metallib.sh /tmp/metallib
-          for x in .build/arm64-apple-macosx/debug/*.xctest/Contents/MacOS; do cp /tmp/metallib/mlx.metallib "$x/"; done
           INKLING2_GPU_TESTS=1 swift test --skip-build --filter "Inkling2SpeculativeRoundTests/testVerifyRows" 2>&1 | tee gpu-test.log
           exit ${PIPESTATUS[0]}
