@@ -774,6 +774,16 @@ private final class Inkling2ProjectionSpans {
     }
 }
 
+/// Report a convolution write to a staged round's tail cache, which keeps the padded input so
+/// the round can commit any prefix of it (see ``ConvolutionTailCache``). A no-op outside a round.
+@inline(__always)
+private func inkling2RecordConvolution(
+    _ state: ArraysCache?, slot: Int, previous: MLXArray, input: MLXArray
+) {
+    guard let tails = state as? ConvolutionTailCache, tails.isRecording else { return }
+    tails.record(slot: slot, previous: previous, input: input)
+}
+
 /// The reference `ShortConvolution`: a depthwise causal convolution over the previous
 /// `kernel - 1` inputs, with the residual added before the `1 / sqrt(kernel + 1)` scale, all in
 /// float32. `state[slot]` holds the last `kernel - 1` inputs in float32.
@@ -788,6 +798,7 @@ private func inkling2ShortConvolution(
     let xf = x.asType(.float32)
     let previous = state?[slot] ?? MLXArray.zeros([batch, kernel - 1, channels], dtype: .float32)
     let context = concatenated([previous, xf], axis: 1)
+    inkling2RecordConvolution(state, slot: slot, previous: previous, input: xf)
     state?[slot] = context[0..., (context.dim(1) - (kernel - 1))..., 0...]
     // `mx.conv1d(context, weight [C, K, 1], groups=C)`: tap K - 1 multiplies the current input.
     let weight = taps.asType(.float32).reshaped(channels, kernel, 1)
@@ -819,12 +830,14 @@ private func inkling2DynamicShortConvolution(
             state?[slot] ?? MLXArray.zeros([batch, kernel - 1, channels], dtype: .float32)
         let result = ShortConvolutionKernels.convolveDynamic(
             x, dynamicTaps: dynamicTaps, staticTaps: staticTaps, heads: heads, state: previous)
+        inkling2RecordConvolution(state, slot: slot, previous: previous, input: x)
         state?[slot] = result.state
         return result.out
     }
     let xf = x.asType(.float32)
     let previous = state?[slot] ?? MLXArray.zeros([batch, kernel - 1, channels], dtype: .float32)
     let context = concatenated([previous, xf], axis: 1)
+    inkling2RecordConvolution(state, slot: slot, previous: previous, input: xf)
     state?[slot] = context[0..., (context.dim(1) - (kernel - 1))..., 0...]
     if let compiled, kernel == 4 {
         let (p0, p1, p2, p3) = compiled(context, x, dynamicTaps, staticTaps)
@@ -1282,11 +1295,13 @@ private func inkling2KernelShortConvolution(
             inputs, template: template, grid: (x.size, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [x.shape, [batch, kernel - 1, channels]],
             outputDTypes: [x.dtype, .float32])
+        inkling2RecordConvolution(state, slot: slot, previous: previous, input: x)
         state?[slot] = results[1]
         return results[0]
     }
     if let state {
         let context = concatenated([previous, x.asType(.float32)], axis: 1)
+        inkling2RecordConvolution(state, slot: slot, previous: previous, input: x)
         state[slot] = context[0..., (context.dim(1) - (kernel - 1))..., 0...]
     }
     return kernels.shortConvolution(
@@ -1310,6 +1325,7 @@ private func inkling2ShortConvolutionAdding(
     let previous = state?[slot] ?? MLXArray.zeros([batch, 3, channels], dtype: .float32)
     let result = ShortConvolutionKernels.convolve(
         x, taps: taps, state: previous, residual: residual, outputDType: outputDType)
+    inkling2RecordConvolution(state, slot: slot, previous: previous, input: x)
     state?[slot] = result.state
     return result.out
 }
@@ -2396,7 +2412,7 @@ public final class Inkling2Model: Module, LLMModel {
         return schedule.visits.map { visit in
             let attention: KVCache =
                 visit.isSliding ? RotatingKVCache(maxSize: window, keep: 0) : KVCacheSimple()
-            return CacheList(attention, ArraysCache(size: 4))
+            return CacheList(attention, ConvolutionTailCache(size: 4))
         }
     }
 

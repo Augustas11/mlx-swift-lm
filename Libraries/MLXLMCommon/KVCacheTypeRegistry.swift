@@ -40,6 +40,7 @@ final class KVCacheTypeRegistry: @unchecked Sendable {
         try! register(RewindableConvolutionCache.self)
         try! register(TurboQuantKVCache.self)
         try! register(CacheList.self)
+        try! register(ConvolutionTailCache.self)
     }
 
     func register<T: KVCache>(_ type: T.Type, aliases: [String] = []) throws {

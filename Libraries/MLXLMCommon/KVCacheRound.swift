@@ -174,6 +174,103 @@ struct RotatingRestorePoint: KVCacheLeafRestorePoint {
     }
 }
 
+/// A `CacheList(attention, ConvolutionTailCache)` entry: the attention child staged by its own
+/// strategy, the convolution tails staged as a recording copy.
+///
+/// The model writes the copy's tails as usual and reports each write's padded input. Commit cuts
+/// every recorded tail at the retained count, so the live tails become exactly what writing only
+/// the kept rows would have left -- oMLX's `mtp_partial_rollback` for Inkling 2. Admission is by
+/// type: only a ``ConvolutionTailCache`` promises the recording, so any other recurrent child
+/// (a Mamba state, a plain ``ArraysCache``) keeps the entry refused.
+final class CacheListRoundStrategy: KVCacheRoundStrategy {
+    let slot: Int
+    let live: CacheList
+    let attention: any KVCacheRoundStrategy
+    let liveTails: ConvolutionTailCache
+    let stagedTails: ConvolutionTailCache
+    let presented: KVCache
+
+    /// Nil unless `live` is exactly one admissible attention child followed by one
+    /// ``ConvolutionTailCache``.
+    init?(slot: Int, live: CacheList, maximumPositions: Int) {
+        guard live.childCount == 2,
+            !(live[0] is CacheList),
+            let tails = live[1] as? ConvolutionTailCache,
+            !tails.isRecording,
+            let attention = KVCacheRoundStrategyFactory.make(
+                for: KVCacheLeaf(path: [slot, 0], cache: live[0]), slot: slot,
+                maximumPositions: maximumPositions)
+        else { return nil }
+        self.slot = slot
+        self.live = live
+        self.attention = attention
+        self.liveTails = tails
+        self.stagedTails = tails.makeStagedCopy()
+        self.presented = CacheList(attention.presented, stagedTails)
+    }
+
+    var writtenPositions: Int { attention.writtenPositions }
+    var liveOffset: Int { attention.liveOffset }
+    var attentionBound: Int? { attention.attentionBound }
+
+    func commit(retaining: Int) {
+        let recorded = stagedTails.recordedInputs
+        let written = attention.writtenPositions
+        precondition(
+            recorded.keys.allSatisfy { stagedTails.recordedPositions(slot: $0) == written },
+            "a convolution tail recorded a different width than its attention child wrote")
+        // A tail written without a report would be committed whole; refuse that rather than
+        // keep rows the verifier rejected.
+        precondition(
+            (0 ..< liveTails.slotCount).allSatisfy { index in
+                recorded[index] != nil || stagedTails[index] === liveTails[index]
+            },
+            "a convolution tail was written this round without recording its input")
+        attention.commit(retaining: retaining)
+        liveTails.cut(from: recorded, retaining: retaining)
+    }
+
+    func makeRestorePoint(retaining: Int) -> (any KVCacheLeafRestorePoint)? {
+        CacheListRestorePoint(
+            attention: attention.makeRestorePoint(retaining: retaining),
+            tails: stagedTails.recordedInputs,
+            committed: retaining)
+    }
+}
+
+/// Restores a `CacheList(attention, ConvolutionTailCache)` entry: the attention child by its own
+/// record or a trim, every recorded tail by a cut at the re-retained count.
+///
+/// The padded inputs already hold the round-start tails, so nothing is snapshotted.
+struct CacheListRestorePoint: KVCacheLeafRestorePoint {
+    let attention: (any KVCacheLeafRestorePoint)?
+    let tails: [Int: (rows: MLXArray, width: Int)]
+    let committed: Int
+
+    func canRestore(into leaf: KVCache) -> Bool {
+        guard let list = leaf as? CacheList, list.childCount == 2,
+            list[1] is ConvolutionTailCache
+        else { return false }
+        if let attention { return attention.canRestore(into: list[0]) }
+        return list[0].isTrimmable
+    }
+
+    @discardableResult
+    func restore(into leaf: KVCache, retaining: Int) -> Bool {
+        guard canRestore(into: leaf), let list = leaf as? CacheList,
+            let liveTails = list[1] as? ConvolutionTailCache
+        else { return false }
+        let keep = Swift.min(Swift.max(retaining, 0), committed)
+        if let attention {
+            attention.restore(into: list[0], retaining: keep)
+        } else if committed > keep {
+            list[0].trim(committed - keep)
+        }
+        liveTails.cut(from: tails, retaining: keep)
+        return true
+    }
+}
+
 /// Chooses a strategy per leaf, or refuses.
 ///
 /// Deliberately not a requirement on ``KVCache`` itself: that protocol is public, so a `package`

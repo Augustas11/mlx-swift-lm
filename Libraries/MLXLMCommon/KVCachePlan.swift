@@ -210,9 +210,10 @@ package final class KVCacheStorage {
     /// Open a staged round over these entries, or `nil` when one of them cannot take part.
     ///
     /// Every leaf is classified before anything is constructed, so a refusal leaves the entries
-    /// exactly as they were and the caller can fall back to unstaged decoding. Nested
-    /// ``CacheList`` topologies are refused too: they expand to more leaves than array slots, and
-    /// the caches handed back have to line up with the live array positionally.
+    /// exactly as they were and the caller can fall back to unstaged decoding. A ``CacheList``
+    /// entry takes part only as `(attention, ConvolutionTailCache)`, staged as one slot; every
+    /// other composite is refused, since the caches handed back have to line up with the live
+    /// array positionally.
     ///
     /// - Parameter maximumPositions: the widest write the round will make. Append-only leaves are
     ///   admitted only if they can still be rewound after absorbing it.
@@ -228,7 +229,17 @@ package final class KVCacheStorage {
                 strategies.append(AppendOnlyRoundStrategy(slot: slot, live: entry))
                 continue
             }
-            guard !(entry is CacheList),
+            // A composite entry takes part only as `(attention, convolution tails)`, which
+            // stages as one slot; any other `CacheList` topology is refused.
+            if let list = entry as? CacheList {
+                guard
+                    let strategy = CacheListRoundStrategy(
+                        slot: slot, live: list, maximumPositions: maximumPositions)
+                else { return nil }
+                strategies.append(strategy)
+                continue
+            }
+            guard
                 let strategy = KVCacheRoundStrategyFactory.make(
                     for: KVCacheLeaf(path: [slot], cache: entry), slot: slot,
                     maximumPositions: maximumPositions)
