@@ -2248,13 +2248,23 @@ public final class Inkling2TextModel: Module {
     func callAsFunction(
         _ inputs: MLXArray, cache: [KVCache]?, schedule: Inkling2LoopSchedule
     ) -> MLXArray {
+        forward(inputs, cache: cache, schedule: schedule, capturing: []).hidden
+    }
+
+    /// ``callAsFunction(_:cache:schedule:)`` that also returns the state entering each visit in
+    /// `capturing` (the DSpark draft's target taps; the loop driver records them, nothing else
+    /// changes in the pass).
+    func forward(
+        _ inputs: MLXArray, cache: [KVCache]?, schedule: Inkling2LoopSchedule,
+        capturing: Set<Int>
+    ) -> (hidden: MLXArray, captures: [Int: MLXArray]) {
         precondition(
             cache == nil || cache?.count == schedule.count,
             "Inkling 2 requires a separate cache for every layer visit")
         let x = Inkling2PhaseProfiler.measure(.embed) { embedNorm(embed(inputs)) }
         let stacks = Inkling2FastPath.uses(.blockStack) ? Inkling2BlockStacks() : nil
         let result = Inkling2LoopDriver.run(
-            schedule: schedule, hidden: x,
+            schedule: schedule, hidden: x, capturing: capturing,
             messageQuery: { (layer: Int) -> MLXArray in
                 guard let message = layers[layer].loopMessage else {
                     fatalError("Inkling 2 core layer \(layer) has no message queries")
@@ -2271,9 +2281,10 @@ public final class Inkling2TextModel: Module {
             return layers[step.layer](
                 hidden, blocks: &blocks, cache: visitCache, messages: messages, stacks: stacks)
         }
-        return Inkling2PhaseProfiler.measure(.residualMix) {
+        let hidden = Inkling2PhaseProfiler.measure(.residualMix) {
             finalInput(result.blocks, result.hidden, stacks: stacks)[.ellipsis, 0, 0...]
         }
+        return (hidden, result.captures)
     }
 }
 
@@ -2325,6 +2336,37 @@ public final class Inkling2Model: Module, LLMModel {
         return Inkling2PhaseProfiler.measure(.head) { logits(fromNormalized: model.norm(hidden)) }
     }
 
+    /// The forward the MTP iterator calls. With ``mtpEmitFlagKey`` set it also writes the DSpark
+    /// draft's target taps to ``mtpLastHiddenStatesKey``: for each id of
+    /// ``mtpTargetLayerIdsKey``, in that order, the state entering that layer visit, or for the
+    /// id equal to the visit count the final-norm output (oMLX `omlx/patches/inkling2/model.py`
+    /// `TextModel.__call__(capture=)`, Apache-2.0). `[B, L, taps * H]` in the embedding dtype,
+    /// bf16, the dtype oMLX's drafter keeps its context in. The logits are those of the plain forward.
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        let emit = state?[mtpEmitFlagKey] ?? false
+        let ids = emit ? (state?[mtpTargetLayerIdsKey] ?? []) : []
+        precondition(
+            Set(ids).count == ids.count && ids.allSatisfy { (0 ... schedule.count).contains($0) },
+            "Inkling 2 draft taps must be distinct visit indices in 0...\(schedule.count)")
+        let output = model.forward(
+            input.tokens, cache: cache, schedule: schedule,
+            capturing: Set(ids.filter { $0 < schedule.count }))
+        let normalized = model.norm(output.hidden)
+        let logits = Inkling2PhaseProfiler.measure(.head) { logits(fromNormalized: normalized) }
+        guard emit else { return LMOutput(logits: logits) }
+
+        var out = state ?? LMOutput.State()
+        out[mtpLastHiddenStatesKey] = Self.draftTaps(
+            ids, output, normalized: normalized, visits: schedule.count)
+        // The draft reads target features, not target K/V.
+        out[mtpSharedKVStatesKey] = [:]
+        out[mtpSharedKVOffsetsKey] = [:]
+        out[mtpSharedKVSourceIndicesKey] = [:]
+        return LMOutput(logits: logits, state: out)
+    }
+
     /// The reference `_logits_from_norm`: the normalised state rounded to the embedding dtype,
     /// a float32 head product, the final softcap, and the padding vocabulary dropped.
     func logits(fromNormalized normalized: MLXArray) -> MLXArray {
@@ -2362,12 +2404,15 @@ public final class Inkling2Model: Module, LLMModel {
     /// alone. The default chunk is the reference's 2048; the chunk size changes greedy output,
     /// so parity runs fix it on both sides.
     public func prepare(
-        _ input: LMInput, cache: [KVCache], state _: LMOutput.State? = nil,
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State? = nil,
         prefill: PrefillParameters = .init()
     ) throws -> PrepareResult {
         let y = input.text
         guard y.tokens.size > 0 else {
             return .tokens(y)
+        }
+        if state?[mtpEmitFlagKey] ?? false {
+            return try prepareEmittingTaps(y, cache: cache, state: state!, prefill: prefill)
         }
         let processed = try prefill.forEachChunk(
             total: y.tokens.size,
@@ -2380,6 +2425,64 @@ public final class Inkling2Model: Module, LLMModel {
     }
 
     private static let defaultPrefillChunkSize = 2048
+
+    /// The prompt prefill of a speculative stream: the DSpark draft needs the taps of every
+    /// prompt position, which the default path never materialises.
+    ///
+    /// The cache sees exactly what ordinary decode gives it: the prompt but its last token in
+    /// chunks of ``defaultPrefillChunkSize`` (the chunk size changes greedy output, so the MTP
+    /// iterator's request for one unchunked forward is not followed), then the last token as a
+    /// one-row forward whose logits are returned. Only that row goes through the head, so the
+    /// prompt costs no `[L, vocabulary]` logits.
+    private func prepareEmittingTaps(
+        _ y: LMInput.Text, cache: [KVCache], state: LMOutput.State, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        let ids = state[mtpTargetLayerIdsKey] ?? []
+        precondition(
+            Set(ids).count == ids.count && ids.allSatisfy { (0 ... schedule.count).contains($0) },
+            "Inkling 2 draft taps must be distinct visit indices in 0...\(schedule.count)")
+        var chunks = [MLXArray]()
+        // The default prefill (model step size, balanced chunks): what an ordinary request with
+        // default prefill parameters runs. The iterator replaced the caller's step size and
+        // chunking with `.unchunked`, so a caller that set its own is not reproduced here.
+        var ordinary = prefill
+        ordinary.stepSize = nil
+        ordinary.chunking = .balanced
+        let processed = try ordinary.forEachChunk(
+            total: y.tokens.size, defaultStepSize: Self.defaultPrefillChunkSize
+        ) { range in
+            let output = model.forward(
+                y[.newAxis, range].tokens, cache: cache, schedule: schedule,
+                capturing: Set(ids.filter { $0 < schedule.count }))
+            chunks.append(Self.draftTaps(ids, output, normalized: model.norm(output.hidden), visits: schedule.count))
+            asyncEval(cache)
+            asyncEval(chunks.last!)
+        }
+        let last = callAsFunction(y[processed...][text: .newAxis], cache: cache, state: state)
+        guard let lastTaps = last.state?[mtpLastHiddenStatesKey] else {
+            preconditionFailure("Inkling 2 emitted no draft taps")
+        }
+        var out = last.state ?? state
+        out[mtpLastHiddenStatesKey] = concatenated(chunks + [lastTaps], axis: 1)
+        return .logits(LMOutput(logits: last.logits, state: out))
+    }
+
+    /// The taps of `ids` from one forward, `[B, L, taps * H]` bf16 (the dtype oMLX keeps its
+    /// draft context in): the state entering each visit, or the final-norm output for the id
+    /// equal to `visits`.
+    static func draftTaps(
+        _ ids: [Int], _ output: (hidden: MLXArray, captures: [Int: MLXArray]),
+        normalized: MLXArray, visits: Int
+    ) -> MLXArray {
+        let taps = ids.map { id -> MLXArray in
+            if id == visits { return normalized.asType(.bfloat16) }
+            guard let tap = output.captures[id] else {
+                preconditionFailure("Inkling 2 visit \(id) was not captured")
+            }
+            return tap.asType(.bfloat16)
+        }
+        return taps.isEmpty ? normalized.asType(.bfloat16) : concatenated(taps, axis: -1)
+    }
 
     /// Text weights in the oQ layout. A source checkpoint is converted; vision and draft tensors
     /// are dropped. A checkpoint the converter rejects is returned unchanged, so the loader's
