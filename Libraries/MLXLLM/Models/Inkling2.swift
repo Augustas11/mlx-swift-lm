@@ -1746,11 +1746,14 @@ final class Inkling2SparseMoE: Module {
                     let top = fusedRouterTopK(
                         selection: selection, values: scores, k: topK, normalize: false,
                         order: .descending)
+                    // The weights row by row: their sum over one row's experts is a whole-array
+                    // reduction on one row and a row reduction on several, which add in different
+                    // orders.
+                    let weights = concatenated(
+                        (0 ..< rows).map { compiledRouteWeights(top.scores[$0 ..< ($0 + 1)]) },
+                        axis: 0)
                     let shape = Array(x.shape.dropLast()) + [topK]
-                    return (
-                        top.indices.reshaped(shape),
-                        compiledRouteWeights(top.scores).reshaped(shape)
-                    )
+                    return (top.indices.reshaped(shape), weights.reshaped(shape))
                 }
             }
             // Each row in the rank and shape a one-row decode step routes.
