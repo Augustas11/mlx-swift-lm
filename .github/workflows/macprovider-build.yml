@@ -1,0 +1,35 @@
+name: macprovider fork build
+
+# Compile check for macprovider/* fork branches before any lab-hardware time: the upstream
+# workflows only run in ml-explore/mlx-swift-lm. Build only (library + test targets); the tests
+# need Metal and run on lab hardware.
+on:
+  push:
+    branches: ["macprovider/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macprovider-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository == 'Augustas11/mlx-swift-lm'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Xcode and Swift versions
+        run: |
+          xcodebuild -version
+          swift --version
+      - name: Build library and test targets
+        run: swift build --build-tests 2>&1 | tee build.log; exit ${PIPESTATUS[0]}
+      - name: Compile errors
+        if: failure()
+        run: grep -E "error:" build.log | sort -u | head -80

@@ -2370,8 +2370,8 @@ public final class Inkling2Model: Module, LLMModel {
             input.tokens, cache: cache, schedule: schedule,
             capturing: Set(ids.filter { $0 < schedule.count }))
         let normalized = model.norm(output.hidden)
-        let logits = Inkling2PhaseProfiler.measure(.head) { logits(fromNormalized: normalized) }
-        guard emit else { return LMOutput(logits: logits) }
+        let head = Inkling2PhaseProfiler.measure(.head) { self.logits(fromNormalized: normalized) }
+        guard emit else { return LMOutput(logits: head) }
 
         var out = state ?? LMOutput.State()
         out[mtpLastHiddenStatesKey] = Self.draftTaps(
@@ -2380,7 +2380,7 @@ public final class Inkling2Model: Module, LLMModel {
         out[mtpSharedKVStatesKey] = [:]
         out[mtpSharedKVOffsetsKey] = [:]
         out[mtpSharedKVSourceIndicesKey] = [:]
-        return LMOutput(logits: logits, state: out)
+        return LMOutput(logits: head, state: out)
     }
 
     /// The reference `_logits_from_norm`: the normalised state rounded to the embedding dtype,
