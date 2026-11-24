@@ -739,13 +739,26 @@ private func inkling2Project(_ linear: Linear, _ rows: Range<Int>, _ x: MLXArray
     return matmul(x, linear.weight[r].transposed())
 }
 
+/// The widest speculative verify (one bonus row plus the drafts) whose rows take the one-row
+/// decode computations, so each verify row's logits are bit-identical to decoding that token
+/// alone (exact greedy speculative decoding, SPEC-048 R005). megakernel-zoo's rule: each of the
+/// K rows runs exactly the statements of the K = 1 step.
+enum Inkling2VerifyRows {
+    static let maximum = 8
+
+    /// Whether a `rows`-row forward is a verify that must reproduce one-row decode per row.
+    static func isVerify(_ rows: Int) -> Bool { rows > 1 && rows <= maximum }
+}
+
 /// Row spans of fused projections computed once per attention visit
 /// (``Inkling2FastPath/Lever/oneProjection``), so the parts that read one input come from one
 /// product. Each output row of MLX's quantized matrix-vector product depends only on its own
 /// weight rows (the kernel is chosen by the input size and the row count, which do not change),
 /// so a part sliced from the span equals the part's own product. Only for quantized projections
-/// and a single input row, where a column slice stays row-contiguous; otherwise every part is
-/// projected on its own as before.
+/// and at most ``Inkling2VerifyRows/maximum`` input rows: one row is ordinary decode, and a
+/// speculative verify of up to that many rows must take the same span product so each row gets
+/// its one-row bits (the full-span widths miss the fork's batched small-row window and run the
+/// per-row matrix-vector kernel at both sizes). Wider inputs project every part on its own.
 ///
 /// Ported from the single projection per input in Ollama's Inkling 2 attention (Ollama pull
 /// request 19843, `model/models/inkling2` `project`; MIT licence, Copyright (c) Ollama).
@@ -753,7 +766,9 @@ private final class Inkling2ProjectionSpans {
     private var spans: [(linear: Linear, input: MLXArray, rows: Range<Int>, out: MLXArray)] = []
     private let enabled: Bool
 
-    init(rows: Int) { enabled = rows == 1 && Inkling2FastPath.uses(.oneProjection) }
+    init(rows: Int) {
+        enabled = rows <= Inkling2VerifyRows.maximum && Inkling2FastPath.uses(.oneProjection)
+    }
 
     /// Computes rows `rows` of `linear` on `x` once, for the parts inside them.
     func add(_ linear: Linear, _ rows: Range<Int>, _ x: MLXArray) {
@@ -1632,6 +1647,21 @@ final class Inkling2SparseMoE: Module {
     /// `_route`: sigmoid scores in float32, top-k of the bias-corrected scores, weights
     /// normalised over the chosen experts and multiplied by `route_scale`.
     func route(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
+        let rows = x.size / x.dim(-1)
+        if Inkling2FastPath.enabled, Inkling2FastPath.onGPU, Inkling2VerifyRows.isVerify(rows) {
+            // A speculative verify: a multi-row float32 product takes a different kernel (and K
+            // order) from the one-row matrix-vector product, so near-tie experts could swap. Each
+            // row routes exactly as its one-row decode step does (oMLX `_row_matmul`).
+            // Each row in the rank and shape a one-row decode step routes.
+            let one = Array(repeating: 1, count: x.ndim - 1) + [x.dim(-1)]
+            let flat = x.reshaped(rows, x.dim(-1))
+            let routed = (0 ..< rows).map { route(flat[$0].reshaped(one)) }
+            let shape = Array(x.shape.dropLast())
+            return (
+                concatenated(routed.map(\.indices), axis: 0).reshaped(shape + [topK]),
+                concatenated(routed.map(\.weights), axis: 0).reshaped(shape + [topK])
+            )
+        }
         if Inkling2FastPath.uses(.router), Inkling2FastPath.onGPU, x.size == x.dim(-1) {
             // Single-row decode: the top-k and the gather in one dispatch. The shared kernel's
             // descending order is `argPartition(-selection, kth: K - 1)[..<K]`'s (stable, ties
@@ -1925,37 +1955,69 @@ final class Inkling2Attention: Module {
         let size = keys.dim(2)
         let sliding = isSliding ? c.slidingWindow : 0
         let extent = isSliding ? c.slidingWindow : c.relativeExtent
-        var mask: MLXArray
-        if let rotation, rotation > 0 {
-            mask = RingBandMaskKernels.mask(
-                relative, relativeProj.asType(dtype), keys: keys, rotation: rotation,
-                sliding: sliding, extent: extent)
+        var out: MLXArray
+        if batch == 1, Inkling2VerifyRows.isVerify(length), Inkling2FastPath.uses(.sinkRing),
+            Inkling2FastPath.onGPU
+        {
+            // A speculative verify: each row attends exactly as its one-row decode step does --
+            // the keys up to and including its own position, its banded mask, and its sink as
+            // the kernel's sink logit -- so its output is bit-identical to decoding it alone. One
+            // multi-row call would put the sink at a key index that moves with the row count and
+            // reduce over a different key split. Within the sliding window the one-row step
+            // reads the same chronological keys; past it, it reads the ring as stored, which
+            // this does not reproduce yet.
+            let sinkLogits = spans.project(projection, queryRanges[s], x)
+            let projected = relativeProj.asType(dtype)
+            out = concatenated(
+                (0 ..< length).map { row -> MLXArray in
+                    let count = size - length + row + 1
+                    let k = keys[0..., 0..., ..<count, 0...]
+                    let v = values[0..., 0..., ..<count, 0...]
+                    let rel = relative[0..., row ..< (row + 1)]
+                    let mask =
+                        inkling2KernelBandedMask(
+                            rel, projected, keys: k, sliding: sliding, extent: extent)
+                        ?? inkling2BandedMask(
+                            rel, projected, queryOffset: count - 1, keys: count,
+                            sliding: sliding, extent: extent)
+                    return MLXFast.scaledDotProductAttention(
+                        queries: queries[0..., 0..., row ..< (row + 1), 0...], keys: k, values: v,
+                        scale: inkling2InverseSquareRoot(headDim), mask: .array(mask),
+                        sinks: sinkLogits[0..., row, 0...].reshaped(heads).asType(queries.dtype))
+                }, axis: 2)
         } else {
-            mask =
-                inkling2KernelBandedMask(
-                    relative, relativeProj.asType(dtype), keys: keys, sliding: sliding,
-                    extent: extent)
-                ?? inkling2BandedMask(
-                    relative, relativeProj.asType(dtype), queryOffset: size - length, keys: size,
+            var mask: MLXArray
+            if let rotation, rotation > 0 {
+                mask = RingBandMaskKernels.mask(
+                    relative, relativeProj.asType(dtype), keys: keys, rotation: rotation,
                     sliding: sliding, extent: extent)
+            } else {
+                mask =
+                    inkling2KernelBandedMask(
+                        relative, relativeProj.asType(dtype), keys: keys, sliding: sliding,
+                        extent: extent)
+                    ?? inkling2BandedMask(
+                        relative, relativeProj.asType(dtype), queryOffset: size - length, keys: size,
+                        sliding: sliding, extent: extent)
+            }
+            // A query-dependent sink: its own logit against a zero key and value.
+            let sinkLogits = spans.project(projection, queryRanges[s], x)
+            var sinks: MLXArray? = nil
+            if sinkRing {
+                // One query row: its per-head sink logit is the kernel's per-head sink, unscaled
+                // like a mask logit, with no value.
+                sinks = sinkLogits.reshaped(heads).asType(queries.dtype)
+            } else {
+                mask = concatenated(
+                    [mask, sinkLogits.transposed(0, 2, 1).expandedDimensions(axis: -1)], axis: -1)
+                let row = [batch, kvHeads, 1, headDim]
+                keys = concatenated([keys, constants.zeros(row, keys.dtype)], axis: 2)
+                values = concatenated([values, constants.zeros(row, values.dtype)], axis: 2)
+            }
+            out = MLXFast.scaledDotProductAttention(
+                queries: queries, keys: keys, values: values,
+                scale: inkling2InverseSquareRoot(headDim), mask: .array(mask), sinks: sinks)
         }
-        // A query-dependent sink: its own logit against a zero key and value.
-        let sinkLogits = spans.project(projection, queryRanges[s], x)
-        var sinks: MLXArray? = nil
-        if sinkRing {
-            // One query row: its per-head sink logit is the kernel's per-head sink, unscaled
-            // like a mask logit, with no value.
-            sinks = sinkLogits.reshaped(heads).asType(queries.dtype)
-        } else {
-            mask = concatenated(
-                [mask, sinkLogits.transposed(0, 2, 1).expandedDimensions(axis: -1)], axis: -1)
-            let row = [batch, kvHeads, 1, headDim]
-            keys = concatenated([keys, constants.zeros(row, keys.dtype)], axis: 2)
-            values = concatenated([values, constants.zeros(row, values.dtype)], axis: 2)
-        }
-        var out = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: keys, values: values,
-            scale: inkling2InverseSquareRoot(headDim), mask: .array(mask), sinks: sinks)
         out = out.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
         let gate = spans.project(projection, queryRanges[g], x)
         if Inkling2FastPath.uses(.fusedTails), out.dtype == dtype {

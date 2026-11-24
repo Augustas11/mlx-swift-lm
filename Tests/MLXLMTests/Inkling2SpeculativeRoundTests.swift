@@ -21,7 +21,9 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
     /// short prompts wrap it, and 8-bit affine experts that run on the CPU. Every parameter is
     /// random (the module initialises the conv taps and experts to zero), so every tail and the
     /// MoE reach the logits.
-    private func tinyModel() throws -> Inkling2Model {
+    private func tinyModel(
+        _ overrides: [String: Any] = [:], floatType: DType = .float32
+    ) throws -> Inkling2Model {
         var json = try XCTUnwrap(
             JSONSerialization.jsonObject(with: resource("oq4e-config.json")) as? [String: Any])
         var text = try XCTUnwrap(json["text_config"] as? [String: Any])
@@ -33,6 +35,7 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
             "n_routed_experts": 4, "num_experts_per_tok": 2, "intermediate_size": 32,
         ]
         text.merge(tiny) { _, new in new }
+        text.merge(overrides) { _, new in new }
         var loop = try XCTUnwrap(text["loop_config"] as? [String: Any])
         loop["gate_rank"] = 8
         text["loop_config"] = loop
@@ -53,7 +56,8 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
             if value.dtype == .uint32 || value.dtype == .uint8 {
                 return (key, MLXRandom.randInt(0 ..< 200, value.shape).asType(value.dtype))
             }
-            return (key, (MLXRandom.normal(value.shape) * 0.05).asType(value.dtype))
+            // Scales and floating parameters in `floatType` (bf16 reaches the GPU fast kernels).
+            return (key, (MLXRandom.normal(value.shape) * 0.05).asType(floatType))
         }
         model.update(parameters: ModuleParameters.unflattened(randomized))
         eval(model)
@@ -306,6 +310,52 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
             XCTAssertEqual(produced, expected, "speculative stream differs from ordinary decode")
             XCTAssertGreaterThan(iterator.acceptedCount, 0)
             XCTAssertLessThan(iterator.acceptedCount, iterator.proposedCount)
+        }
+    }
+
+    /// The speculative verify on the GPU fast path: every row of a multi-row forward must give
+    /// the logits a one-row decode of that token gives, bit for bit (per-row router, span
+    /// projections, per-row attention with the sink as the kernel's sink logit). Widths meet the
+    /// fast kernels' shape conditions; the window is wide enough not to wrap. Skips without a GPU.
+    func testVerifyRowsReproduceOneRowDecodeBitForBitOnTheGPU() throws {
+        guard ProcessInfo.processInfo.environment["INKLING2_GPU_TESTS"] == "1" else {
+            throw XCTSkip("INKLING2_GPU_TESTS is not set")
+        }
+        try Device.withDefaultDevice(.gpu) {
+            XCTAssertTrue(Inkling2FastPath.enabled && Inkling2FastPath.onGPU)
+            let model = try tinyModel([
+                "hidden_size": 256, "vocab_size": 256, "unpadded_vocab_size": 256,
+                "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 128,
+                "swa_num_attention_heads": 2, "swa_num_key_value_heads": 1, "swa_head_dim": 128,
+                "d_rel": 16, "rel_extent": 64, "sliding_window_size": 64,
+                "intermediate_size": 128,
+            ], floatType: .bfloat16)
+            let prompt = tokens([3, 9, 27, 17, 51, 25, 11, 33, 35])
+            let verify = [5, 15, 45, 7, 200, 101, 66, 12]
+
+            let serial = KVCacheStorage(try model.newCache(parameters: nil), plan: .disabled)
+            eval(model(prompt[.newAxis], cache: serial.cache))
+            serial.commitProcessedTokens(prompt.size)
+            let staged = serial.copy()
+
+            var expected = [MLXArray]()
+            for token in verify {
+                let logits = model(tokens([token])[.newAxis], cache: serial.cache)
+                eval(logits)
+                expected.append(logits)
+            }
+            for rows in [2, 5, 8] {
+                let live = staged.copy()
+                let round = try XCTUnwrap(live.beginRound(maximumPositions: rows))
+                let logits = model(tokens(Array(verify[..<rows]))[.newAxis], cache: round.caches)
+                eval(logits)
+                live.rollback(round)
+                for row in 0 ..< rows {
+                    XCTAssertTrue(
+                        arrayEqual(logits[0..., row ..< (row + 1), 0...], expected[row]).item(Bool.self),
+                        "verify of \(rows) rows: row \(row) differs from its one-row decode")
+                }
+            }
         }
     }
 }
