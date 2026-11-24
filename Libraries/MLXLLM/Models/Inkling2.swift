@@ -746,8 +746,15 @@ private func inkling2Project(_ linear: Linear, _ rows: Range<Int>, _ x: MLXArray
 enum Inkling2VerifyRows {
     static let maximum = 8
 
-    /// Whether a `rows`-row forward is a verify that must reproduce one-row decode per row.
-    static func isVerify(_ rows: Int) -> Bool { rows > 1 && rows <= maximum }
+    /// Whether this visit's `rows`-row forward is a speculative verify that must reproduce
+    /// one-row decode per row: a staged round (its tail cache records) on the GPU fast path.
+    /// Keyed on the round, not the row count, so ordinary prefill chunks keep their numerics.
+    static func isVerify(_ rows: Int, cache: CacheList?) -> Bool {
+        guard rows > 1, rows <= maximum, Inkling2FastPath.onGPU,
+            Inkling2FastPath.uses(.sinkRing), let cache
+        else { return false }
+        return (cache[1] as? ConvolutionTailCache)?.isRecording ?? false
+    }
 }
 
 /// Row spans of fused projections computed once per attention visit
@@ -765,15 +772,27 @@ enum Inkling2VerifyRows {
 private final class Inkling2ProjectionSpans {
     private var spans: [(linear: Linear, input: MLXArray, rows: Range<Int>, out: MLXArray)] = []
     private let enabled: Bool
+    private let perRow: Bool
 
-    init(rows: Int) {
-        enabled = rows <= Inkling2VerifyRows.maximum && Inkling2FastPath.uses(.oneProjection)
+    /// - Parameter verify: a speculative verify (``Inkling2VerifyRows``): every span is built
+    ///   from one-row products, the exact computation each row's decode step makes. One
+    ///   multi-row product can leave the one-row kernel: past the GPU's batched matrix-vector
+    ///   limit (6 rows for wide outputs on some M1/M2 GPUs) MLX switches to its matrix kernel.
+    init(rows: Int, verify: Bool = false) {
+        enabled = (rows == 1 || verify) && Inkling2FastPath.uses(.oneProjection)
+        perRow = verify
     }
 
     /// Computes rows `rows` of `linear` on `x` once, for the parts inside them.
     func add(_ linear: Linear, _ rows: Range<Int>, _ x: MLXArray) {
         guard enabled, linear is QuantizedLinear else { return }
-        spans.append((linear, x, rows, inkling2Project(linear, rows, x)))
+        let out =
+            perRow
+            ? concatenated(
+                (0 ..< x.dim(1)).map { inkling2Project(linear, rows, x[0..., $0 ..< ($0 + 1)]) },
+                axis: 1)
+            : inkling2Project(linear, rows, x)
+        spans.append((linear, x, rows, out))
     }
 
     /// Rows `rows` of `linear` on `x`: a slice of a span that holds them, else their own product.
@@ -1646,9 +1665,10 @@ final class Inkling2SparseMoE: Module {
 
     /// `_route`: sigmoid scores in float32, top-k of the bias-corrected scores, weights
     /// normalised over the chosen experts and multiplied by `route_scale`.
-    func route(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
+    /// - Parameter verify: a speculative verify (``Inkling2VerifyRows``).
+    func route(_ x: MLXArray, verify: Bool = false) -> (indices: MLXArray, weights: MLXArray) {
         let rows = x.size / x.dim(-1)
-        if Inkling2FastPath.enabled, Inkling2FastPath.onGPU, Inkling2VerifyRows.isVerify(rows) {
+        if verify, rows > 1 {
             // A speculative verify: a multi-row float32 product takes a different kernel (and K
             // order) from the one-row matrix-vector product, so near-tie experts could swap. Each
             // row routes exactly as its one-row decode step does (oMLX `_row_matmul`).
@@ -1689,10 +1709,11 @@ final class Inkling2SparseMoE: Module {
         return (indices, weights)
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    /// - Parameter verify: a speculative verify: each row routes as its one-row decode step does.
+    func callAsFunction(_ x: MLXArray, verify: Bool = false) -> MLXArray {
         let (indices, weights) = Inkling2PhaseProfiler.measure(
             .router, outputs: { (r: (indices: MLXArray, weights: MLXArray)) in [r.indices, r.weights] }
-        ) { route(x) }
+        ) { route(x, verify: verify) }
         return Inkling2PhaseProfiler.measure(.experts) {
             let out = experts(x, indices)
             if Inkling2FastPath.enabled { return inkling2CompiledCombineRoutes(out, weights) }
@@ -1828,7 +1849,8 @@ final class Inkling2Attention: Module {
         let conv = cache?[1] as? ArraysCache
         // Row parts of `in_proj` (local) or `q_proj` (global) that read the query input.
         let (q, r, g, s) = isSliding ? (0, 3, 4, 5) : (0, 1, 2, 3)
-        let spans = Inkling2ProjectionSpans(rows: batch * length)
+        let verify = batch == 1 && Inkling2VerifyRows.isVerify(length, cache: cache)
+        let spans = Inkling2ProjectionSpans(rows: batch * length, verify: verify)
         if let inProj {
             if keyInput === x && valueInput === x {
                 spans.add(inProj, 0 ..< inProj.weight.dim(0), x)
@@ -1956,9 +1978,7 @@ final class Inkling2Attention: Module {
         let sliding = isSliding ? c.slidingWindow : 0
         let extent = isSliding ? c.slidingWindow : c.relativeExtent
         var out: MLXArray
-        if batch == 1, Inkling2VerifyRows.isVerify(length), Inkling2FastPath.uses(.sinkRing),
-            Inkling2FastPath.onGPU
-        {
+        if verify {
             // A speculative verify: each row attends exactly as its one-row decode step does --
             // the keys up to and including its own position, its banded mask, and its sink as
             // the kernel's sink logit -- so its output is bit-identical to decoding it alone. One
@@ -2271,7 +2291,9 @@ final class Inkling2DecoderLayer: Module {
             }
             normalized = Inkling2PhaseProfiler.measure(.norms) { mlpNorm(hidden).asType(dtype) }
         }
-        let hidden = mlp(normalized)
+        let hidden = mlp(
+            normalized,
+            verify: x.dim(0) == 1 && Inkling2VerifyRows.isVerify(x.dim(1), cache: cache))
         let out: MLXArray
         if let added = Inkling2PhaseProfiler.measure(
             .shortConvolutions, outputs: { $0.map { [$0] } ?? [] },

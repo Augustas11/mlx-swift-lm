@@ -22,7 +22,7 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
     /// random (the module initialises the conv taps and experts to zero), so every tail and the
     /// MoE reach the logits.
     private func tinyModel(
-        _ overrides: [String: Any] = [:], floatType: DType = .float32
+        _ overrides: [String: Any] = [:], floatType: DType = .float32, quantizeLinears: Bool = false
     ) throws -> Inkling2Model {
         var json = try XCTUnwrap(
             JSONSerialization.jsonObject(with: resource("oq4e-config.json")) as? [String: Any])
@@ -51,6 +51,15 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
         let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
         MLXRandom.seed(7)
         let model = Inkling2Model(config, quantization: base.perLayerQuantization)
+        if quantizeLinears {
+            // oQ4e's attention projections and head: 8-bit affine, group 64.
+            quantize(model: model) { _, module in
+                guard let linear = module as? Linear, !(linear is QuantizedLinear),
+                    linear.weight.dim(1) % 64 == 0
+                else { return nil }
+                return (64, 8, .affine)
+            }
+        }
         XCTAssertEqual(model.expertFormats.first?.gateUp, Inkling2ExpertFormat(mode: .affine, bits: 8, groupSize: 32))
         let randomized = model.parameters().flattened().map { key, value -> (String, MLXArray) in
             if value.dtype == .uint32 || value.dtype == .uint8 {
@@ -329,7 +338,9 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
                 "swa_num_attention_heads": 2, "swa_num_key_value_heads": 1, "swa_head_dim": 128,
                 "d_rel": 16, "rel_extent": 64, "sliding_window_size": 64,
                 "intermediate_size": 128,
-            ], floatType: .bfloat16)
+            ], floatType: .bfloat16, quantizeLinears: true)
+            XCTAssertTrue(model.lmHead is QuantizedLinear)
+            XCTAssertTrue(model.model.layers[0].attention.inProj is QuantizedLinear)
             let prompt = tokens([3, 9, 27, 17, 51, 25, 11, 33, 35])
             let verify = [5, 15, 45, 7, 200, 101, 66, 12]
 
