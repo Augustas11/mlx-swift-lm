@@ -37,7 +37,7 @@ In the commit column, "—" means the lever was not ported. In the "Exact?" colu
 | Fused message controllers, 2 kernels per launch (`ctrl`) | no | messages 18% | ~770 | tokens | 2d3a8b5 |
 | Fused attention inputs: clips, value norm, log scaling, layouts (`inputs`) | no | attention 21% | ~530 | tokens | b9955fe |
 | Short convolution with the residual add; dynamic K/V conv in one kernel (`convadd`) | partly (`convstate`) | shortConvolutions 20% | ~170 | yes | 337db8d |
-| One quantized product per (projection, input) (`oneproj`) | no | attention projections | ~200 | yes* | 47bd807 |
+| One quantized product per (projection, input) (`oneproj`) | no | attention projections | ~200 | tokens* | 47bd807 |
 | Shared router top-k kernel (`router`) | no | router 5.8% | ~50–100 | yes | 5e33b34 |
 | Ring read as stored, sink as the SDPA sink (`sinkring`) | no | attention 21% plus the 1K→32K slope | ~144, plus the ring copies | tokens | 716c094 |
 | NVFP4/MXFP8 expert gathers with activation quantization | — | experts 7.5% | — | — | not ported: native weights only, W4A4 semantics, epilogue M5+ only |
@@ -47,7 +47,7 @@ In the commit column, "—" means the lever was not ported. In the "Exact?" colu
 
 The ported levers together cut about 2700 of the 5000 dispatches.
 
-\* `oneproj` is exact if MLX's quantized matrix-vector product computes each output row from its own weight rows alone. `testFastPathLeversAreBitExact` checks this.
+\* `oneproj` is not bit-exact: on the real weights the wide product moves logits by up to 1.53 (Studio 2026-11-24), so it is gated on greedy token parity like the other fused levers. Measured: all levers on 36.5/35.6/32.4 tok/s vs all seven off 26.5/25.5/22.7 at 1K/8K/32K (source layout), parity 64/64 on both layouts.
 
 **Native NVFP4 recommendation: keep serving oQ4e.**
 
