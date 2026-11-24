@@ -1,8 +1,8 @@
 name: macprovider fork build
 
 # Compile check for macprovider/* fork branches before any lab-hardware time: the upstream
-# workflows only run in ml-explore/mlx-swift-lm. Build only (library + test targets); the tests
-# need Metal and run on lab hardware.
+# workflows only run in ml-explore/mlx-swift-lm. Builds library and test targets and runs the
+# CPU-only speculative-round tests; Metal tests and real-model runs stay on lab hardware.
 on:
   push:
     branches: ["macprovider/**"]
@@ -33,3 +33,9 @@ jobs:
       - name: Compile errors
         if: failure()
         run: grep -E "error:" build.log | sort -u | head -80
+      # CPU-only logic tests (tiny random models, no Metal): speculative verify and rollback
+      # must reproduce ordinary decode exactly.
+      - name: CPU speculative-round tests
+        run: |
+          swift test --skip-build --filter "Inkling2SpeculativeRoundTests|ConvolutionTailRound|KVCacheRoundTests" 2>&1 | tee test.log
+          exit ${PIPESTATUS[0]}

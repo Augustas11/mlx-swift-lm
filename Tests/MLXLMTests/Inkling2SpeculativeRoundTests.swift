@@ -213,4 +213,99 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
             MTPSpeculativeTokenIterator.promptPrefill(caller, target: other, needsPromptHidden: false)
                 .stepSize, 512)
     }
+
+    // MARK: End to end through the MTP iterator
+
+    /// Proposes the true greedy continuation (from an ordinary run) with one wrong token per
+    /// round at a rotating position, so rounds accept every count from 0 to `blockSize - 1`.
+    /// With exact verify and rollback the speculative stream equals ordinary decode.
+    private final class OracleDrafter: Module, StatefulMTPDrafterModel {
+        let expected: [Int]
+        let promptLength: Int
+        let vocabulary: Int
+        private(set) var rounds = 0
+
+        init(expected: [Int], promptLength: Int, vocabulary: Int) {
+            self.expected = expected
+            self.promptLength = promptLength
+            self.vocabulary = vocabulary
+            super.init()
+        }
+
+        var maximumBlockSize: Int? { 8 }
+        var requiresSharedTargetKV: Bool { false }
+        var requiresPromptPrefill: Bool { true }
+        var requiresGreedySampling: Bool { true }
+        var targetLayerIds: [Int]? { [5, 23, 41, 48] }
+        func isCompatible(with target: any LanguageModel) -> Bool { true }
+        func validateCompatibility(with target: any LanguageModel) throws {}
+        func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
+            MTPDrafterState(cache: [])
+        }
+        func prepareDrafterState(
+            target: any LanguageModel, promptTokens: MLXArray, targetHidden: MLXArray,
+            firstBonus: MLXArray, positionDeltas: MLXArray?, state: inout MTPDrafterState,
+            sampler: any LogitSampler
+        ) {}
+        func commitDrafterState(
+            target: any LanguageModel, targetHidden: MLXArray, draftTokens: MLXArray,
+            acceptedCount: Int, finalToken: MLXArray, positionDeltas: MLXArray?,
+            state: inout MTPDrafterState, sampler: any LogitSampler
+        ) {}
+        func draftBlock(
+            target: any LanguageModel, lastToken: MLXArray, lastHidden: MLXArray,
+            sharedKV: [String: (MLXArray, MLXArray)], positionDeltas: MLXArray?,
+            queryOffset: Int, blockSize: Int, sampler: any LogitSampler
+        ) -> MLXArray {
+            var state = makeState(parameters: nil)
+            return draftBlock(
+                target: target, lastToken: lastToken, lastHidden: lastHidden, sharedKV: sharedKV,
+                positionDeltas: positionDeltas, queryOffset: queryOffset, blockSize: blockSize,
+                state: &state, sampler: sampler)
+        }
+        func draftBlock(
+            target: any LanguageModel, lastToken: MLXArray, lastHidden: MLXArray,
+            sharedKV: [String: (MLXArray, MLXArray)], positionDeltas: MLXArray?,
+            queryOffset: Int, blockSize: Int, state: inout MTPDrafterState,
+            sampler: any LogitSampler
+        ) -> MLXArray {
+            // The bonus `lastToken` is output index `queryOffset - promptLength`; draft what
+            // follows it.
+            let bonus = queryOffset - promptLength
+            let wrongAt = rounds % blockSize  // blockSize - 1 means no wrong draft this round
+            rounds += 1
+            let drafts = (1 ..< blockSize).map { k -> Int32 in
+                let index = bonus + k
+                let truth = index < expected.count ? expected[index] : 0
+                return Int32(k - 1 == wrongAt ? (truth + 1) % vocabulary : truth)
+            }
+            return MLXArray(drafts, [1, blockSize - 1])
+        }
+    }
+
+    func testMTPIteratorWithAnOracleDrafterMatchesOrdinaryDecode() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let model = try tinyModel()
+            let prompt = [3, 9, 27, 17, 51, 25, 11, 33, 35, 1, 2]
+            let input = LMInput(tokens: tokens(prompt))
+            var parameters = GenerateParameters(maxTokens: 48, temperature: 0)
+            parameters.prefill = PrefillParameters(stepSize: 4)
+
+            var plain = try TokenIterator(input: input, model: model, parameters: parameters)
+            var expected = [Int]()
+            while let token = plain.next() { expected.append(token) }
+
+            let drafter = OracleDrafter(expected: expected, promptLength: prompt.count, vocabulary: 64)
+            var iterator = try MTPSpeculativeTokenIterator(
+                input: input, mainModel: model, drafter: drafter, parameters: parameters,
+                blockSize: 8)
+            var produced = [Int]()
+            while let token = iterator.next() { produced.append(token) }
+
+            XCTAssertNil(iterator.passthroughReason)
+            XCTAssertEqual(produced, expected, "speculative stream differs from ordinary decode")
+            XCTAssertGreaterThan(iterator.acceptedCount, 0)
+            XCTAssertLessThan(iterator.acceptedCount, iterator.proposedCount)
+        }
+    }
 }
