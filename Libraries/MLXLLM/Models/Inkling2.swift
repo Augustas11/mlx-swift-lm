@@ -775,6 +775,18 @@ private func inkling2DynamicShortConvolution(
 ) -> MLXArray {
     let (batch, length, channels) = (x.dim(0), x.dim(1), x.dim(2))
     let kernel = staticTaps.dim(0)
+    if Inkling2FastPath.uses(.convAdd),
+        ShortConvolutionKernels.supportsDynamic(
+            x, dynamicTaps: dynamicTaps, staticTaps: staticTaps, heads: heads)
+    {
+        // One dispatch for the taps, the lag products in the reference's order and the state.
+        let previous =
+            state?[slot] ?? MLXArray.zeros([batch, kernel - 1, channels], dtype: .float32)
+        let result = ShortConvolutionKernels.convolveDynamic(
+            x, dynamicTaps: dynamicTaps, staticTaps: staticTaps, heads: heads, state: previous)
+        state?[slot] = result.state
+        return result.out
+    }
     let xf = x.asType(.float32)
     let previous = state?[slot] ?? MLXArray.zeros([batch, kernel - 1, channels], dtype: .float32)
     let context = concatenated([previous, xf], axis: 1)
@@ -870,10 +882,14 @@ public enum Inkling2FastPath {
         /// The attention inputs in one kernel: query and relative-query clips with the global
         /// layers' log scaling, the key clip and the value norm, written in attention's layouts.
         case attentionInputs = "inputs"
+        /// Short convolutions in one kernel each, with their next state: the static ones add the
+        /// attention residual or the layer output's residual in the kernel, the global layers'
+        /// dynamic ones compute their taps and lag products in the kernel.
+        case convAdd = "convadd"
 
         public var isExact: Bool {
             switch self {
-            case .convState, .blockStack, .fusedTails: return true
+            case .convState, .blockStack, .fusedTails, .convAdd: return true
             case .residualMix, .controllers, .attentionInputs: return false
             }
         }
@@ -1210,6 +1226,26 @@ private func inkling2KernelShortConvolution(
     return kernels.shortConvolution(
         inputs, template: template, grid: (x.size, 1, 1), threadGroup: (256, 1, 1),
         outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
+}
+
+/// The static short convolution with a residual added after its rounding, in one kernel
+/// (``Inkling2FastPath/Lever/convAdd``): `residual + conv(x)` in float32, cast to
+/// `outputDType`, or `conv(x)` cast to `outputDType` without a residual. Bit-identical to
+/// ``inkling2ShortConvolution(_:taps:state:slot:)`` followed by the add. Nil when the lever is
+/// off or the decode kernel's condition does not hold.
+private func inkling2ShortConvolutionAdding(
+    _ x: MLXArray, taps: MLXArray, state: ArraysCache?, slot: Int, residual: MLXArray?,
+    outputDType: DType
+) -> MLXArray? {
+    guard Inkling2FastPath.uses(.convAdd), ShortConvolutionKernels.supportsStatic(x, taps: taps),
+        residual.map({ $0.shape == x.shape }) ?? true
+    else { return nil }
+    let (batch, channels) = (x.dim(0), x.dim(2))
+    let previous = state?[slot] ?? MLXArray.zeros([batch, 3, channels], dtype: .float32)
+    let result = ShortConvolutionKernels.convolve(
+        x, taps: taps, state: previous, residual: residual, outputDType: outputDType)
+    state?[slot] = result.state
+    return result.out
 }
 
 /// The reference's GPU band bias (`_mask_v2_kernel`): `[B, H, L, S]` in the dtype of `rel`, for
@@ -1989,17 +2025,32 @@ final class Inkling2DecoderLayer: Module {
             }
         }
         let fused = Inkling2FastPath.uses(.fusedTails)
-        let attentionConvolved = Inkling2PhaseProfiler.measure(.shortConvolutions) {
-            inkling2ShortConvolution(attended, taps: attentionConv, state: conv, slot: 2)
-        }
         let residual: MLXArray
-        if closesBlock {
+        if let added = Inkling2PhaseProfiler.measure(
+            .shortConvolutions, outputs: { $0.map { [$0] } ?? [] },
+            {
+                inkling2ShortConvolutionAdding(
+                    attended, taps: attentionConv, state: conv, slot: 2,
+                    residual: closesBlock ? nil : x, outputDType: .float32)
+            })
+        {
+            // Convolution and attention residual in one dispatch.
+            residual = added
+            if closesBlock { blocks.append(x) }
+        } else if closesBlock {
+            let attentionConvolved = Inkling2PhaseProfiler.measure(.shortConvolutions) {
+                inkling2ShortConvolution(attended, taps: attentionConv, state: conv, slot: 2)
+            }
             residual = attentionConvolved.asType(.float32)
             blocks.append(x)
-        } else if fused {
-            residual = inkling2CompiledResidual(attentionConvolved, x)
         } else {
-            residual = attentionConvolved.asType(.float32) + x.asType(.float32)
+            let attentionConvolved = Inkling2PhaseProfiler.measure(.shortConvolutions) {
+                inkling2ShortConvolution(attended, taps: attentionConv, state: conv, slot: 2)
+            }
+            residual =
+                fused
+                ? inkling2CompiledResidual(attentionConvolved, x)
+                : attentionConvolved.asType(.float32) + x.asType(.float32)
         }
         let normalized: MLXArray
         if messages == nil, Inkling2FastPath.uses(.residualMix),
@@ -2025,13 +2076,26 @@ final class Inkling2DecoderLayer: Module {
             normalized = Inkling2PhaseProfiler.measure(.norms) { mlpNorm(hidden).asType(dtype) }
         }
         let hidden = mlp(normalized)
-        let convolved = Inkling2PhaseProfiler.measure(.shortConvolutions) {
-            inkling2ShortConvolution(hidden, taps: mlpConv, state: conv, slot: 3)
+        let out: MLXArray
+        if let added = Inkling2PhaseProfiler.measure(
+            .shortConvolutions, outputs: { $0.map { [$0] } ?? [] },
+            {
+                inkling2ShortConvolutionAdding(
+                    hidden, taps: mlpConv, state: conv, slot: 3, residual: residual,
+                    outputDType: x.dtype)
+            })
+        {
+            // Convolution and layer output in one dispatch.
+            out = added
+        } else {
+            let convolved = Inkling2PhaseProfiler.measure(.shortConvolutions) {
+                inkling2ShortConvolution(hidden, taps: mlpConv, state: conv, slot: 3)
+            }
+            out =
+                fused
+                ? inkling2CompiledLayerOutput(residual, convolved, x)
+                : (residual + convolved.asType(.float32)).asType(dtype)
         }
-        let out =
-            fused
-            ? inkling2CompiledLayerOutput(residual, convolved, x)
-            : (residual + convolved.asType(.float32)).asType(dtype)
         conv?.advance(x.dim(1))
         return out
     }
