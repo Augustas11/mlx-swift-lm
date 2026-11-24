@@ -48,10 +48,15 @@ jobs:
         run: |
           swift test --skip-build --filter "Inkling2SpeculativeRoundTests|ConvolutionTailRound|KVCacheRoundTests" 2>&1 | tee test.log
           exit ${PIPESTATUS[0]}
-      # The runner's paravirtual GPU: the bit-exact verify-row test. Informational until the
-      # runner's Metal support is proven.
-      - name: GPU verify-row bit-exactness (hosted GPU)
-        continue-on-error: true
+      # The runner's paravirtual GPU: every verify row must equal its one-row decode step bit
+      # for bit, in the toy-width model and at Inkling 2 Mini's real widths. The second run
+      # forces one two-pass block count so the folded attention also runs MLX's two-pass kernel
+      # here (this GPU otherwise routes long-key folds to the per-row calls).
+      - name: GPU verify bit-exactness (hosted GPU)
         run: |
-          INKLING2_GPU_TESTS=1 swift test --skip-build --filter "Inkling2SpeculativeRoundTests/testVerifyRows" 2>&1 | tee gpu-test.log
-          exit ${PIPESTATUS[0]}
+          INKLING2_GPU_TESTS=1 swift test --skip-build --filter "Inkling2SpeculativeRoundTests/testVerifyRows|Inkling2VerifyKernelTests" 2>&1 | tee gpu-test.log
+          rc=${PIPESTATUS[0]}
+          MLX_SDPA_BLOCKS=64 INKLING2_GPU_TESTS=1 swift test --skip-build --filter "Inkling2VerifyKernelTests/testFoldedVerifyAttention" 2>&1 | tee gpu-test-2pass.log
+          rc2=${PIPESTATUS[0]}
+          grep -h "INKLING2_VERIFY_FOLDS" gpu-test.log gpu-test-2pass.log || true
+          [ "$rc" = 0 ] && [ "$rc2" = 0 ]
