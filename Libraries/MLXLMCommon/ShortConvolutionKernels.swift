@@ -103,9 +103,9 @@ package enum ShortConvolutionKernels {
 
     /// The unread mask (`HAS_MASK` false) and the divisors for width 4, held once as host data so
     /// no fill kernel runs per call.
-    private static let noMask = MLXArray([false], [1, 1])
-    private static let staticDivisor4 = MLXArray(Float(Double(5).squareRoot()))
-    private static let dynamicDivisor4 = MLXArray(Float(Double(9).squareRoot()))
+    nonisolated(unsafe) private static let noMask = MLXArray([false], [1, 1])
+    nonisolated(unsafe) private static let staticDivisor4 = MLXArray(Float(Double(5).squareRoot()))
+    nonisolated(unsafe) private static let dynamicDivisor4 = MLXArray(Float(Double(9).squareRoot()))
 
     /// mlx-vlm's GPU condition for its decode kernel: bfloat16 input `[B, L, C]` with `B <= 4`,
     /// `L <= 8`, `C` a multiple of 128, width-4 taps, on the GPU.
