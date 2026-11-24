@@ -867,11 +867,14 @@ public enum Inkling2FastPath {
         /// norms folded in, then gain/forget and the blend); a visit's attn, k and v controllers
         /// share one launch.
         case controllers = "ctrl"
+        /// The attention inputs in one kernel: query and relative-query clips with the global
+        /// layers' log scaling, the key clip and the value norm, written in attention's layouts.
+        case attentionInputs = "inputs"
 
         public var isExact: Bool {
             switch self {
             case .convState, .blockStack, .fusedTails: return true
-            case .residualMix, .controllers: return false
+            case .residualMix, .controllers, .attentionInputs: return false
             }
         }
     }
@@ -1621,6 +1624,32 @@ final class Inkling2Attention: Module {
         super.init()
     }
 
+    /// Fast-path lever ``Inkling2FastPath/Lever/attentionInputs``: the query and relative-query
+    /// clips (with the global layers' log scaling), the key clip and the value norm in one
+    /// kernel (``ClippedAttentionInputKernels``, ported from Ollama pull request 19843), from
+    /// the projections `[B, L, heads * D]`, `[B, L, heads * dRel]` and the convolved keys and
+    /// values `[B, L, kvHeads * D]`. Returns queries `[B, heads, L, D]`, keys and values
+    /// `[B, kvHeads, L, D]` and relative queries `[B, L, heads, dRel]`; nil where the lever is
+    /// off or the kernel does not apply.
+    private func fusedInputs(
+        query: MLXArray, relative: MLXArray, keys: MLXArray, values: MLXArray, offset: Int
+    ) -> (q: MLXArray, k: MLXArray, v: MLXArray, r: MLXArray)? {
+        guard Inkling2FastPath.uses(.attentionInputs) else { return nil }
+        let c = configuration
+        var tau: MLXArray?
+        if !isSliding, let floor = c.logScalingFloor {
+            // tau = 1 + alpha log(max(position / floor, 1)) op by op, positions counted from 1
+            // as float32 straight from the host (exact below 2^24, as the cast is).
+            let positions = MLXArray((0 ..< query.dim(1)).map { Float(offset + 1 + $0) })
+            tau = Float(1) + c.logScalingAlpha * log(maximum(positions / Float(floor), Float(1)))
+        }
+        return ClippedAttentionInputKernels.prepare(
+            q: query, r: relative, k: keys, v: values, queryScale: queryScale,
+            relativeScale: relativeScale, temperature: tau, heads: heads, kvHeads: kvHeads,
+            headDim: headDim, relativeDim: c.relativeDim, queryClip: c.qkClipThreshold,
+            relativeClip: c.relativeClipThreshold, valueNormEps: c.useValueNorm ? c.rmsNormEps : nil)
+    }
+
     /// The reference `Attention.__call__(x, key_input, value_input, cache)`: queries, relative
     /// queries, the gate and the sink read `query`; keys read `key` and values `value`.
     ///
@@ -1669,51 +1698,64 @@ final class Inkling2Attention: Module {
         // Row parts of `in_proj` (local) or `q_proj` (global) that read the query input.
         let (q, r, g, s) = isSliding ? (0, 3, 4, 5) : (0, 1, 2, 3)
 
-        let fast = Inkling2FastPath.enabled
-        let queryInput =
-            inkling2Project(projection, queryRanges[q], x).reshaped(batch, length, heads, headDim)
-        var queries =
-            fast
-            ? queryClip(queryInput, queryScale)
-            : inkling2L2Clip(queryInput, threshold: c.qkClipThreshold, scale: queryScale)
-        keys = keys.reshaped(batch, length, kvHeads, headDim)
-        keys = fast ? keyClip(keys) : inkling2L2Clip(keys, threshold: c.qkClipThreshold)
-        values = values.reshaped(batch, length, kvHeads, headDim)
-        if c.useValueNorm {
-            values = inkling2UnitRMSNorm(values.asType(.float32), eps: c.rmsNormEps).asType(dtype)
-        }
-        let relativeInput = inkling2Project(projection, queryRanges[r], x)
-            .reshaped(batch, length, heads, c.relativeDim)
-        var relative =
-            fast
-            ? relativeClip(relativeInput, relativeScale)
-            : inkling2L2Clip(
-                relativeInput, threshold: c.relativeClipThreshold, scale: relativeScale)
-        if !isSliding, let floor = c.logScalingFloor {
-            // tau = 1 + alpha log(max(position / floor, 1)), positions counted from 1.
-            let offset = attentionCache?.offset ?? 0
-            let fused =
-                Inkling2FastPath.uses(.fusedTails) && queries.dtype == dtype
-                && relative.dtype == dtype
-            // Fused: float32 positions straight from the host, exact below 2^24 as the cast is.
-            let positions =
-                fused
-                ? MLXArray((0 ..< length).map { Float(offset + 1 + $0) })
-                : MLXArray((0 ..< length).map { Int32(offset + 1 + $0) }).asType(.float32)
-            let tau =
-                (Float(1)
-                + c.logScalingAlpha * log(maximum(positions / Float(floor), Float(1))))
-                .reshaped(length, 1, 1)
-            if fused {
-                (queries, relative) = inkling2CompiledLogScaling(queries, relative, tau)
-            } else {
-                queries = (queries.asType(.float32) * tau).asType(dtype)
-                relative = (relative.asType(.float32) * tau).asType(dtype)
+        let queryPart = inkling2Project(projection, queryRanges[q], x)
+        let relativePart = inkling2Project(projection, queryRanges[r], x)
+        var queries: MLXArray
+        var relative: MLXArray
+        if let prepared = fusedInputs(
+            query: queryPart, relative: relativePart, keys: keys, values: values,
+            offset: attentionCache?.offset ?? 0)
+        {
+            // Fused clips, value norm and log scaling, already in attention's layouts.
+            queries = prepared.q
+            keys = prepared.k
+            values = prepared.v
+            relative = prepared.r
+        } else {
+            let fast = Inkling2FastPath.enabled
+            let queryInput = queryPart.reshaped(batch, length, heads, headDim)
+            queries =
+                fast
+                ? queryClip(queryInput, queryScale)
+                : inkling2L2Clip(queryInput, threshold: c.qkClipThreshold, scale: queryScale)
+            keys = keys.reshaped(batch, length, kvHeads, headDim)
+            keys = fast ? keyClip(keys) : inkling2L2Clip(keys, threshold: c.qkClipThreshold)
+            values = values.reshaped(batch, length, kvHeads, headDim)
+            if c.useValueNorm {
+                values = inkling2UnitRMSNorm(values.asType(.float32), eps: c.rmsNormEps).asType(dtype)
             }
+            let relativeInput = relativePart.reshaped(batch, length, heads, c.relativeDim)
+            relative =
+                fast
+                ? relativeClip(relativeInput, relativeScale)
+                : inkling2L2Clip(
+                    relativeInput, threshold: c.relativeClipThreshold, scale: relativeScale)
+            if !isSliding, let floor = c.logScalingFloor {
+                // tau = 1 + alpha log(max(position / floor, 1)), positions counted from 1.
+                let offset = attentionCache?.offset ?? 0
+                let fused =
+                    Inkling2FastPath.uses(.fusedTails) && queries.dtype == dtype
+                    && relative.dtype == dtype
+                // Fused: float32 positions straight from the host, exact below 2^24 as the cast is.
+                let positions =
+                    fused
+                    ? MLXArray((0 ..< length).map { Float(offset + 1 + $0) })
+                    : MLXArray((0 ..< length).map { Int32(offset + 1 + $0) }).asType(.float32)
+                let tau =
+                    (Float(1)
+                    + c.logScalingAlpha * log(maximum(positions / Float(floor), Float(1))))
+                    .reshaped(length, 1, 1)
+                if fused {
+                    (queries, relative) = inkling2CompiledLogScaling(queries, relative, tau)
+                } else {
+                    queries = (queries.asType(.float32) * tau).asType(dtype)
+                    relative = (relative.asType(.float32) * tau).asType(dtype)
+                }
+            }
+            queries = queries.transposed(0, 2, 1, 3)
+            keys = keys.transposed(0, 2, 1, 3)
+            values = values.transposed(0, 2, 1, 3)
         }
-        queries = queries.transposed(0, 2, 1, 3)
-        keys = keys.transposed(0, 2, 1, 3)
-        values = values.transposed(0, 2, 1, 3)
         if let attentionCache {
             (keys, values) = attentionCache.update(keys: keys, values: values)
             // Relative logits index backward distance, so a ring is read in chronological
