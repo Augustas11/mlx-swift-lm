@@ -401,11 +401,12 @@ final class Inkling2RealParityTests: XCTestCase {
         }
     }
 
-    /// Every fast-path lever (``Inkling2FastPath/Lever``) leaves the logits bit-identical: on the
-    /// shortest oracle prompt, prefill and 16 decode steps with all levers off are the reference;
-    /// all levers on, and each lever alone, must give equal float32 logit rows, step by step, on
-    /// the same token sequence. Fast path only; skipped with `INKLING2_COMPILED=0`. Prints one
-    /// `inkling2 lever exactness` line per configuration.
+    /// Every exact fast-path lever (``Inkling2FastPath/Lever/isExact``) leaves the logits
+    /// bit-identical: on the shortest oracle prompt, prefill and 16 decode steps with all levers
+    /// off are the reference; all levers on, and each lever alone, must give equal float32 logit
+    /// rows, step by step, on the same token sequence. A configuration with an inexact lever on
+    /// must keep every step's greedy token. Fast path only; skipped with `INKLING2_COMPILED=0`.
+    /// Prints one `inkling2 lever exactness` line per configuration.
     func testFastPathLeversAreBitExact() throws {
         let environment = ProcessInfo.processInfo.environment
         guard let modelPath = environment["INKLING2_REAL_MODEL"],
@@ -463,10 +464,20 @@ final class Inkling2RealParityTests: XCTestCase {
                 let (rows, _) = try run(off: off, feed: tokens)
                 let equal = arrayEqual(rows, reference).item(Bool.self)
                 let difference = abs(rows - reference).max().item(Float.self)
+                // Levers that reduce in another order (``Inkling2FastPath/Lever/isExact`` false)
+                // must keep the greedy token of every step; the mlx-vlm oracle test is their
+                // full gate.
+                let exact = all.subtracting(off).allSatisfy(\.isExact)
+                let sameTokens = arrayEqual(argMax(rows, axis: -1), argMax(reference, axis: -1))
+                    .item(Bool.self)
                 print(
                     "inkling2 lever exactness levers=\(name) length=\(prompt.size) steps=\(steps) "
-                        + "equal=\(equal) maxDiff=\(difference)")
-                XCTAssertTrue(equal, "lever \(name) changes the logits (max |d| \(difference))")
+                        + "exact=\(exact) equal=\(equal) sameTokens=\(sameTokens) maxDiff=\(difference)")
+                if exact {
+                    XCTAssertTrue(equal, "lever \(name) changes the logits (max |d| \(difference))")
+                } else {
+                    XCTAssertTrue(sameTokens, "lever \(name) changes a greedy token (max |d| \(difference))")
+                }
             }
         }
     }

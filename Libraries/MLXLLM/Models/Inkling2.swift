@@ -446,12 +446,23 @@ public enum Inkling2LoopDriver {
         var blocks = [MLXArray]()
         var prelude: (hidden: MLXArray, blocks: [MLXArray])?
         var bank: MLXArray?
+        // Fused residual mix (``Inkling2FastPath/Lever/residualMix``): the bank's states, which
+        // the mix kernel normalises itself, instead of the bank.
+        var bankStates: [MLXArray]?
         var captures = [Int: MLXArray]()
         for step in schedule.visits {
             if step.layer == schedule.coreStart && step.inCore {
                 if let saved = prelude {
                     let states = Array(blocks[(saved.blocks.count + 1)...]) + [x]
-                    bank = Inkling2PhaseProfiler.measure(.messages) { messageBank(states, eps: eps) }
+                    if Inkling2FastPath.uses(.residualMix),
+                        ResidualMixKernels.supports(states, query: messageQuery(step.layer))
+                    {
+                        bankStates = states
+                        bank = nil
+                    } else {
+                        bankStates = nil
+                        bank = Inkling2PhaseProfiler.measure(.messages) { messageBank(states, eps: eps) }
+                    }
                     x = saved.hidden
                     blocks = saved.blocks
                 } else {
@@ -459,7 +470,13 @@ public enum Inkling2LoopDriver {
                 }
             }
             var messages: MLXArray?
-            if let bank, step.inCore {
+            if let bankStates, step.inCore {
+                // `softmax(query . rms(states) / sqrt(H)) . rms(states)`: the bank and the
+                // messages in one kernel.
+                messages = ResidualMixKernels.mix(
+                    bankStates, query: messageQuery(step.layer), eps: eps,
+                    scale: Float(pow(Double(x.dim(-1)), -0.5)))
+            } else if let bank, step.inCore {
                 messages = Inkling2PhaseProfiler.measure(.messages) {
                     Self.messages(query: messageQuery(step.layer), bank: bank)
                 }
@@ -830,8 +847,10 @@ public enum Inkling2FastPath {
     nonisolated(unsafe) public static var enabled: Bool =
         ProcessInfo.processInfo.environment["INKLING2_COMPILED"] != "0"
 
-    /// Decode levers of the fast path beyond the reference's own fusions. Each is exact (the
-    /// same values in the same op order) and on by default.
+    /// Decode levers of the fast path beyond the reference's own fusions, all on by default.
+    /// An exact lever (``isExact``) gives the same values in the same op order; the others
+    /// (ports of Ollama's Inkling kernels, Ollama pull requests 19808 and 19843) reduce in another
+    /// order and are gated on greedy token parity with the mlx-vlm oracle.
     public enum Lever: String, CaseIterable, Sendable {
         /// The short-convolution kernel also writes the next float32 state.
         case convState = "convstate"
@@ -840,6 +859,17 @@ public enum Inkling2FastPath {
         /// Compiled elementwise tails: message controllers, output gate, residual adds,
         /// dynamic convolutions, log scaling. No fused kernel adds a product it computes.
         case fusedTails = "tails"
+        /// One kernel per attention-residual mix (sources, scores, softmax, mixture), with the
+        /// following input RMS norm where no message controller sits between them; the message
+        /// bank and messages of later passes use the same kernel.
+        case residualMix = "mix"
+
+        public var isExact: Bool {
+            switch self {
+            case .convState, .blockStack, .fusedTails: return true
+            case .residualMix: return false
+            }
+        }
     }
 
     /// Levers switched off, for A/B measurement only: `INKLING2_FAST_OFF`, a comma list of
@@ -1276,6 +1306,7 @@ final class Inkling2AttentionResidual: Module {
     func callAsFunction(
         _ blocks: [MLXArray], _ partial: MLXArray, stacks: Inkling2BlockStacks? = nil
     ) -> MLXArray {
+        if let mixed = fused(blocks, partial) { return mixed }
         let states: MLXArray
         if let stacks, !blocks.isEmpty {
             states = concatenated(
@@ -1291,6 +1322,40 @@ final class Inkling2AttentionResidual: Module {
             matmul(keys, query.reshaped(-1, width).transposed()) * inkling2InverseSquareRoot(width)
         let weights = softmax(scores, axis: -2).swappedAxes(-1, -2)
         return matmul(weights, normalizesValues ? keys : states)
+    }
+
+    /// Fast-path lever ``Inkling2FastPath/Lever/residualMix``: the mix in one kernel
+    /// (``ResidualMixKernels``, ported from Ollama pull requests 19808 and 19843). With `norm`
+    /// (`[queries, H]` RMS norm weights) each mixture also goes through its input norm and is
+    /// rounded once to `dtype`. Nil where the lever is off or the kernel does not apply.
+    func fused(
+        _ blocks: [MLXArray], _ partial: MLXArray, norm: MLXArray? = nil, normEps: Float = 0,
+        dtype: DType = .float32
+    ) -> MLXArray? {
+        guard Inkling2FastPath.uses(.residualMix), normalizesValues else { return nil }
+        let sources = blocks + [partial]
+        guard ResidualMixKernels.supports(sources, query: query) else { return nil }
+        return ResidualMixKernels.mix(
+            sources, query: query, eps: 1e-6, scale: inkling2InverseSquareRoot(partial.dim(-1)),
+            norm: norm, normEps: normEps, outputDType: dtype)
+    }
+}
+
+/// Norm weights stacked `[n, H]` for the fused residual mix, built and evaluated once per set of
+/// weight arrays (by identity). Not a module parameter.
+final class Inkling2StackedNormWeights {
+    private var entries = [String: (weights: [MLXArray], stacked: MLXArray)]()
+
+    func stacked(_ key: String, _ weights: [MLXArray]) -> MLXArray {
+        if let entry = entries[key], entry.weights.count == weights.count,
+            zip(entry.weights, weights).allSatisfy({ $0 === $1 })
+        {
+            return entry.stacked
+        }
+        let result = MLX.stacked(weights, axis: 0)
+        eval(result)
+        entries[key] = (weights, result)
+        return result
     }
 }
 
@@ -1713,6 +1778,8 @@ final class Inkling2DecoderLayer: Module {
     /// Fused tails (``Inkling2FastPath/Lever/fusedTails``): the message controller.
     private let compiledBlendTerms:
         @Sendable (MLXArray, MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray)
+    /// Fused residual mix (``Inkling2FastPath/Lever/residualMix``): the input norms' weights.
+    private let normWeights = Inkling2StackedNormWeights()
 
     init(
         _ config: Inkling2TextConfiguration, layer: Int,
@@ -1776,6 +1843,22 @@ final class Inkling2DecoderLayer: Module {
         return (Float(1) - forget) * x + gain * message
     }
 
+    /// Fast-path lever ``Inkling2FastPath/Lever/residualMix`` for a visit without messages: the
+    /// attention-input mix and its input norms (the local norm, or the global Q/K/V norms) in one
+    /// kernel, `[B, L, 1 or 3, H]` in the hidden dtype. Nil where it does not apply (layer 0 reads
+    /// the embeddings directly).
+    private func fusedAttentionInputs(_ blocks: [MLXArray], _ x: MLXArray) -> MLXArray? {
+        guard Inkling2FastPath.uses(.residualMix), let attentionInput else { return nil }
+        let norms: [RMSNorm?] =
+            isSliding ? [attentionNorm] : [queryInputNorm, keyInputNorm, valueInputNorm]
+        let weights = norms.compactMap { $0?.weight }
+        guard weights.count == norms.count, attentionInput.query.dim(0) == norms.count else {
+            return nil
+        }
+        return attentionInput.fused(
+            blocks, x, norm: normWeights.stacked("attn", weights), normEps: eps, dtype: x.dtype)
+    }
+
     /// One visit of this layer (the reference `DecoderLayer.__call__`).
     ///
     /// - Parameters:
@@ -1789,11 +1872,21 @@ final class Inkling2DecoderLayer: Module {
     ) -> MLXArray {
         let dtype = x.dtype
         let conv = cache?[1] as? ArraysCache
-        let mixed = Inkling2PhaseProfiler.measure(.residualMix) {
-            attentionInput.map { $0(blocks, x, stacks: stacks) } ?? x.expandedDimensions(axis: -2)
-        }
         let attended: MLXArray
-        if isSliding, messages == nil, let attentionNorm {
+        if messages == nil, let normalized = fusedAttentionInputs(blocks, x) {
+            // Fused residual mix and input norms: `[B, L, 1 or 3, H]` in the hidden dtype. A local
+            // layer's one input serves all three projections, as the graph's does.
+            let parts =
+                normalized.dim(-2) == 1
+                ? Array(repeating: normalized[.ellipsis, 0, 0...], count: 3)
+                : (0 ..< 3).map { normalized[.ellipsis, $0, 0...] }
+            attended = Inkling2PhaseProfiler.measure(.attention) {
+                attention(query: parts[0], key: parts[1], value: parts[2], cache: cache)
+            }
+        } else if isSliding, messages == nil, let attentionNorm {
+            let mixed = Inkling2PhaseProfiler.measure(.residualMix) {
+                attentionInput.map { $0(blocks, x, stacks: stacks) } ?? x.expandedDimensions(axis: -2)
+            }
             let input = Inkling2PhaseProfiler.measure(.norms) {
                 attentionNorm(mixed[.ellipsis, 0, 0...]).asType(dtype)
             }
@@ -1801,6 +1894,9 @@ final class Inkling2DecoderLayer: Module {
                 attention(query: input, key: input, value: input, cache: cache)
             }
         } else {
+            let mixed = Inkling2PhaseProfiler.measure(.residualMix) {
+                attentionInput.map { $0(blocks, x, stacks: stacks) } ?? x.expandedDimensions(axis: -2)
+            }
             let count = mixed.dim(-2)
             var parts = (0 ..< 3).map { mixed[.ellipsis, Swift.min($0, count - 1), 0...] }
             if let messages {
@@ -1835,16 +1931,26 @@ final class Inkling2DecoderLayer: Module {
         } else {
             residual = attentionConvolved.asType(.float32) + x.asType(.float32)
         }
-        var hidden = Inkling2PhaseProfiler.measure(.residualMix) {
-            mlpInput(blocks, residual, stacks: stacks)[.ellipsis, 0, 0...]
-        }
-        if let messages {
-            hidden = Inkling2PhaseProfiler.measure(.messages) {
-                blend(hidden, messages[.ellipsis, 3, 0...], controller: 3)
+        let normalized: MLXArray
+        if messages == nil, Inkling2FastPath.uses(.residualMix),
+            let fusedInput = mlpInput.fused(
+                blocks, residual, norm: normWeights.stacked("mlp", [mlpNorm.weight]), normEps: eps,
+                dtype: dtype)
+        {
+            // Fused residual mix and MLP input norm.
+            normalized = fusedInput[.ellipsis, 0, 0...]
+        } else {
+            var hidden = Inkling2PhaseProfiler.measure(.residualMix) {
+                mlpInput(blocks, residual, stacks: stacks)[.ellipsis, 0, 0...]
             }
+            if let messages {
+                hidden = Inkling2PhaseProfiler.measure(.messages) {
+                    blend(hidden, messages[.ellipsis, 3, 0...], controller: 3)
+                }
+            }
+            normalized = Inkling2PhaseProfiler.measure(.norms) { mlpNorm(hidden).asType(dtype) }
         }
-        let normalized = Inkling2PhaseProfiler.measure(.norms) { mlpNorm(hidden).asType(dtype) }
-        hidden = mlp(normalized)
+        let hidden = mlp(normalized)
         let convolved = Inkling2PhaseProfiler.measure(.shortConvolutions) {
             inkling2ShortConvolution(hidden, taps: mlpConv, state: conv, slot: 3)
         }
