@@ -344,11 +344,19 @@ public final class Inkling2DSparkDraftModel: Module, StatefulMTPDrafterModel {
 
     /// Appends the committed positions' taps `[B, n, T * H]` to every layer's context and keeps
     /// the Markov feature of the last one.
-    private func append(_ taps: MLXArray, state: inout MTPDrafterState) {
+    private func append(_ newTaps: MLXArray, state: inout MTPDrafterState) {
         precondition(state.cache.count == layers.count, "Inkling 2 DSpark cache/layer mismatch")
-        let n = taps.dim(1)
+        var taps = newTaps
+        var n = taps.dim(1)
         guard n > 0 else { return }
         let keep = draft.slidingWindow - 1
+        if n > keep {
+            // Only the newest `keep` positions are ever read: skip projecting the rest (a long
+            // prompt would otherwise mix and project every row on the TTFT path).
+            state.nextPosition += n - keep
+            taps = taps[0..., (n - keep)..., 0...]
+            n = keep
+        }
         for (index, layer) in layers.enumerated() {
             let cache = state.cache[index]
             let (keys, values) = layer.attention.context(

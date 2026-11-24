@@ -2445,9 +2445,10 @@ public final class Inkling2Model: Module, LLMModel {
     /// The prompt prefill of a speculative stream: the DSpark draft needs the taps of every
     /// prompt position, which the default path never materialises.
     ///
-    /// The cache sees exactly what ordinary decode gives it: the prompt but its last token in
-    /// chunks of ``defaultPrefillChunkSize`` (the chunk size changes greedy output, so the MTP
-    /// iterator's request for one unchunked forward is not followed), then the last token as a
+    /// The cache sees exactly what ordinary decode gives it: the prompt but its last token in the
+    /// caller's chunks (default ``defaultPrefillChunkSize``; the chunk size changes greedy output,
+    /// so the model is an ``MTPChunkedPromptHiddenModel`` and the iterator keeps them), then the
+    /// last token as a
     /// one-row forward whose logits are returned. Only that row goes through the head, so the
     /// prompt costs no `[L, vocabulary]` logits.
     private func prepareEmittingTaps(
@@ -2458,13 +2459,9 @@ public final class Inkling2Model: Module, LLMModel {
             Set(ids).count == ids.count && ids.allSatisfy { (0 ... schedule.count).contains($0) },
             "Inkling 2 draft taps must be distinct visit indices in 0...\(schedule.count)")
         var chunks = [MLXArray]()
-        // The default prefill (model step size, balanced chunks): what an ordinary request with
-        // default prefill parameters runs. The iterator replaced the caller's step size and
-        // chunking with `.unchunked`, so a caller that set its own is not reproduced here.
-        var ordinary = prefill
-        ordinary.stepSize = nil
-        ordinary.chunking = .balanced
-        let processed = try ordinary.forEachChunk(
+        // The caller's own step size and chunking, exactly as ordinary `prepare` runs them: the
+        // iterator keeps them for an ``MTPChunkedPromptHiddenModel``.
+        let processed = try prefill.forEachChunk(
             total: y.tokens.size, defaultStepSize: Self.defaultPrefillChunkSize
         ) { range in
             let output = model.forward(
@@ -2792,3 +2789,6 @@ public enum Inkling2WeightLayout {
         }
     }
 }
+
+/// The emit prefill collects draft taps chunk by chunk under the caller's prefill parameters.
+extension Inkling2Model: MTPChunkedPromptHiddenModel {}

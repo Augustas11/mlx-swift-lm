@@ -228,6 +228,8 @@ final class CacheListRoundStrategy: KVCacheRoundStrategy {
             "a convolution tail was written this round without recording its input")
         attention.commit(retaining: retaining)
         liveTails.cut(from: recorded, retaining: retaining)
+        // Batched lengths and left padding move with the kept rows only.
+        liveTails.advance(retaining)
     }
 
     func makeRestorePoint(retaining: Int) -> (any KVCacheLeafRestorePoint)? {
@@ -267,6 +269,7 @@ struct CacheListRestorePoint: KVCacheLeafRestorePoint {
             list[0].trim(committed - keep)
         }
         liveTails.cut(from: tails, retaining: keep)
+        liveTails.advance(keep - committed)
         return true
     }
 }

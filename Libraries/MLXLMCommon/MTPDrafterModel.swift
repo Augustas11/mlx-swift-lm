@@ -147,6 +147,15 @@ public protocol MTPTargetInputEmbeddingProvider {
 /// Rollback belongs to the target/cache implementation, not to the drafter.
 /// The depth is explicit so a future multi-token drafter cannot accidentally
 /// select an in-place path whose recurrent checkpoint is too shallow.
+/// A target that emits one hidden row per prompt token under the caller's own prefill chunking.
+///
+/// The MTP iterator normally prefills a prompt-prefill drafter's target in one unchunked forward,
+/// because most targets only expose per-row hidden states that way. For a target whose greedy
+/// output depends on the prefill chunk size, that forward would decode differently from an
+/// ordinary request. A conforming target aggregates the per-chunk rows itself, so the iterator
+/// keeps the caller's ``PrefillParameters`` and the cache sees what ordinary decode gives it.
+public protocol MTPChunkedPromptHiddenModel {}
+
 public protocol SpeculativeCacheRewindModel {
     var maximumNativeTargetCacheRewind: Int { get }
 }
