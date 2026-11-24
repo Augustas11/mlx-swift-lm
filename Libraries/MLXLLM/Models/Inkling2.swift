@@ -863,11 +863,15 @@ public enum Inkling2FastPath {
         /// following input RMS norm where no message controller sits between them; the message
         /// bank and messages of later passes use the same kernel.
         case residualMix = "mix"
+        /// The message controllers in two kernels per launch (down product with the unit RMS
+        /// norms folded in, then gain/forget and the blend); a visit's attn, k and v controllers
+        /// share one launch.
+        case controllers = "ctrl"
 
         public var isExact: Bool {
             switch self {
             case .convState, .blockStack, .fusedTails: return true
-            case .residualMix: return false
+            case .residualMix, .controllers: return false
             }
         }
     }
@@ -1859,6 +1863,25 @@ final class Inkling2DecoderLayer: Module {
             blocks, x, norm: normWeights.stacked("attn", weights), normEps: eps, dtype: x.dtype)
     }
 
+    /// Fast-path lever ``Inkling2FastPath/Lever/controllers``: message controllers
+    /// `first ..< first + count` blended in two kernels (``LowRankGateKernels``, ported from
+    /// Ollama pull request 19843), `[count, B * L, H]` float32. `inputs` is `[B, L, inputCount, H]`
+    /// or `[B, L, H]`. Nil where the lever is off or the kernels do not apply.
+    private func fusedBlend(
+        _ inputs: MLXArray, inputCount: Int, messages: MLXArray, first: Int, count: Int
+    ) -> MLXArray? {
+        guard Inkling2FastPath.uses(.controllers), let loopDown, let loopGainForget,
+            LowRankGateKernels.supports(
+                inputs: inputs, inputCount: inputCount, messages: messages, first: first,
+                count: count, down: loopDown, gainForget: loopGainForget)
+        else { return nil }
+        return Inkling2PhaseProfiler.measure(.messages) {
+            LowRankGateKernels.blend(
+                inputs: inputs, inputCount: inputCount, messages: messages, first: first,
+                count: count, down: loopDown, gainForget: loopGainForget, eps: eps)
+        }
+    }
+
     /// One visit of this layer (the reference `DecoderLayer.__call__`).
     ///
     /// - Parameters:
@@ -1900,9 +1923,14 @@ final class Inkling2DecoderLayer: Module {
             let count = mixed.dim(-2)
             var parts = (0 ..< 3).map { mixed[.ellipsis, Swift.min($0, count - 1), 0...] }
             if let messages {
-                parts = parts.enumerated().map { (i, part) -> MLXArray in
-                    Inkling2PhaseProfiler.measure(.messages) {
-                        blend(part, messages[.ellipsis, i, 0...], controller: i)
+                if let blended = fusedBlend(mixed, inputCount: count, messages: messages, first: 0, count: 3) {
+                    let shape = parts[0].shape
+                    parts = (0 ..< 3).map { blended[$0].reshaped(shape) }
+                } else {
+                    parts = parts.enumerated().map { (i, part) -> MLXArray in
+                        Inkling2PhaseProfiler.measure(.messages) {
+                            blend(part, messages[.ellipsis, i, 0...], controller: i)
+                        }
                     }
                 }
             }
@@ -1944,8 +1972,12 @@ final class Inkling2DecoderLayer: Module {
                 mlpInput(blocks, residual, stacks: stacks)[.ellipsis, 0, 0...]
             }
             if let messages {
-                hidden = Inkling2PhaseProfiler.measure(.messages) {
-                    blend(hidden, messages[.ellipsis, 3, 0...], controller: 3)
+                if let blended = fusedBlend(hidden, inputCount: 1, messages: messages, first: 3, count: 1) {
+                    hidden = blended[0].reshaped(hidden.shape)
+                } else {
+                    hidden = Inkling2PhaseProfiler.measure(.messages) {
+                        blend(hidden, messages[.ellipsis, 3, 0...], controller: 3)
+                    }
                 }
             }
             normalized = Inkling2PhaseProfiler.measure(.norms) { mlpNorm(hidden).asType(dtype) }
