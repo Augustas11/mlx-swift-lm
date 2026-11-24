@@ -739,6 +739,41 @@ private func inkling2Project(_ linear: Linear, _ rows: Range<Int>, _ x: MLXArray
     return matmul(x, linear.weight[r].transposed())
 }
 
+/// Row spans of fused projections computed once per attention visit
+/// (``Inkling2FastPath/Lever/oneProjection``), so the parts that read one input come from one
+/// product. Each output row of MLX's quantized matrix-vector product depends only on its own
+/// weight rows (the kernel is chosen by the input size and the row count, which do not change),
+/// so a part sliced from the span equals the part's own product. Only for quantized projections
+/// and a single input row, where a column slice stays row-contiguous; otherwise every part is
+/// projected on its own as before.
+///
+/// Ported from the single projection per input in Ollama's Inkling 2 attention (Ollama pull
+/// request 19843, `model/models/inkling2` `project`; MIT licence, Copyright (c) Ollama).
+private final class Inkling2ProjectionSpans {
+    private var spans: [(linear: Linear, input: MLXArray, rows: Range<Int>, out: MLXArray)] = []
+    private let enabled: Bool
+
+    init(rows: Int) { enabled = rows == 1 && Inkling2FastPath.uses(.oneProjection) }
+
+    /// Computes rows `rows` of `linear` on `x` once, for the parts inside them.
+    func add(_ linear: Linear, _ rows: Range<Int>, _ x: MLXArray) {
+        guard enabled, linear is QuantizedLinear else { return }
+        spans.append((linear, x, rows, inkling2Project(linear, rows, x)))
+    }
+
+    /// Rows `rows` of `linear` on `x`: a slice of a span that holds them, else their own product.
+    func project(_ linear: Linear, _ rows: Range<Int>, _ x: MLXArray) -> MLXArray {
+        if let span = spans.first(where: {
+            $0.linear === linear && $0.input === x && $0.rows.lowerBound <= rows.lowerBound
+                && rows.upperBound <= $0.rows.upperBound
+        }) {
+            let start = rows.lowerBound - span.rows.lowerBound
+            return span.out[.ellipsis, start ..< (start + rows.count)]
+        }
+        return inkling2Project(linear, rows, x)
+    }
+}
+
 /// The reference `ShortConvolution`: a depthwise causal convolution over the previous
 /// `kernel - 1` inputs, with the residual added before the `1 / sqrt(kernel + 1)` scale, all in
 /// float32. `state[slot]` holds the last `kernel - 1` inputs in float32.
@@ -886,10 +921,13 @@ public enum Inkling2FastPath {
         /// attention residual or the layer output's residual in the kernel, the global layers'
         /// dynamic ones compute their taps and lag products in the kernel.
         case convAdd = "convadd"
+        /// One quantized product per (fused projection, input) at single-row decode, sliced into
+        /// the parts, instead of one product per part.
+        case oneProjection = "oneproj"
 
         public var isExact: Bool {
             switch self {
-            case .convState, .blockStack, .fusedTails, .convAdd: return true
+            case .convState, .blockStack, .fusedTails, .convAdd, .oneProjection: return true
             case .residualMix, .controllers, .attentionInputs: return false
             }
         }
@@ -1698,14 +1736,30 @@ final class Inkling2Attention: Module {
         let dtype = x.dtype
         let attentionCache = cache?[0]
         let conv = cache?[1] as? ArraysCache
+        // Row parts of `in_proj` (local) or `q_proj` (global) that read the query input.
+        let (q, r, g, s) = isSliding ? (0, 3, 4, 5) : (0, 1, 2, 3)
+        let spans = Inkling2ProjectionSpans(rows: batch * length)
+        if let inProj {
+            if keyInput === x && valueInput === x {
+                spans.add(inProj, 0 ..< inProj.weight.dim(0), x)
+            } else {
+                // Relative query, gate and sink rows are adjacent; the query rows come first.
+                spans.add(inProj, queryRanges[q], x)
+                spans.add(inProj, queryRanges[r].lowerBound ..< queryRanges[s].upperBound, x)
+            }
+        } else if let queryProj, let keyProj, let valueProj {
+            spans.add(queryProj, 0 ..< queryProj.weight.dim(0), x)
+            spans.add(keyProj, 0 ..< keyProj.weight.dim(0), keyInput)
+            spans.add(valueProj, 0 ..< valueProj.weight.dim(0), valueInput)
+        }
 
         var keys: MLXArray
         var values: MLXArray
         let projection: Linear
         if let inProj, let keyConv, let valueConv {
             projection = inProj
-            let k = inkling2Project(inProj, queryRanges[1], keyInput)
-            let v = inkling2Project(inProj, queryRanges[2], valueInput)
+            let k = spans.project(inProj, queryRanges[1], keyInput)
+            let v = spans.project(inProj, queryRanges[2], valueInput)
             keys = Inkling2PhaseProfiler.measure(.shortConvolutions, inputs: [k]) {
                 inkling2ShortConvolution(k, taps: keyConv, state: conv, slot: 0)
             }
@@ -1714,10 +1768,10 @@ final class Inkling2Attention: Module {
             }
         } else if let queryProj, let keyProj, let valueProj, let keyStatic, let valueStatic {
             projection = queryProj
-            let k = inkling2Project(keyProj, keyValueRanges[0], keyInput)
-            let kTaps = inkling2Project(keyProj, keyValueRanges[1], keyInput)
-            let v = inkling2Project(valueProj, keyValueRanges[0], valueInput)
-            let vTaps = inkling2Project(valueProj, keyValueRanges[1], valueInput)
+            let k = spans.project(keyProj, keyValueRanges[0], keyInput)
+            let kTaps = spans.project(keyProj, keyValueRanges[1], keyInput)
+            let v = spans.project(valueProj, keyValueRanges[0], valueInput)
+            let vTaps = spans.project(valueProj, keyValueRanges[1], valueInput)
             keys = Inkling2PhaseProfiler.measure(.shortConvolutions, inputs: [k, kTaps]) {
                 inkling2DynamicShortConvolution(
                     k, dynamicTaps: kTaps, staticTaps: keyStatic, heads: kvHeads, state: conv,
@@ -1731,11 +1785,8 @@ final class Inkling2Attention: Module {
         } else {
             fatalError("Inkling 2 attention has neither the local nor the global projections")
         }
-        // Row parts of `in_proj` (local) or `q_proj` (global) that read the query input.
-        let (q, r, g, s) = isSliding ? (0, 3, 4, 5) : (0, 1, 2, 3)
-
-        let queryPart = inkling2Project(projection, queryRanges[q], x)
-        let relativePart = inkling2Project(projection, queryRanges[r], x)
+        let queryPart = spans.project(projection, queryRanges[q], x)
+        let relativePart = spans.project(projection, queryRanges[r], x)
         var queries: MLXArray
         var relative: MLXArray
         if let prepared = fusedInputs(
@@ -1813,7 +1864,7 @@ final class Inkling2Attention: Module {
                 relative, relativeProj.asType(dtype), queryOffset: size - length, keys: size,
                 sliding: sliding, extent: extent)
         // A query-dependent sink: its own logit against a zero key and value.
-        let sinks = inkling2Project(projection, queryRanges[s], x).transposed(0, 2, 1)
+        let sinks = spans.project(projection, queryRanges[s], x).transposed(0, 2, 1)
             .expandedDimensions(axis: -1)
         mask = concatenated([mask, sinks], axis: -1)
         let row = [batch, kvHeads, 1, headDim]
@@ -1823,7 +1874,7 @@ final class Inkling2Attention: Module {
             queries: queries, keys: keys, values: values,
             scale: inkling2InverseSquareRoot(headDim), mask: mask)
         out = out.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        let gate = inkling2Project(projection, queryRanges[g], x)
+        let gate = spans.project(projection, queryRanges[g], x)
         if Inkling2FastPath.uses(.fusedTails), out.dtype == dtype {
             out = inkling2CompiledOutputGate(out, gate)
         } else {
