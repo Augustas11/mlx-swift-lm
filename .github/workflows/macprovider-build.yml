@@ -1,0 +1,52 @@
+name: macprovider fork build
+
+# Compile check for macprovider/* fork branches before any lab-hardware time: the upstream
+# workflows only run in ml-explore/mlx-swift-lm. Builds library and test targets and runs the
+# CPU-only speculative-round tests; Metal tests and real-model runs stay on lab hardware.
+on:
+  push:
+    branches: ["macprovider/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macprovider-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository == 'Augustas11/mlx-swift-lm'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Xcode and Swift versions
+        run: |
+          xcodebuild -version
+          swift --version
+      - name: Build library and test targets
+        run: swift build --build-tests 2>&1 | tee build.log; exit ${PIPESTATUS[0]}
+      - name: Compile errors
+        if: failure()
+        run: grep -E "error:" build.log | sort -u | head -80
+      # Loading the test bundle initialises MLX's Metal backend, which needs mlx.metallib even
+      # for CPU-only tests: build it from the resolved mlx-swift checkout.
+      - name: Build mlx.metallib
+        run: |
+          xcodebuild -downloadComponent MetalToolchain >/dev/null 2>&1 || true
+          curl -fsSL https://raw.githubusercontent.com/Augustas11/macprovider/main/phase3-binary/scripts/build-mlx-metallib.sh -o "$RUNNER_TEMP/build-mlx-metallib.sh"
+          MLX_SWIFT_CHECKOUT="$PWD/.build/checkouts/mlx-swift" bash "$RUNNER_TEMP/build-mlx-metallib.sh" "$RUNNER_TEMP/metallib"
+          for x in .build/arm64-apple-macosx/debug/*.xctest/Contents/MacOS; do cp "$RUNNER_TEMP/metallib/mlx.metallib" "$x/"; done
+          cp "$RUNNER_TEMP/metallib/mlx.metallib" .build/arm64-apple-macosx/debug/
+      # The runner's paravirtual GPU: the fused gate/up stack must release the separate
+      # projections (#2474) and match the unfused path. Small shapes only; the bitwise test at
+      # GLM-5.3-Flash expert shapes needs more memory than the hosted runner and stays on the
+      # lab job.
+      - name: GLM5Next fused gate/up tests (hosted GPU)
+        run: |
+          swift test --skip-build --filter "GLM5NextTests/testFusedGateUpReleasesSeparateProjections|GLM5NextTests/testFusedGateUpOnlyForInstalledQuantizedViews" 2>&1 | tee gpu-test.log
+          exit ${PIPESTATUS[0]}
