@@ -818,6 +818,16 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         retainedView(tail: rewindCapacity > 0 ? Swift.min(tail, maxCacheSize) : tail)
     }
 
+    /// The storage column of the oldest entry in the arrays the last ``update(keys:values:)``
+    /// returned, for a ring without a pinned prefix or a rewind reserve: those arrays are then
+    /// every live entry, in chronological order from this column, wrapping. Zero when they are
+    /// already in order; nil for other layouts, which callers read through ``logicalView(tail:)``.
+    package var ringRotation: Int? {
+        guard keep == 0, rewindCapacity == 0, let keys else { return nil }
+        if !wrapped || idx == keys.dim(2) { return 0 }
+        return idx
+    }
+
     private func retainedView(tail: Int) -> (MLXArray, MLXArray)? {
         guard let keys = self.keys, let values = self.values else { return nil }
 
