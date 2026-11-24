@@ -31,13 +31,17 @@ final class Inkling2VerifyKernelTests: XCTestCase {
         try Device.withDefaultDevice(.gpu) {
             MLXRandom.seed(11)
             for (bits, group) in [(8, 64), (4, 64)] {
-                for (inputs, outputs) in [(2304, 8600), (2304, 6552), (3072, 2304), (2304, 1024)] {
+                // Mini's widths, then the toy model test's (hidden 256, 2 heads of 128).
+                for (inputs, outputs) in [
+                    (2304, 8600), (2304, 6552), (3072, 2304), (2304, 1024),
+                    (256, 1096), (256, 256), (256, 128),
+                ] {
                     let linear = QuantizedLinear(
                         weight: (MLXRandom.normal([outputs, inputs]) * 0.05).asType(.bfloat16),
                         bias: nil, groupSize: group, bits: bits)
-                    let ranges = [0 ..< outputs, 0 ..< 3072, 3072 ..< outputs]
-                        .filter { $0.upperBound <= outputs && !$0.isEmpty }
-                    for rows in [2, 5, 8] {
+                    let split = outputs > 3072 ? 3072 : outputs / 2
+                    let ranges = [0 ..< outputs, 0 ..< split, split ..< outputs]
+                    for rows in [2, 3, 5, 8] {
                         let x = (MLXRandom.normal([1, rows, inputs])).asType(.bfloat16)
                         for range in ranges {
                             let batched = inkling2Project(linear, range, inkling2RowBatch(x))
@@ -68,25 +72,34 @@ final class Inkling2VerifyKernelTests: XCTestCase {
                     with: Data(contentsOf: directory.appendingPathComponent("oq4e-config.json")))
                     as? [String: Any])
             json["mtp_config"] = nil
-            let config = try JSONDecoder().decode(
-                Inkling2Configuration.self, from: JSONSerialization.data(withJSONObject: json))
-            XCTAssertEqual(config.text.hiddenSize, 2304)
-            XCTAssertEqual(config.text.experts, 128)
             let format = Inkling2ExpertFormat(mode: .affine, bits: 8, groupSize: 32)
-            let moe = Inkling2SparseMoE(config.text, gateUp: format, down: format)
             MLXRandom.seed(13)
-            moe.update(
-                parameters: ModuleParameters.unflattened([
-                    "router_weight": MLXRandom.normal([128, 2304]) * 0.02,
-                    "router_bias": MLXRandom.normal([128]) * 0.01,
-                ]))
-            for rows in [2, 5, 8] {
-                let x = MLXRandom.normal([1, rows, 2304]).asType(.bfloat16)
-                let verify = moe.route(x, verify: true)
-                for row in 0 ..< rows {
-                    let alone = moe.route(x[0..., row ..< (row + 1)])
-                    equal(verify.indices[0..., row ..< (row + 1)], alone.indices, "indices \(row) of \(rows)")
-                    equal(verify.weights[0..., row ..< (row + 1)], alone.weights, "weights \(row) of \(rows)")
+            // Mini's router, then the toy model test's (hidden 256, 4 experts, top 2).
+            for (hidden, experts, top) in [(2304, 128, 8), (256, 4, 2)] {
+                var text = try XCTUnwrap(json["text_config"] as? [String: Any])
+                text["hidden_size"] = hidden
+                text["n_routed_experts"] = experts
+                text["num_experts_per_tok"] = top
+                text["intermediate_size"] = 32
+                var shaped = json
+                shaped["text_config"] = text
+                let config = try JSONDecoder().decode(
+                    Inkling2Configuration.self, from: JSONSerialization.data(withJSONObject: shaped))
+                let moe = Inkling2SparseMoE(config.text, gateUp: format, down: format)
+                moe.update(
+                    parameters: ModuleParameters.unflattened([
+                        "router_weight": MLXRandom.normal([experts, hidden]) * 0.02,
+                        "router_bias": MLXRandom.normal([experts]) * 0.01,
+                    ]))
+                for rows in [2, 3, 5, 8] {
+                    let x = MLXRandom.normal([1, rows, hidden]).asType(.bfloat16)
+                    let verify = moe.route(x, verify: true)
+                    for row in 0 ..< rows {
+                        let alone = moe.route(x[0..., row ..< (row + 1)])
+                        let note = "\(experts) experts over \(hidden), row \(row) of \(rows)"
+                        equal(verify.indices[0..., row ..< (row + 1)], alone.indices, "indices: " + note)
+                        equal(verify.weights[0..., row ..< (row + 1)], alone.weights, "weights: " + note)
+                    }
                 }
             }
         }
