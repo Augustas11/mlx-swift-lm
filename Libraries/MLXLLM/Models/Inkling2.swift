@@ -924,10 +924,14 @@ public enum Inkling2FastPath {
         /// One quantized product per (fused projection, input) at single-row decode, sliced into
         /// the parts, instead of one product per part.
         case oneProjection = "oneproj"
+        /// The router's top-k, gather of the chosen scores, at single-row decode in the fork's
+        /// shared one-dispatch top-k kernel instead of the sort and gather.
+        case router = "router"
 
         public var isExact: Bool {
             switch self {
-            case .convState, .blockStack, .fusedTails, .convAdd, .oneProjection: return true
+            case .convState, .blockStack, .fusedTails, .convAdd, .oneProjection, .router:
+                return true
             case .residualMix, .controllers, .attentionInputs: return false
             }
         }
@@ -996,6 +1000,23 @@ private func inkling2CompiledRoute(topK: Int, routeScale: Float)
         let chosen = takeAlong(scores, indices, axis: -1)
         let weights = chosen / (chosen.sum(axis: -1, keepDims: true) + Float(1e-20)) * routeScale
         return (indices, weights)
+    }
+}
+
+/// The router's scores and bias-corrected selection values, compiled: `sigmoid(x W^T)` in
+/// float32 and `scores + bias`, as ``inkling2CompiledRoute(topK:routeScale:)`` computes them.
+private let inkling2CompiledRouteScores:
+    @Sendable (MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray) =
+        compile(shapeless: false) { x, weight, bias in
+            let scores = sigmoid(matmul(x.asType(.float32), weight.asType(.float32).transposed()))
+            return (scores, scores + bias)
+        }
+
+/// The router's weights from the chosen scores, compiled: normalised over the chosen experts
+/// and multiplied by `route_scale`, as ``inkling2CompiledRoute(topK:routeScale:)`` computes them.
+private func inkling2CompiledRouteWeights(routeScale: Float) -> @Sendable (MLXArray) -> MLXArray {
+    compile(shapeless: false) { chosen in
+        chosen / (chosen.sum(axis: -1, keepDims: true) + Float(1e-20)) * routeScale
     }
 }
 
@@ -1567,6 +1588,7 @@ final class Inkling2SparseMoE: Module {
     let topK: Int
     let routeScale: Float
     private let compiledRoute: @Sendable (MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray)
+    private let compiledRouteWeights: @Sendable (MLXArray) -> MLXArray
 
     @ParameterInfo(key: "router_weight") var routerWeight: MLXArray
     @ParameterInfo(key: "router_bias") var routerBias: MLXArray
@@ -1576,6 +1598,7 @@ final class Inkling2SparseMoE: Module {
         topK = config.expertsPerToken
         routeScale = config.routeScale
         compiledRoute = inkling2CompiledRoute(topK: config.expertsPerToken, routeScale: config.routeScale)
+        compiledRouteWeights = inkling2CompiledRouteWeights(routeScale: config.routeScale)
         _routerWeight.wrappedValue = MLXArray.zeros(
             [config.experts, config.hiddenSize], dtype: .float32)
         _routerBias.wrappedValue = MLXArray.zeros([config.experts], dtype: .float32)
@@ -1586,6 +1609,20 @@ final class Inkling2SparseMoE: Module {
     /// `_route`: sigmoid scores in float32, top-k of the bias-corrected scores, weights
     /// normalised over the chosen experts and multiplied by `route_scale`.
     func route(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
+        if Inkling2FastPath.uses(.router), Inkling2FastPath.onGPU, x.size == x.dim(-1) {
+            // Single-row decode: the top-k and the gather in one dispatch. The shared kernel's
+            // descending order is `argPartition(-selection, kth: K - 1)[..<K]`'s (stable, ties
+            // in expert order), so indices and weights are bit-identical. Ported from Ollama's
+            // Inkling 2 route top-k (Ollama pull request 19843, `mlx/route_topk.go`; MIT
+            // licence, Copyright (c) Ollama), on the fork's shared router kernel.
+            let (scores, selection) = inkling2CompiledRouteScores(x, routerWeight, routerBias)
+            if supportsFusedRouterTopK(selection, k: topK) {
+                let top = fusedRouterTopK(
+                    selection: selection, values: scores, k: topK, normalize: false,
+                    order: .descending)
+                return (top.indices, compiledRouteWeights(top.scores))
+            }
+        }
         if Inkling2FastPath.enabled {
             let (indices, weights) = compiledRoute(x, routerWeight, routerBias)
             return (indices, weights)
