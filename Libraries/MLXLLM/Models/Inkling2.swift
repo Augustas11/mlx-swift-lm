@@ -2477,6 +2477,8 @@ public final class Inkling2Model: Module, LLMModel {
         }
         var out = last.state ?? state
         out[mtpLastHiddenStatesKey] = concatenated(chunks + [lastTaps], axis: 1)
+        // The iterator's `.logits` branch reports nothing, so report completion here.
+        prefill.progress?(y.tokens.size, y.tokens.size)
         return .logits(LMOutput(logits: last.logits, state: out))
     }
 

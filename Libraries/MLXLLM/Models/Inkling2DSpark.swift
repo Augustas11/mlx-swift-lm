@@ -350,7 +350,7 @@ public final class Inkling2DSparkDraftModel: Module, StatefulMTPDrafterModel {
         var n = taps.dim(1)
         guard n > 0 else { return }
         let keep = draft.slidingWindow - 1
-        if n > keep {
+        if n > keep, keep > 0 {
             // Only the newest `keep` positions are ever read: skip projecting the rest (a long
             // prompt would otherwise mix and project every row on the TTFT path).
             state.nextPosition += n - keep
@@ -373,8 +373,9 @@ public final class Inkling2DSparkDraftModel: Module, StatefulMTPDrafterModel {
             }
         }
         state.nextPosition += n
+        let total = newTaps.dim(1)
         state.seedHidden = mix(
-            taps[0..., (n - 1)..., 0...], row: draft.hiddenLayers, norm: markovHead.tapNorm)
+            newTaps[0..., (total - 1)..., 0...], row: draft.hiddenLayers, norm: markovHead.tapNorm)
     }
 
     /// The newest `sliding_window_size - 1` context positions of layer `index`.

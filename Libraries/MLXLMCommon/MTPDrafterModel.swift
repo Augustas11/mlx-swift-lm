@@ -142,11 +142,6 @@ public protocol MTPTargetInputEmbeddingProvider {
     var mtpInputEmbeddingScale: Float { get }
 }
 
-/// Target-side capability for rewinding an in-place speculative verify pass.
-///
-/// Rollback belongs to the target/cache implementation, not to the drafter.
-/// The depth is explicit so a future multi-token drafter cannot accidentally
-/// select an in-place path whose recurrent checkpoint is too shallow.
 /// A target that emits one hidden row per prompt token under the caller's own prefill chunking.
 ///
 /// The MTP iterator normally prefills a prompt-prefill drafter's target in one unchunked forward,
@@ -156,6 +151,11 @@ public protocol MTPTargetInputEmbeddingProvider {
 /// keeps the caller's ``PrefillParameters`` and the cache sees what ordinary decode gives it.
 public protocol MTPChunkedPromptHiddenModel {}
 
+/// Target-side capability for rewinding an in-place speculative verify pass.
+///
+/// Rollback belongs to the target/cache implementation, not to the drafter.
+/// The depth is explicit so a future multi-token drafter cannot accidentally
+/// select an in-place path whose recurrent checkpoint is too shallow.
 public protocol SpeculativeCacheRewindModel {
     var maximumNativeTargetCacheRewind: Int { get }
 }

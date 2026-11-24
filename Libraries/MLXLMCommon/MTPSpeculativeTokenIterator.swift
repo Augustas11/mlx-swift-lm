@@ -293,17 +293,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         let prefillStart = Date.timeIntervalSinceReferenceDate
-        var mtpPrefill = parameters.prefill
-        if drafter.requiresPromptPrefill || continuationToResume != nil,
-            !(mainModel is any MTPChunkedPromptHiddenModel)
-        {
-            // The target must expose one hidden row per prompt token so a
-            // private MTP cache can be filled or resumed over the suffix.
-            // Targets that aggregate chunk rows themselves keep the caller's
-            // chunking; the rest use the reference single-forward computation.
-            mtpPrefill.stepSize = Int.max
-            mtpPrefill.chunking = .unchunked
-        }
+        let mtpPrefill = Self.promptPrefill(
+            parameters.prefill, target: mainModel,
+            needsPromptHidden: drafter.requiresPromptPrefill || continuationToResume != nil)
         try prepare(input: input, prefill: mtpPrefill)
         self.promptPrefillTime = Date.timeIntervalSinceReferenceDate - prefillStart
 
@@ -318,6 +310,20 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     static let missingSharedKVSourcesReason =
         "main model did not report which cache entries its shared K/V came from; continuing "
         + "without speculation"
+
+    /// The prefill the target runs. A drafter that needs one hidden row per prompt token (or a
+    /// resumed continuation) gets the reference single unchunked forward, unless the target
+    /// aggregates chunk rows itself (``MTPChunkedPromptHiddenModel``): then the caller's chunking
+    /// stands, so the cache sees what ordinary decode gives it.
+    static func promptPrefill(
+        _ prefill: PrefillParameters, target: any LanguageModel, needsPromptHidden: Bool
+    ) -> PrefillParameters {
+        guard needsPromptHidden, !(target is any MTPChunkedPromptHiddenModel) else { return prefill }
+        var single = prefill
+        single.stepSize = Int.max
+        single.chunking = .unchunked
+        return single
+    }
 
     /// The tightest sliding window among the cache's layers, or `nil` when no layer slides.
     static func narrowestSlidingWindow(in cache: [KVCache]) -> Int? {

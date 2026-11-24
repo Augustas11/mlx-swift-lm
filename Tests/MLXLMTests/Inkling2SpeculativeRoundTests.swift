@@ -18,7 +18,9 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
     }
 
     /// Mini's topology (24 layers, the looped core, 48 visits) at toy widths, a 6-slot ring so
-    /// short prompts wrap it, and 8-bit affine experts that run on the CPU.
+    /// short prompts wrap it, and 8-bit affine experts that run on the CPU. Every parameter is
+    /// random (the module initialises the conv taps and experts to zero), so every tail and the
+    /// MoE reach the logits.
     private func tinyModel() throws -> Inkling2Model {
         var json = try XCTUnwrap(
             JSONSerialization.jsonObject(with: resource("oq4e-config.json")) as? [String: Any])
@@ -36,13 +38,24 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
         text["loop_config"] = loop
         json["text_config"] = text
         json["mtp_config"] = nil
-        json["quantization_config"] = ["group_size": 32, "bits": 8, "mode": "affine"]
+        // `BaseConfiguration` reads `quantization`; the fixture's per-layer map names nvfp4.
+        let affine8: [String: Any] = ["group_size": 32, "bits": 8, "mode": "affine"]
+        json["quantization"] = affine8
+        json["quantization_config"] = affine8
         let data = try JSONSerialization.data(withJSONObject: json)
         let config = try JSONDecoder().decode(Inkling2Configuration.self, from: data)
         try config.validateModelConfiguration()
         let base = try JSONDecoder().decode(BaseConfiguration.self, from: data)
         MLXRandom.seed(7)
         let model = Inkling2Model(config, quantization: base.perLayerQuantization)
+        XCTAssertEqual(model.expertFormats.first?.gateUp, Inkling2ExpertFormat(mode: .affine, bits: 8, groupSize: 32))
+        let randomized = model.parameters().flattened().map { key, value -> (String, MLXArray) in
+            if value.dtype == .uint32 || value.dtype == .uint8 {
+                return (key, MLXRandom.randInt(0 ..< 200, value.shape).asType(value.dtype))
+            }
+            return (key, (MLXRandom.normal(value.shape) * 0.05).asType(value.dtype))
+        }
+        model.update(parameters: ModuleParameters.unflattened(randomized))
         eval(model)
         return model
     }
@@ -54,6 +67,14 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
     private func close(_ a: MLXArray, _ b: MLXArray, _ note: String) {
         XCTAssertEqual(a.shape, b.shape, note)
         XCTAssertTrue(allClose(a, b, rtol: 1e-4, atol: 1e-4).item(Bool.self), note)
+    }
+
+    private func identical(_ a: [KVCache], _ b: [KVCache]) -> Bool {
+        zip(a, b).allSatisfy { x, y in
+            let (sx, sy) = (x.state, y.state)
+            return sx.count == sy.count
+                && zip(sx, sy).allSatisfy { $0.shape == $1.shape && arrayEqual($0, $1).item(Bool.self) }
+        }
     }
 
     private func expectTailsMatch(_ a: [KVCache], _ b: [KVCache], _ note: String) {
@@ -132,32 +153,64 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
         try Device.withDefaultDevice(.cpu) {
             let model = try tinyModel()
             let prompt = LMInput(tokens: tokens([3, 9, 27, 17, 51, 25, 11, 33, 35, 1, 2]))
-            let prefill = PrefillParameters(stepSize: 4)
 
-            let ordinaryCache = try model.newCache(parameters: nil)
-            guard case .tokens(let rest) = try model.prepare(
-                prompt, cache: ordinaryCache, state: nil, prefill: prefill)
-            else { return XCTFail("ordinary prepare returned logits") }
-            let ordinaryLogits = model(rest.tokens[.newAxis], cache: ordinaryCache)
+            func ordinary(_ prefill: PrefillParameters) throws -> ([KVCache], MLXArray) {
+                let cache = try model.newCache(parameters: nil)
+                guard case .tokens(let rest) = try model.prepare(
+                    prompt, cache: cache, state: nil, prefill: prefill)
+                else { throw XCTSkip("ordinary prepare returned logits") }
+                let logits = model(rest.tokens[.newAxis], cache: cache)
+                eval(logits, cache)
+                return (cache, logits)
+            }
+            func emitting(_ prefill: PrefillParameters) throws -> ([KVCache], LMOutput) {
+                var state = LMOutput.State()
+                state[mtpEmitFlagKey] = true
+                state[mtpTargetLayerIdsKey] = [5, 23, 41, 48]
+                let cache = try model.newCache(parameters: nil)
+                guard case .logits(let output) = try model.prepare(
+                    prompt, cache: cache, state: state, prefill: prefill)
+                else { throw XCTSkip("emit prepare returned tokens") }
+                eval(output.logits, cache)
+                return (cache, output)
+            }
 
-            var state = LMOutput.State()
-            state[mtpEmitFlagKey] = true
-            state[mtpTargetLayerIdsKey] = [5, 23, 41, 48]
-            let emitCache = try model.newCache(parameters: nil)
-            guard case .logits(let output) = try model.prepare(
-                prompt, cache: emitCache, state: state, prefill: prefill)
-            else { return XCTFail("emit prepare returned tokens") }
-
-            close(output.logits, ordinaryLogits, "last-token logits")
-            expectTailsMatch(emitCache, ordinaryCache, "emit prefill")
+            // The same chunks run the same ops, so the caches are bit-identical.
+            let stepFour = PrefillParameters(stepSize: 4)
+            let (ordinaryCache, ordinaryLogits) = try ordinary(stepFour)
+            let (emitCache, output) = try emitting(stepFour)
+            XCTAssertTrue(identical(emitCache, ordinaryCache), "emit prefill at step 4")
+            XCTAssertTrue(arrayEqual(output.logits, ordinaryLogits).item(Bool.self), "last-token logits")
             let taps = try XCTUnwrap(output.state?[mtpLastHiddenStatesKey])
             XCTAssertEqual(taps.shape, [1, prompt.text.tokens.size, 4 * 64])
             XCTAssertEqual(taps.dtype, .bfloat16)
+
+            // Negative control: the check above sees a chunking change.
+            let (unchunkedCache, _) = try emitting(PrefillParameters(chunking: .unchunked))
+            XCTAssertFalse(
+                identical(unchunkedCache, ordinaryCache),
+                "an unchunked prefill left the same cache as step 4: the check cannot see chunking")
         }
     }
 
-    func testTheIteratorKeepsTheCallersPrefillForInkling() throws {
-        let model = try Device.withDefaultDevice(.cpu) { try tinyModel() }
-        XCTAssertTrue((model as Any) is any MTPChunkedPromptHiddenModel)
+    func testTheIteratorKeepsTheCallersPrefillOnlyForChunkAggregatingTargets() throws {
+        let inkling = try Device.withDefaultDevice(.cpu) { try tinyModel() }
+        let caller = PrefillParameters(stepSize: 512)
+        let kept = MTPSpeculativeTokenIterator.promptPrefill(
+            caller, target: inkling, needsPromptHidden: true)
+        XCTAssertEqual(kept.stepSize, 512)
+        guard case .balanced = kept.chunking else { return XCTFail("chunking replaced for Inkling 2") }
+
+        let other = Device.withDefaultDevice(.cpu) { LlamaModel(
+            LlamaConfiguration(
+                hiddenSize: 64, hiddenLayers: 2, intermediateSize: 128, attentionHeads: 8,
+                rmsNormEps: 0.00001, vocabularySize: 100, kvHeads: 4)) }
+        let replaced = MTPSpeculativeTokenIterator.promptPrefill(
+            caller, target: other, needsPromptHidden: true)
+        XCTAssertEqual(replaced.stepSize, Int.max)
+        guard case .unchunked = replaced.chunking else { return XCTFail("other targets must run unchunked") }
+        XCTAssertEqual(
+            MTPSpeculativeTokenIterator.promptPrefill(caller, target: other, needsPromptHidden: false)
+                .stepSize, 512)
     }
 }
