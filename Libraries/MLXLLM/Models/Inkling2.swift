@@ -2526,7 +2526,7 @@ public final class Inkling2TextModel: Module {
 }
 
 /// The text model and head.
-public final class Inkling2Model: Module, LLMModel {
+public final class Inkling2Model: Module, LLMModel, SuppressedTokensProviding {
     public let configuration: Inkling2Configuration
     public let schedule: Inkling2LoopSchedule
 
@@ -2560,6 +2560,10 @@ public final class Inkling2Model: Module, LLMModel {
 
     public var vocabularySize: Int { configuration.text.unpaddedVocabularySize }
 
+    /// See `SuppressedTokensProviding` in MLXLMCommon; ``verifyLogits(fromNormalized:)`` ranks
+    /// a verify row's logits without these ids, as the iterator's suppressor does.
+    public var suppressedTokenIds: Set<Int> = []
+
     /// One entry per layer visit (48 for Mini), not per layer.
     public var kvHeads: [Int] {
         schedule.visits.map { $0.isSliding ? configuration.text.slidingKVHeads : configuration.text.kvHeads }
@@ -2587,11 +2591,18 @@ public final class Inkling2Model: Module, LLMModel {
         precondition(
             Set(ids).count == ids.count && ids.allSatisfy { (0 ... schedule.count).contains($0) },
             "Inkling 2 draft taps must be distinct visit indices in 0...\(schedule.count)")
+        let verify =
+            input.tokens.ndim == 2 && input.tokens.dim(0) == 1
+            && Inkling2VerifyRows.isVerify(input.tokens.dim(1), cache: cache?.first as? CacheList)
         let output = model.forward(
             input.tokens, cache: cache, schedule: schedule,
             capturing: Set(ids.filter { $0 < schedule.count }))
         let normalized = model.norm(output.hidden)
-        let head = Inkling2PhaseProfiler.measure(.head) { self.logits(fromNormalized: normalized) }
+        let head = Inkling2PhaseProfiler.measure(.head) {
+            verify
+                ? self.verifyLogits(fromNormalized: normalized)
+                : self.logits(fromNormalized: normalized)
+        }
         guard emit else { return LMOutput(logits: head) }
 
         var out = state ?? LMOutput.State()
@@ -2602,6 +2613,40 @@ public final class Inkling2Model: Module, LLMModel {
         out[mtpSharedKVOffsetsKey] = [:]
         out[mtpSharedKVSourceIndicesKey] = [:]
         return LMOutput(logits: head, state: out)
+    }
+
+    /// The smallest gap between a verify row's two largest unsuppressed logits that lets the
+    /// row keep the multi-row head product. That product takes the matrix kernel, whose sums can
+    /// differ from the one-row (matrix-vector) product in the last bits; a greedy verify reads
+    /// only each row's argmax, which such differences cannot move while the two largest logits
+    /// are further apart than twice the difference. Float32 rounding over the 2304-term product
+    /// of a normalised state is far below this, and the softcap only shrinks it.
+    static let verifyHeadMargin: Float = 0.05
+
+    /// The head of a speculative verify (``Inkling2VerifyRows``): one multi-row product, with
+    /// every row whose two largest unsuppressed logits are closer than ``verifyHeadMargin``
+    /// recomputed by the one-row product, so each row's greedy token is the one a one-row
+    /// decode step picks. Reads the gaps back from the GPU once per verify.
+    func verifyLogits(fromNormalized normalized: MLXArray) -> MLXArray {
+        let logits = logits(fromNormalized: normalized)
+        var ranked = logits
+        let vocabulary = logits.dim(-1)
+        let suppressed = suppressedTokenIds.filter { (0 ..< vocabulary).contains($0) }
+        if !suppressed.isEmpty {
+            var mask = [Bool](repeating: false, count: vocabulary)
+            for id in suppressed { mask[id] = true }
+            ranked = which(MLXArray(mask), MLXArray(-Float.infinity), ranked)
+        }
+        let best = top(ranked, k: 2, axis: -1)
+        let gaps = abs(best[.ellipsis, 0] - best[.ellipsis, 1]).reshaped(-1).asArray(Float.self)
+        // A NaN gap fails the comparison and is recomputed too.
+        let close = gaps.indices.filter { !(gaps[$0] >= Self.verifyHeadMargin) }
+        guard !close.isEmpty else { return logits }
+        var rows = (0 ..< normalized.dim(1)).map { logits[0..., $0 ..< ($0 + 1)] }
+        for row in close {
+            rows[row] = self.logits(fromNormalized: normalized[0..., row ..< (row + 1)])
+        }
+        return concatenated(rows, axis: 1)
     }
 
     /// The reference `_logits_from_norm`: the normalised state rounded to the embedding dtype,
@@ -3022,7 +3067,13 @@ extension Inkling2Model: MTPChunkedPromptHiddenModel {}
 /// window does, and decoding goes on one token at a time.
 extension Inkling2Model: MTPExactVerifyLimitModel {
     public func exactVerifyPositions(remainingIn cache: [KVCache]) -> Int? {
-        guard Inkling2FastPath.onGPU, Inkling2FastPath.uses(.sinkRing) else { return nil }
+        guard Inkling2FastPath.onGPU else { return nil }
+        // The verify computations that reproduce one-row decode (``Inkling2VerifyRows``,
+        // ``Inkling2ProjectionSpans``, the batched router) exist only with these levers on; with
+        // any of them off a verify is an ordinary multi-row forward, so none is exact.
+        guard Inkling2FastPath.uses(.sinkRing), Inkling2FastPath.uses(.oneProjection),
+            Inkling2FastPath.uses(.router)
+        else { return 0 }
         var remaining: Int?
         for entry in cache {
             guard let list = entry as? CacheList,

@@ -105,6 +105,35 @@ final class Inkling2VerifyKernelTests: XCTestCase {
         }
     }
 
+    /// The verify head: a multi-row float32 product of normalised states against a 2304-wide
+    /// head may differ from each row's one-row product only far inside
+    /// ``Inkling2Model/verifyHeadMargin``, the gap below which a verify row is recomputed one
+    /// row at a time. 131072 outputs puts 8 rows in MLX's large-matmul tiling and 2 rows in the
+    /// small one, as Mini's 201024 do.
+    func testVerifyHeadRowsStayInsideTheRecomputeMargin() throws {
+        try requireGPU()
+        try Device.withDefaultDevice(.gpu) {
+            MLXRandom.seed(23)
+            let (inputs, outputs) = (2304, 131_072)
+            let weight = (MLXRandom.normal([outputs, inputs]) * 0.02).asType(.bfloat16)
+                .asType(.float32).transposed()
+            var worst: Float = 0
+            for rows in [2, 5, 8] {
+                let x = MLXRandom.normal([1, rows, inputs])
+                let h = (x * rsqrt(mean(x * x, axis: -1, keepDims: true) + 1e-6))
+                    .asType(.bfloat16).asType(.float32)
+                let batched = matmul(h, weight)
+                for row in 0 ..< rows {
+                    let alone = matmul(h[0..., row ..< (row + 1)], weight)
+                    let diff = abs(batched[0..., row ..< (row + 1)] - alone).max().item(Float.self)
+                    worst = Swift.max(worst, diff)
+                    print("INKLING2_HEAD_DIAG rows=\(rows) row=\(row) equal=\(diff == 0) maxdiff=\(diff)")
+                }
+            }
+            XCTAssertLessThan(worst, Inkling2Model.verifyHeadMargin / 4)
+        }
+    }
+
     /// Diagnostic, prints only: whether one dispatch over a strided row batch reproduces the
     /// one-row router scores (compiled and plain float32 products), and the largest difference.
     func testRouterScoreBatchDiagnostic() throws {

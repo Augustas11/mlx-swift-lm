@@ -325,6 +325,31 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
     /// On the GPU fast path a verify is exact only until a sliding ring wraps, so the iterator
     /// speculates up to the window and decodes the rest one token at a time: a generation that
     /// runs well past the window still equals ordinary decode, token for token.
+    /// With a verify lever off a verify is an ordinary multi-row forward, so the model allows
+    /// no verify positions and the iterator decodes one token at a time.
+    func testMTPIteratorOnTheGPUAllowsNoVerifyWithALeverOff() throws {
+        guard ProcessInfo.processInfo.environment["INKLING2_GPU_TESTS"] == "1" else {
+            throw XCTSkip("INKLING2_GPU_TESTS is not set")
+        }
+        try Device.withDefaultDevice(.gpu) {
+            let model = try tinyModel([
+                "hidden_size": 256, "vocab_size": 256, "unpadded_vocab_size": 256,
+                "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 128,
+                "swa_num_attention_heads": 2, "swa_num_key_value_heads": 1, "swa_head_dim": 128,
+                "d_rel": 16, "rel_extent": 64, "sliding_window_size": 64,
+                "intermediate_size": 128,
+            ], floatType: .bfloat16, quantizeLinears: true)
+            let cache = model.newCache(parameters: nil)
+            XCTAssertEqual(model.exactVerifyPositions(remainingIn: cache), 64)
+            let saved = Inkling2FastPath.off
+            defer { Inkling2FastPath.off = saved }
+            for lever in [Inkling2FastPath.Lever.sinkRing, .oneProjection, .router] {
+                Inkling2FastPath.off = [lever]
+                XCTAssertEqual(model.exactVerifyPositions(remainingIn: cache), 0, lever.rawValue)
+            }
+        }
+    }
+
     func testMTPIteratorOnTheGPUStaysExactPastTheSlidingWindow() throws {
         guard ProcessInfo.processInfo.environment["INKLING2_GPU_TESTS"] == "1" else {
             throw XCTSkip("INKLING2_GPU_TESTS is not set")

@@ -58,5 +58,5 @@ jobs:
           rc=${PIPESTATUS[0]}
           MLX_SDPA_BLOCKS=64 INKLING2_GPU_TESTS=1 swift test --skip-build --filter "Inkling2VerifyKernelTests/testFoldedVerifyAttention" 2>&1 | tee gpu-test-2pass.log
           rc2=${PIPESTATUS[0]}
-          grep -h "INKLING2_VERIFY_FOLDS\|INKLING2_ROUTER_DIAG" gpu-test.log gpu-test-2pass.log || true
+          grep -h "INKLING2_VERIFY_FOLDS\|INKLING2_ROUTER_DIAG\|INKLING2_HEAD_DIAG" gpu-test.log gpu-test-2pass.log || true
           [ "$rc" = 0 ] && [ "$rc2" = 0 ]
