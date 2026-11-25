@@ -856,7 +856,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     /// returned, for a ring without a pinned prefix or a rewind reserve: those arrays are then
     /// every live entry, in chronological order from this column, wrapping. Zero when they are
     /// already in order; nil for other layouts, which callers read through ``logicalView(tail:)``.
-    package var ringRotation: Int? {
+    public var ringRotation: Int? {
         guard keep == 0, rewindCapacity == 0, let keys else { return nil }
         if !wrapped || idx == keys.dim(2) { return 0 }
         return idx
