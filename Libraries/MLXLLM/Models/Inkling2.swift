@@ -2680,8 +2680,13 @@ public final class Inkling2Model: Module, LLMModel, SuppressedTokensProviding {
             input.tokens, cache: cache, schedule: schedule,
             capturing: Set(ids.filter { $0 < schedule.count }))
         let normalized = model.norm(output.hidden)
+        // A continuous batch of one-token rows (#2505) takes the verify head too: its multi-row
+        // head product can leave a near-tie row's greedy token, as a verify's can.
+        let batchedDecode =
+            input.tokens.ndim == 2 && input.tokens.dim(0) > 1 && input.tokens.dim(1) == 1
+            && Inkling2FastPath.onGPU
         let head = Inkling2PhaseProfiler.measure(.head) {
-            verify
+            verify || batchedDecode
                 ? self.verifyLogits(fromNormalized: normalized)
                 : self.logits(fromNormalized: normalized)
         }
@@ -2705,10 +2710,11 @@ public final class Inkling2Model: Module, LLMModel, SuppressedTokensProviding {
     /// of a normalised state is far below this, and the softcap only shrinks it.
     static let verifyHeadMargin: Float = 0.05
 
-    /// The head of a speculative verify (``Inkling2VerifyRows``): one multi-row product, with
-    /// every row whose two largest unsuppressed logits are closer than ``verifyHeadMargin``
-    /// recomputed by the one-row product, so each row's greedy token is the one a one-row
-    /// decode step picks. Reads the gaps back from the GPU once per verify.
+    /// The head of a speculative verify (``Inkling2VerifyRows``) or of a continuous batch of
+    /// one-token rows: one multi-row product, with every row whose two largest unsuppressed
+    /// logits are closer than ``verifyHeadMargin`` recomputed by the one-row product, so each
+    /// row's greedy token is the one a one-row decode step picks. Reads the gaps back from the
+    /// GPU once per forward. Rows are the `[B, L]` positions in order.
     func verifyLogits(fromNormalized normalized: MLXArray) -> MLXArray {
         let logits = logits(fromNormalized: normalized)
         var ranked = logits
@@ -2724,11 +2730,17 @@ public final class Inkling2Model: Module, LLMModel, SuppressedTokensProviding {
         // A NaN gap fails the comparison and is recomputed too.
         let close = gaps.indices.filter { !(gaps[$0] >= Self.verifyHeadMargin) }
         guard !close.isEmpty else { return logits }
-        var rows = (0 ..< normalized.dim(1)).map { logits[0..., $0 ..< ($0 + 1)] }
-        for row in close {
-            rows[row] = self.logits(fromNormalized: normalized[0..., row ..< (row + 1)])
-        }
-        return concatenated(rows, axis: 1)
+        let (batch, length) = (normalized.dim(0), normalized.dim(1))
+        return concatenated(
+            (0 ..< batch).map { b -> MLXArray in
+                let rows = (0 ..< length).map { l -> MLXArray in
+                    let (bs, ls) = (b ..< (b + 1), l ..< (l + 1))
+                    return close.contains(b * length + l)
+                        ? self.logits(fromNormalized: normalized[bs, ls])
+                        : logits[bs, ls]
+                }
+                return length == 1 ? rows[0] : concatenated(rows, axis: 1)
+            }, axis: 0)
     }
 
     /// The reference `_logits_from_norm`: the normalised state rounded to the embedding dtype,
