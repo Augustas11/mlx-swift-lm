@@ -117,13 +117,21 @@ final class Inkling2VerifyKernelTests: XCTestCase {
                 let x32 = x.asType(.float32)
                 let plainBatch = matmul(inkling2RowBatch(x32), weight.transposed())
                 let contiguous = matmul(x32.reshaped(rows, 1, 2304), weight.transposed())
+                let flat = x32.reshaped(rows, 1, 2304)
+                let viewed = asStrided(
+                    concatenated([flat, flat], axis: 1), [rows, 1, 2304],
+                    strides: [2 * 2304, 2304, 1])
+                let asStridedBatch = matmul(viewed, weight.transposed())
                 for row in 0 ..< rows {
                     let one = matmul(x32[0..., row ..< (row + 1)], weight.transposed())
-                    for (name, batch) in [("strided", plainBatch), ("contiguous", contiguous)] {
+                    for (name, batch) in [
+                        ("strided", plainBatch), ("contiguous", contiguous),
+                        ("asStrided", asStridedBatch),
+                    ] {
                         let b = batch[row ..< (row + 1)].reshaped(one.shape)
                         let same = arrayEqual(b, one).item(Bool.self)
                         let diff = abs(b - one).max().item(Float.self)
-                        print("INKLING2_ROUTER_DIAG \(name) rows=\(rows) row=\(row) equal=\(same) maxdiff=\(diff) strides=\(inkling2RowBatch(x32).strides)")
+                        print("INKLING2_ROUTER_DIAG \(name) rows=\(rows) row=\(row) equal=\(same) maxdiff=\(diff) strides=\(viewed.strides)")
                     }
                 }
             }
