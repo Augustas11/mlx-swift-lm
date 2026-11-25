@@ -20,13 +20,15 @@ final class GLM5NextTests: XCTestCase {
     /// Six layers: three dense KDA, then DSA (own indexer) + MoE, KDA + MoE,
     /// and DSA with a shared indexer + MoE. Dims are multiples of 32 so every
     /// projection can be quantized at group size 32.
-    private func textConfigJSON(indexTopk: Int = 8, nextn: Int = 1, linearHeadDim: Int = 32) -> String {
+    private func textConfigJSON(
+        indexTopk: Int = 8, nextn: Int = 1, linearHeadDim: Int = 32, heads: Int = 2
+    ) -> String {
         """
         {
             "model_type": "glm5_next_text", "vocab_size": 64, "hidden_size": 64,
             "intermediate_size": 96, "moe_intermediate_size": 32,
             "num_hidden_layers": 6, "num_nextn_predict_layers": \(nextn),
-            "num_attention_heads": 2, "num_key_value_heads": 2,
+            "num_attention_heads": \(heads), "num_key_value_heads": \(heads),
             "n_shared_experts": 1, "n_routed_experts": 4, "num_experts_per_tok": 2,
             "routed_scaling_factor": 2.5, "n_group": 1, "topk_group": 1,
             "norm_topk_prob": true, "scoring_func": "sigmoid", "topk_method": "noaux_tc",
@@ -49,9 +51,11 @@ final class GLM5NextTests: XCTestCase {
     }
 
     private func configuration(
-        indexTopk: Int = 8, nextn: Int = 1, nested: Bool = false, linearHeadDim: Int = 32
+        indexTopk: Int = 8, nextn: Int = 1, nested: Bool = false, linearHeadDim: Int = 32,
+        heads: Int = 2
     ) throws -> GLM5NextConfiguration {
-        let text = textConfigJSON(indexTopk: indexTopk, nextn: nextn, linearHeadDim: linearHeadDim)
+        let text = textConfigJSON(
+            indexTopk: indexTopk, nextn: nextn, linearHeadDim: linearHeadDim, heads: heads)
         let json = nested ? #"{"model_type": "glm5_next", "text_config": \#(text)}"# : text
         let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
         try config.validateModelConfiguration()
@@ -1012,6 +1016,100 @@ final class GLM5NextTests: XCTestCase {
         // The two routes reach the attention scores through different GEMM
         // shapes, so TF32 on NAX GPUs separates them by a few 1e-3.
         XCTAssertLessThan(maxAbsDifference(gemm, perHead), MatmulPrecision.splitTolerance)
+    }
+
+    /// The pre-#2524 sparse prefill attention of one block: gather the
+    /// selected latent rows, then SDPA (MLX's fallback for head dim 512).
+    private func gatheredSparseAttention(
+        queries: MLXArray, latent: MLXArray, index: MLXArray, valid: MLXArray, scale: Float
+    ) -> MLXArray {
+        let (q, h, r) = (queries.dim(0), queries.dim(1), queries.dim(2))
+        let k = index.dim(1)
+        let selected = take(latent, index.flattened(), axis: 0).reshaped(q, 1, k, r)
+        return MLXFast.scaledDotProductAttention(
+            queries: queries.reshaped(q, 1, h, r), keys: selected, values: selected,
+            scale: scale, mask: .array(valid.reshaped(q, 1, 1, k))
+        ).reshaped(q, h, r)
+    }
+
+    /// Random selections over `t` latent rows with the indexer's shape of
+    /// invalid slots: `-1` padding, a tail past the context, duplicates, and
+    /// one query with nothing valid.
+    private func sparseSelection(queries: Int, width: Int, rows t: Int, seed: UInt64)
+        -> (index: MLXArray, valid: MLXArray)
+    {
+        let raw = withRandomState(MLXRandom.RandomState(seed: seed)) {
+            MLXRandom.randInt(-200 ..< Int32(t + 40), [queries, width]).asType(.int32)
+        }
+        let index = which(raw .< 0, MLXArray(Int32(-1)), raw)
+        var valid = logicalAnd(index .>= 0, index .< Int32(t))
+        valid[1] = MLXArray.zeros([width], dtype: .bool)
+        return (clip(index, min: 0, max: t - 1), valid)
+    }
+
+    /// #2524: the in-place sparse-MLA kernels equal the gathered SDPA bit for
+    /// bit at the GLM-5.3-Flash shapes (64 heads, rank 512, 2,063 selected
+    /// of 3,673 rows) and at small shapes with every tile edge ragged (head
+    /// dims MLX's fused SDPA kernels do not take, so the reference is the
+    /// fallback the model sees).
+    func testSparseMLAKernelsMatchGatheredSDPABitwise() throws {
+        guard glm5NextSparseMLAKernelsApply(dtype: .bfloat16, heads: 64, latentWidth: 512) else {
+            throw XCTSkip("the in-place sparse-MLA kernels do not run on NAX GPUs")
+        }
+        let cases: [(q: Int, h: Int, r: Int, k: Int, t: Int, dtype: DType)] = [
+            (70, 64, 512, 2063, 3673, .bfloat16),
+            (9, 64, 512, 2063, 3673, .float16),
+            (13, 16, 32, 11, 40, .bfloat16),
+            (5, 72, 160, 77, 130, .bfloat16),
+        ]
+        for (n, c) in cases.enumerated() {
+            let (queries, latent) = withRandomState(MLXRandom.RandomState(seed: UInt64(11 + n))) {
+                (MLXRandom.normal([c.q, c.h, c.r]).asType(c.dtype),
+                 MLXRandom.normal([c.t, c.r]).asType(c.dtype))
+            }
+            let (index, valid) = sparseSelection(queries: c.q, width: c.k, rows: c.t, seed: UInt64(5 + n))
+            let scale = pow(Float(c.r / 2), -0.5)
+            let fused = glm5NextSparseMLAAttention(
+                queries: queries, latent: latent, index: index, valid: valid, scale: scale)
+            let reference = gatheredSparseAttention(
+                queries: queries, latent: latent, index: index, valid: valid, scale: scale)
+            assertBitwiseEqual(fused, reference, "case \(n) \(c)")
+        }
+    }
+
+    /// End to end (#2524): bfloat16 prefill logits through the sparse path
+    /// with the in-place kernels equal the gathered op path's, for forwards
+    /// of 137 and 129 = 2 x 64 + 1 queries (the one-query block stays
+    /// gathered). 16 heads: with fewer MLX's `q @ kᵀ` is not a steel GEMM.
+    func testSparseMLAKernelsKeepPrefillLogitsBitwise() throws {
+        guard glm5NextSparseMLAKernelsApply(dtype: .bfloat16, heads: 16, latentWidth: 32) else {
+            throw XCTSkip("the in-place sparse-MLA kernels do not run on NAX GPUs")
+        }
+        let model = GLM5NextTextModel(try configuration(indexTopk: 8, heads: 16))
+        randomize(model)
+        model.update(parameters: ModuleParameters.unflattened(
+            model.parameters().flattened().map { ($0.0, $0.1.asType(.bfloat16)) }))
+        eval(model)
+        model.train(false)
+        let input = tokens(266)
+        func prefill(_ on: Bool) throws -> MLXArray {
+            for layer in model.model.layers where !layer.isLinear {
+                (layer.selfAttn as! GLM5NextAttention).sparseMLAKernelsPrefill = on
+            }
+            let cache = try model.newCache(parameters: nil)
+            // Two chunks, so the second attends sparsely past a cached prefix.
+            eval(model(input[0..., ..<137], cache: cache))
+            let logits = model(input[0..., 137...], cache: cache)
+            eval(logits)
+            return logits
+        }
+        let before = glm5NextSparseMLAAttentionCalls
+        let fused = try prefill(true)
+        #if DEBUG
+            XCTAssertGreaterThan(glm5NextSparseMLAAttentionCalls, before, "the kernel path did not run")
+        #endif
+        let reference = try prefill(false)
+        assertBitwiseEqual(fused, reference, "prefill logits")
     }
 
     /// End to end: decode logits with the fused KDA step equal the op path's.

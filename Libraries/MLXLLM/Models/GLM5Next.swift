@@ -1053,6 +1053,15 @@ final class GLM5NextAttention: Module {
     /// Prefill sparse attention runs each query's heads as one GEMM.
     var headsAsQueriesPrefill = true
 
+    /// Prefill sparse attention reads each query's selected latent rows in
+    /// place (`glm5NextSparseMLAAttention`, bit-identical to the gathered
+    /// op path) where those kernels apply (#2524).
+    var sparseMLAKernelsPrefill = true
+
+    /// Queries per in-place sparse-attention block: bounds the scores and
+    /// probabilities (`[block, H, K]`) instead of a gathered latent copy.
+    static let sparseKernelChunk = 256
+
     @ModuleInfo(key: "q_a_proj") var qAProj: Linear
     @ModuleInfo(key: "q_a_layernorm") var qALayerNorm: RMSNorm
     @ModuleInfo(key: "q_b_proj") var qBProj: Linear
@@ -1274,7 +1283,32 @@ final class GLM5NextAttention: Module {
         let batchOffsets = (MLXArray(Int32(0) ..< Int32(B)) * Int32(T)).reshaped(B, 1, 1)
 
         var outputs = [MLXArray]()
-        for c0 in stride(from: 0, to: L, by: Self.sparseChunk) {
+        // The gathered blocks below are 64 queries from 0; one whose matmuls
+        // have a single batch (B == 1, one query) runs `p @ v` as MLX's
+        // split-K GEMM, which sums K in another order. That block stays on
+        // the gathered path, so every query keeps its op-path value.
+        var gatheredFrom = 0
+        if sparseMLAKernelsPrefill, headsAsQueriesPrefill, L > 1,
+            glm5NextSparseMLAKernelsApply(dtype: qLatent.dtype, heads: H, latentWidth: R),
+            latent.dtype == qLatent.dtype
+        {
+            gatheredFrom = B == 1 && L % Self.sparseChunk == 1 ? L - 1 : L
+            for c0 in stride(from: 0, to: gatheredFrom, by: Self.sparseKernelChunk) {
+                let c1 = min(c0 + Self.sparseKernelChunk, gatheredFrom)
+                let rows = c1 - c0
+                let indices = topk[0..., c0 ..< c1]
+                let valid = logicalAnd(indices .>= 0, indices .< Int32(T))
+                let safe = clip(indices, min: 0, max: max(T - 1, 0)) + batchOffsets
+                let queries = qLatent[0..., 0..., c0 ..< c1]
+                    .transposed(0, 2, 1, 3)
+                    .reshaped(B * rows, H, R)
+                let out = glm5NextSparseMLAAttention(
+                    queries: queries, latent: flatLatent, index: safe.reshaped(B * rows, K),
+                    valid: valid.reshaped(B * rows, K), scale: scale)
+                outputs.append(out.reshaped(B, rows, H, R).transposed(0, 2, 1, 3))
+            }
+        }
+        for c0 in stride(from: gatheredFrom, to: L, by: Self.sparseChunk) {
             let c1 = min(c0 + Self.sparseChunk, L)
             let rows = c1 - c0
             let indices = topk[0..., c0 ..< c1]
