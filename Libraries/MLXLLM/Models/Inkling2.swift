@@ -1750,15 +1750,18 @@ final class Inkling2Attention: Module {
     /// `[B, kvHeads, L, D]` and relative queries `[B, L, heads, dRel]`; nil where the lever is
     /// off or the kernel does not apply.
     private func fusedInputs(
-        query: MLXArray, relative: MLXArray, keys: MLXArray, values: MLXArray, offset: Int
+        query: MLXArray, relative: MLXArray, keys: MLXArray, values: MLXArray, offsets: [Int]
     ) -> (q: MLXArray, k: MLXArray, v: MLXArray, r: MLXArray)? {
         guard Inkling2FastPath.uses(.attentionInputs) else { return nil }
         let c = configuration
         var tau: MLXArray?
         if !isSliding, let floor = c.logScalingFloor {
             // tau = 1 + alpha log(max(position / floor, 1)) op by op, positions counted from 1
-            // as float32 straight from the host (exact below 2^24, as the cast is).
-            let positions = MLXArray((0 ..< query.dim(1)).map { Float(offset + 1 + $0) })
+            // as float32 straight from the host (exact below 2^24, as the cast is). Rows at
+            // their own offsets (a batched cache) give `[B * L]`, row-major.
+            let length = query.dim(1)
+            let positions = MLXArray(
+                offsets.flatMap { offset in (0 ..< length).map { Float(offset + 1 + $0) } })
             tau = Float(1) + c.logScalingAlpha * log(maximum(positions / Float(floor), Float(1)))
         }
         return ClippedAttentionInputKernels.prepare(
@@ -1766,6 +1769,76 @@ final class Inkling2Attention: Module {
             relativeScale: relativeScale, temperature: tau, heads: heads, kvHeads: kvHeads,
             headDim: headDim, relativeDim: c.relativeDim, queryClip: c.qkClipThreshold,
             relativeClip: c.relativeClipThreshold, valueNormEps: c.useValueNorm ? c.rmsNormEps : nil)
+    }
+
+    /// Single-row decode on the GPU reads the ring as stored and takes the sink as the attention
+    /// kernel's sink logit (``Inkling2FastPath/Lever/sinkRing``).
+    private func usesSinkRing(batch: Int, length: Int) -> Bool {
+        batch == 1 && length == 1 && Inkling2FastPath.uses(.sinkRing) && Inkling2FastPath.onGPU
+    }
+
+    /// Attention over keys already in the cache: the banded relative mask, the sink and SDPA,
+    /// `[B, L, heads * D]`. `keys` hold every key of the query rows, the ring as stored from
+    /// column `ringRotation` (zero when chronological).
+    private func attend(
+        queries: MLXArray, relative: MLXArray, sinkLogits: MLXArray, keys inKeys: MLXArray,
+        values inValues: MLXArray, ringRotation: Int, dtype: DType
+    ) -> MLXArray {
+        let c = configuration
+        let (batch, length) = (queries.dim(0), queries.dim(2))
+        var keys = inKeys
+        var values = inValues
+        // Single-row decode on the GPU: the ring as stored and the sink as the kernel's sink
+        // logit. Ported from Ollama's Inkling 2 relative attention and ordered window cache
+        // (Ollama pull request 19843; MIT licence, Copyright (c) Ollama).
+        let sinkRing = usesSinkRing(batch: batch, length: length)
+        var rotation = 0
+        if ringRotation > 0 {
+            if sinkRing {
+                rotation = ringRotation
+            } else {
+                // The chronological view the plain path reads.
+                keys = concatenated(
+                    [keys[0..., 0..., ringRotation..., 0...], keys[0..., 0..., ..<ringRotation, 0...]],
+                    axis: 2)
+                values = concatenated(
+                    [values[0..., 0..., ringRotation..., 0...], values[0..., 0..., ..<ringRotation, 0...]],
+                    axis: 2)
+            }
+        }
+        let size = keys.dim(2)
+        let sliding = isSliding ? c.slidingWindow : 0
+        let extent = isSliding ? c.slidingWindow : c.relativeExtent
+        var mask: MLXArray
+        if rotation > 0 {
+            mask = RingBandMaskKernels.mask(
+                relative, relativeProj.asType(dtype), keys: keys, rotation: rotation,
+                sliding: sliding, extent: extent)
+        } else {
+            mask =
+                inkling2KernelBandedMask(
+                    relative, relativeProj.asType(dtype), keys: keys, sliding: sliding,
+                    extent: extent)
+                ?? inkling2BandedMask(
+                    relative, relativeProj.asType(dtype), queryOffset: size - length, keys: size,
+                    sliding: sliding, extent: extent)
+        }
+        var sinks: MLXArray? = nil
+        if sinkRing {
+            // One query row: its per-head sink logit is the kernel's per-head sink, unscaled
+            // like a mask logit, with no value.
+            sinks = sinkLogits.reshaped(heads).asType(queries.dtype)
+        } else {
+            mask = concatenated(
+                [mask, sinkLogits.transposed(0, 2, 1).expandedDimensions(axis: -1)], axis: -1)
+            let row = [batch, kvHeads, 1, headDim]
+            keys = concatenated([keys, constants.zeros(row, keys.dtype)], axis: 2)
+            values = concatenated([values, constants.zeros(row, values.dtype)], axis: 2)
+        }
+        let out = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values,
+            scale: inkling2InverseSquareRoot(headDim), mask: .array(mask), sinks: sinks)
+        return out.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
     }
 
     /// The reference `Attention.__call__(x, key_input, value_input, cache)`: queries, relative
@@ -1780,6 +1853,18 @@ final class Inkling2Attention: Module {
         let dtype = x.dtype
         let attentionCache = cache?[0]
         let conv = cache?[1] as? ArraysCache
+        // A batched cache whose rows sit at their own offsets: every row takes its own
+        // positions here and attends alone below, over the keys its one-row cache would hold.
+        let rowCache = attentionCache as? KVCacheRowAttentionProtocol
+        let offsets: [Int] = {
+            if let rowCache {
+                let rows = rowCache.rowOffsets
+                precondition(rows.count == batch, "Inkling 2: one offset per batched row")
+                // Rows at one offset take the one-row positions exactly.
+                return Set(rows).count == 1 ? [rows[0]] : rows
+            }
+            return [attentionCache?.offset ?? 0]
+        }()
         // Row parts of `in_proj` (local) or `q_proj` (global) that read the query input.
         let (q, r, g, s) = isSliding ? (0, 3, 4, 5) : (0, 1, 2, 3)
         let spans = Inkling2ProjectionSpans(rows: batch * length)
@@ -1834,8 +1919,7 @@ final class Inkling2Attention: Module {
         var queries: MLXArray
         var relative: MLXArray
         if let prepared = fusedInputs(
-            query: queryPart, relative: relativePart, keys: keys, values: values,
-            offset: attentionCache?.offset ?? 0)
+            query: queryPart, relative: relativePart, keys: keys, values: values, offsets: offsets)
         {
             // Fused clips, value norm and log scaling, already in attention's layouts.
             queries = prepared.q
@@ -1862,20 +1946,22 @@ final class Inkling2Attention: Module {
                 : inkling2L2Clip(
                     relativeInput, threshold: c.relativeClipThreshold, scale: relativeScale)
             if !isSliding, let floor = c.logScalingFloor {
-                // tau = 1 + alpha log(max(position / floor, 1)), positions counted from 1.
-                let offset = attentionCache?.offset ?? 0
+                // tau = 1 + alpha log(max(position / floor, 1)), positions counted from 1;
+                // `[L, 1, 1]`, or `[B, L, 1, 1]` for rows at their own offsets.
                 let fused =
                     Inkling2FastPath.uses(.fusedTails) && queries.dtype == dtype
                     && relative.dtype == dtype
+                let ordinals = offsets.flatMap { offset in (0 ..< length).map { offset + 1 + $0 } }
                 // Fused: float32 positions straight from the host, exact below 2^24 as the cast is.
                 let positions =
                     fused
-                    ? MLXArray((0 ..< length).map { Float(offset + 1 + $0) })
-                    : MLXArray((0 ..< length).map { Int32(offset + 1 + $0) }).asType(.float32)
+                    ? MLXArray(ordinals.map { Float($0) })
+                    : MLXArray(ordinals.map { Int32($0) }).asType(.float32)
+                let tauShape = offsets.count == 1 ? [length, 1, 1] : [offsets.count, length, 1, 1]
                 let tau =
                     (Float(1)
                     + c.logScalingAlpha * log(maximum(positions / Float(floor), Float(1))))
-                    .reshaped(length, 1, 1)
+                    .reshaped(tauShape)
                 if fused {
                     (queries, relative) = inkling2CompiledLogScaling(queries, relative, tau)
                 } else {
@@ -1887,60 +1973,36 @@ final class Inkling2Attention: Module {
             keys = keys.transposed(0, 2, 1, 3)
             values = values.transposed(0, 2, 1, 3)
         }
-        // Single-row decode on the GPU: the ring as stored and the sink as the kernel's sink
-        // logit. Ported from Ollama's Inkling 2 relative attention and ordered window cache
-        // (Ollama pull request 19843; MIT licence, Copyright (c) Ollama).
-        let sinkRing =
-            batch == 1 && length == 1 && Inkling2FastPath.uses(.sinkRing) && Inkling2FastPath.onGPU
-        var rotation: Int? = nil
-        if let attentionCache {
-            (keys, values) = attentionCache.update(keys: keys, values: values)
-            // Relative logits index backward distance, so a ring is read in chronological
-            // order. A multi-token update already returns it so; a one-token update can return
-            // the ring as stored.
-            if length == 1, let ring = attentionCache as? RotatingKVCache {
-                if sinkRing, let ringRotation = ring.ringRotation {
-                    rotation = ringRotation
-                } else if let window = ring.maxSize, let view = ring.logicalView(tail: window) {
-                    (keys, values) = view
-                }
-            }
-        }
-        let size = keys.dim(2)
-        let sliding = isSliding ? c.slidingWindow : 0
-        let extent = isSliding ? c.slidingWindow : c.relativeExtent
-        var mask: MLXArray
-        if let rotation, rotation > 0 {
-            mask = RingBandMaskKernels.mask(
-                relative, relativeProj.asType(dtype), keys: keys, rotation: rotation,
-                sliding: sliding, extent: extent)
-        } else {
-            mask =
-                inkling2KernelBandedMask(
-                    relative, relativeProj.asType(dtype), keys: keys, sliding: sliding,
-                    extent: extent)
-                ?? inkling2BandedMask(
-                    relative, relativeProj.asType(dtype), queryOffset: size - length, keys: size,
-                    sliding: sliding, extent: extent)
-        }
         // A query-dependent sink: its own logit against a zero key and value.
         let sinkLogits = spans.project(projection, queryRanges[s], x)
-        var sinks: MLXArray? = nil
-        if sinkRing {
-            // One query row: its per-head sink logit is the kernel's per-head sink, unscaled
-            // like a mask logit, with no value.
-            sinks = sinkLogits.reshaped(heads).asType(queries.dtype)
+        var out: MLXArray
+        if let rowCache {
+            out = rowCache.updateAndAttendRows(keys: keys, values: values) { row, view in
+                let r = row ..< row + 1
+                return attend(
+                    queries: queries[r], relative: relative[r], sinkLogits: sinkLogits[r],
+                    keys: view.keys, values: view.values, ringRotation: view.ringRotation,
+                    dtype: dtype)
+            }
         } else {
-            mask = concatenated(
-                [mask, sinkLogits.transposed(0, 2, 1).expandedDimensions(axis: -1)], axis: -1)
-            let row = [batch, kvHeads, 1, headDim]
-            keys = concatenated([keys, constants.zeros(row, keys.dtype)], axis: 2)
-            values = concatenated([values, constants.zeros(row, values.dtype)], axis: 2)
+            var ringRotation = 0
+            if let attentionCache {
+                (keys, values) = attentionCache.update(keys: keys, values: values)
+                // Relative logits index backward distance, so a ring is read in chronological
+                // order. A multi-token update already returns it so; a one-token update can
+                // return the ring as stored.
+                if length == 1, let ring = attentionCache as? RotatingKVCache {
+                    if usesSinkRing(batch: batch, length: length), let rotation = ring.ringRotation {
+                        ringRotation = rotation
+                    } else if let window = ring.maxSize, let view = ring.logicalView(tail: window) {
+                        (keys, values) = view
+                    }
+                }
+            }
+            out = attend(
+                queries: queries, relative: relative, sinkLogits: sinkLogits, keys: keys,
+                values: values, ringRotation: ringRotation, dtype: dtype)
         }
-        var out = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: keys, values: values,
-            scale: inkling2InverseSquareRoot(headDim), mask: .array(mask), sinks: sinks)
-        out = out.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
         let gate = spans.project(projection, queryRanges[g], x)
         if Inkling2FastPath.uses(.fusedTails), out.dtype == dtype {
             out = inkling2CompiledOutputGate(out, gate)
@@ -2244,10 +2306,14 @@ public final class Inkling2TextModel: Module {
     /// The reference `TextModel.__call__(..., skip_final_norm=True)`: the final mix before the
     /// norm, `[B, L, H]` float32.
     ///
-    /// - Parameter cache: one `CacheList` per visit (48 for Mini), or nil.
+    /// - Parameter cache: one `CacheList` per visit (48 for Mini), or nil. A flat layout of
+    /// twice as many entries, each visit's attention cache followed by its convolution-tail
+    /// `ArraysCache`, is the same caches unwrapped (``Inkling2Model/flatCacheLayout(_:)``), as a
+    /// paged batch keeps them.
     func callAsFunction(
         _ inputs: MLXArray, cache: [KVCache]?, schedule: Inkling2LoopSchedule
     ) -> MLXArray {
+        let cache = cache.map { Inkling2Model.visitCaches($0, visits: schedule.count) }
         precondition(
             cache == nil || cache?.count == schedule.count,
             "Inkling 2 requires a separate cache for every layer visit")
@@ -2356,6 +2422,25 @@ public final class Inkling2Model: Module, LLMModel {
                 visit.isSliding ? RotatingKVCache(maxSize: window, keep: 0) : KVCacheSimple()
             return CacheList(attention, ArraysCache(size: 4))
         }
+    }
+
+    /// Each visit's `CacheList` unwrapped into its attention cache and its convolution-tail
+    /// `ArraysCache`, in visit order: the layout a paged batch keeps, where attention pages and
+    /// the tails are per-row recurrent state. The model reads either layout.
+    public static func flatCacheLayout(_ caches: [KVCache]) -> [KVCache] {
+        caches.flatMap { cache -> [KVCache] in
+            guard let list = cache as? CacheList else { return [cache] }
+            var children: [KVCache] = []
+            list.mapChildren { children.append($0); return $0 }
+            return children
+        }
+    }
+
+    /// `caches` as one `CacheList` per visit: unchanged when they already are, else a flat
+    /// layout of `2 * visits` entries paired (attention, tail).
+    static func visitCaches(_ caches: [KVCache], visits: Int) -> [KVCache] {
+        guard caches.count == 2 * visits, !(caches.first is CacheList) else { return caches }
+        return (0 ..< visits).map { CacheList(caches[2 * $0], caches[2 * $0 + 1]) }
     }
 
     /// Fills the cache through the decoder only, so the 201K-wide head runs for the last token

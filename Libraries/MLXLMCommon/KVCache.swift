@@ -262,6 +262,40 @@ public protocol KVCacheAttentionReturningStateProtocol: KVCacheAttentionProtocol
         mask: MLXFast.ScaledDotProductAttentionMaskMode
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray)
 }
+/// One row of a ``KVCacheRowAttentionProtocol`` update: the keys and values the row's own
+/// one-row cache would have returned for it.
+public struct KVCacheRowAttentionView {
+    /// `[1, kvHeads, S, D]`: every key of the row a one-row cache would hand to attention.
+    public let keys: MLXArray
+    public let values: MLXArray
+    /// The column of the oldest key when the row holds a sliding-window ring as stored (the
+    /// one-token update of a keep-0 ring, as ``RotatingKVCache`` returns it): the keys are
+    /// chronological from this column, wrapping. Zero when they are already in order.
+    public let ringRotation: Int
+
+    public init(keys: MLXArray, values: MLXArray, ringRotation: Int) {
+        self.keys = keys
+        self.values = values
+        self.ringRotation = ringRotation
+    }
+}
+
+/// A batched cache whose rows sit at their own key offsets and whose model attends each row
+/// itself, over exactly the keys that row's one-row cache would return, in their order. Used by
+/// models whose attention a padded batch cannot express (Inkling 2: per-row relative band,
+/// query-dependent sink, ring-ordered sliding windows), so every row attends as it would alone.
+public protocol KVCacheRowAttentionProtocol: KVCache {
+    /// Each row's offset before this forward's update, on the host.
+    var rowOffsets: [Int] { get }
+
+    /// Appends `keys`/`values` (`[B, kvHeads, L, D]`, row `r` to row `r`) and returns the
+    /// outputs of `attend(r, view)` for every row, concatenated on axis 0 in row order.
+    func updateAndAttendRows(
+        keys: MLXArray, values: MLXArray,
+        attend: (_ row: Int, _ view: KVCacheRowAttentionView) -> MLXArray
+    ) -> MLXArray
+}
+
 /// A cache entry that holds no attention state, such as a record of the tokens processed so far.
 ///
 /// Cache policy skips these entries: capacity and compression settings, offset alignment
