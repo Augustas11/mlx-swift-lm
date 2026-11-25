@@ -322,6 +322,43 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
         }
     }
 
+    /// On the GPU fast path a verify is exact only until a sliding ring wraps, so the iterator
+    /// speculates up to the window and decodes the rest one token at a time: a generation that
+    /// runs well past the window still equals ordinary decode, token for token.
+    func testMTPIteratorOnTheGPUStaysExactPastTheSlidingWindow() throws {
+        guard ProcessInfo.processInfo.environment["INKLING2_GPU_TESTS"] == "1" else {
+            throw XCTSkip("INKLING2_GPU_TESTS is not set")
+        }
+        try Device.withDefaultDevice(.gpu) {
+            let model = try tinyModel([
+                "hidden_size": 256, "vocab_size": 256, "unpadded_vocab_size": 256,
+                "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 128,
+                "swa_num_attention_heads": 2, "swa_num_key_value_heads": 1, "swa_head_dim": 128,
+                "d_rel": 16, "rel_extent": 64, "sliding_window_size": 64,
+                "intermediate_size": 128,
+            ], floatType: .bfloat16, quantizeLinears: true)
+            let prompt = [3, 9, 27, 17, 51, 25, 11, 33, 35, 1, 2]
+            let input = LMInput(tokens: tokens(prompt))
+            var parameters = GenerateParameters(maxTokens: 120, temperature: 0)
+            parameters.prefill = PrefillParameters(stepSize: 512)
+
+            var plain = try TokenIterator(input: input, model: model, parameters: parameters)
+            var expected = [Int]()
+            while let token = plain.next() { expected.append(token) }
+
+            let drafter = OracleDrafter(expected: expected, promptLength: prompt.count, vocabulary: 256)
+            var iterator = try MTPSpeculativeTokenIterator(
+                input: input, mainModel: model, drafter: drafter, parameters: parameters,
+                blockSize: 8)
+            var produced = [Int]()
+            while let token = iterator.next() { produced.append(token) }
+
+            XCTAssertEqual(produced, expected, "speculative stream differs from ordinary decode")
+            XCTAssertGreaterThan(iterator.acceptedCount, 0)
+            XCTAssertEqual(iterator.passthroughReason, "past the target's exact verify window")
+        }
+    }
+
     /// The speculative verify on the GPU fast path: every row of a multi-row forward must give
     /// the logits a one-row decode of that token gives, bit for bit (per-row router, span
     /// projections, per-row attention with the sink as the kernel's sink logit). Widths meet the

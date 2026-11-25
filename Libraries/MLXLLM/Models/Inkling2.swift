@@ -3015,3 +3015,22 @@ public enum Inkling2WeightLayout {
 
 /// The emit prefill collects draft taps chunk by chunk under the caller's prefill parameters.
 extension Inkling2Model: MTPChunkedPromptHiddenModel {}
+
+/// Verify rows reproduce one-row decode only while no sliding layer's ring has wrapped: past the
+/// window a one-row step reads the ring as stored (``Inkling2FastPath/Lever/sinkRing``) and a
+/// verify reads it in time order, which reduce in different orders. So a verify ends where the
+/// window does, and decoding goes on one token at a time.
+extension Inkling2Model: MTPExactVerifyLimitModel {
+    public func exactVerifyPositions(remainingIn cache: [KVCache]) -> Int? {
+        guard Inkling2FastPath.onGPU, Inkling2FastPath.uses(.sinkRing) else { return nil }
+        var remaining: Int?
+        for entry in cache {
+            guard let list = entry as? CacheList,
+                let ring = list[0] as? RotatingKVCache, let window = ring.maxSize
+            else { continue }
+            let left = Swift.max(0, window - ring.offset)
+            remaining = Swift.min(remaining ?? left, left)
+        }
+        return remaining
+    }
+}

@@ -151,6 +151,17 @@ public protocol MTPTargetInputEmbeddingProvider {
 /// keeps the caller's ``PrefillParameters`` and the cache sees what ordinary decode gives it.
 public protocol MTPChunkedPromptHiddenModel {}
 
+/// A target whose speculative verify reproduces its one-row decode only up to some cache
+/// position. Past it a verify row would no longer get the bits a one-row step gives, so the
+/// iterator verifies at most ``exactVerifyPositions(remainingIn:)`` more positions and then
+/// decodes the rest one token at a time (sticky passthrough), which keeps greedy output
+/// identical to ordinary decode.
+public protocol MTPExactVerifyLimitModel {
+    /// How many more positions a verify can write into `cache` with every row exact, or nil for
+    /// no limit.
+    func exactVerifyPositions(remainingIn cache: [KVCache]) -> Int?
+}
+
 /// Target-side capability for rewinding an in-place speculative verify pass.
 ///
 /// Rollback belongs to the target/cache implementation, not to the drafter.

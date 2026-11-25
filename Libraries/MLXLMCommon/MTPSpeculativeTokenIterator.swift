@@ -556,6 +556,17 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // Keep the whole pending buffer within the remaining output budget.
         let roundStart = Date.timeIntervalSinceReferenceDate
         let depthLimit = Swift.min(adaptiveDepth?.depth() ?? (blockSize - 1), blockSize - 1)
+        var depthLimit = depthLimit
+        if let remaining = (mainModel as? any MTPExactVerifyLimitModel)?
+            .exactVerifyPositions(remainingIn: mainCache)
+        {
+            // The bonus row plus the drafts must all stay where verify is exact.
+            guard remaining >= 2 else {
+                switchToPassthrough(reason: "past the target's exact verify window")
+                return
+            }
+            depthLimit = Swift.min(depthLimit, remaining - 1)
+        }
         let numDraft: Int
         if let maxTokens {
             let remaining = maxTokens - tokenCount
