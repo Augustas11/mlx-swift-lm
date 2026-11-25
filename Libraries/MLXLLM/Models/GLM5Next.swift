@@ -1629,11 +1629,19 @@ public final class GLM5NextModelInner: Module {
 /// summing to the input length. A `glm5_next` model then runs the slices' row-
 /// local feed-forward work as one wide call and everything whose arithmetic
 /// depends on the row count per slice (`GLM5NextModelInner.prefillHidden`):
-/// caches and logits are bit-identical to the separate forwards, and the
-/// logits cover only the last slice's tokens, as its own forward's. Ignored
-/// with `mtpEmitFlagKey` or when the lengths do not sum to the input length
-/// (the logits then cover every token, which a caller can check).
+/// caches are bit-identical to the separate forwards, and the logits cover
+/// only the last `glm5NextPrefillLogitRows` tokens of the last slice (all of
+/// it when shorter), bit-identical to those rows of its own forward. A prompt
+/// forward samples its last row only, so the vocabulary projection of the
+/// other rows is skipped (#2474). Ignored with `mtpEmitFlagKey` or when the
+/// lengths do not sum to the input length (the logits then cover every token,
+/// which a caller can check).
 public let glm5NextPrefillSlicesKey = LMOutput.Key<[Int]>("glm5next.prefillSlices")
+
+/// Rows of the last slice a sliced prefill projects to logits. Enough rows to
+/// keep the vocabulary projection on MLX's `qmm` (above `get_qmv_batch_limit`),
+/// whose per-row sums do not depend on the row count, unlike `qmv`.
+public let glm5NextPrefillLogitRows = 64
 
 /// Text model for `glm5_next_text` checkpoints (`model.*`, `lm_head.*`, `mtp.*`).
 public final class GLM5NextTextModel: Module, LLMModel {
@@ -1690,9 +1698,10 @@ public final class GLM5NextTextModel: Module, LLMModel {
             if let slices = state?[glm5NextPrefillSlicesKey], slices.count > 1,
                 input.tokens.ndim == 2, slices.allSatisfy({ $0 > 0 }), slices.reduce(0, +) == input.tokens.dim(-1)
             {
+                let hidden = model.prefillHidden(input.tokens, cache: cache, slices: slices)
+                let keep = min(glm5NextPrefillLogitRows, slices[slices.count - 1])
                 return LMOutput(
-                    logits: logits(
-                        model.norm(model.prefillHidden(input.tokens, cache: cache, slices: slices))))
+                    logits: logits(model.norm(hidden[0..., (hidden.dim(1) - keep)..., 0...])))
             }
             return LMOutput(logits: self(input.tokens, cache: cache))
         }

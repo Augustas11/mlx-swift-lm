@@ -1095,8 +1095,11 @@ final class GLM5NextTests: XCTestCase {
             eval(wide.flatMap(\.state))
 
             let label = "slices \(slices)"
-            XCTAssertEqual(wideLogits.dim(1), slices[slices.count - 1], label)
-            assertBitwiseEqual(wideLogits, separateLogits, "\(label): last slice logits")
+            let last = slices[slices.count - 1]
+            let keep = min(glm5NextPrefillLogitRows, last)
+            XCTAssertEqual(wideLogits.dim(1), keep, label)
+            assertBitwiseEqual(
+                wideLogits, separateLogits[0..., (last - keep)..., 0...], "\(label): last slice logits")
             for (layer, (a, b)) in zip(wide, separate).enumerated() {
                 XCTAssertEqual(a.offset, b.offset, "\(label): layer \(layer) offset")
                 XCTAssertEqual(a.state.count, b.state.count, "\(label): layer \(layer) state count")
@@ -1574,6 +1577,29 @@ final class GLM5NextTests: XCTestCase {
                     glm5NextProject(linear, x[0 ..< V]).reshaped(V, n),
                     alone[0 ..< V].map { $0.reshaped(1, n) },
                     "project \(bits)b n=\(n) V=\(V)")
+            }
+        }
+    }
+
+    /// A sliced prefill projects only the last `glm5NextPrefillLogitRows` rows
+    /// to logits (#2474). Those rows equal the same rows of the full-width
+    /// projection bit for bit at the row counts the batching route's last
+    /// slice takes (below and above the 1024-row dense `qmm` tile switch), for
+    /// 8-bit and 4-bit group-64 vocabulary projections.
+    func testPrefillLogitRowsMatchFullWidthProjectionBitwise() throws {
+        let keep = glm5NextPrefillLogitRows
+        for (bits, n, k) in [(8, 8192, 4096), (4, 8192, 4096)] {
+            let p = randomAffine([n, k], bits: bits, groupSize: 64, seed: UInt64(2474 + bits))
+            let linear = QuantizedLinear(
+                weight: p.weight, bias: nil, scales: p.scales, biases: p.biases,
+                groupSize: 64, bits: bits)
+            for m in [keep + 1, 699, 1023, 1024, 1836, 2018, 2048] {
+                let x = withRandomState(MLXRandom.RandomState(seed: UInt64(m))) {
+                    MLXRandom.normal([1, m, k]).asType(.bfloat16)
+                }
+                let full = glm5NextProject(linear, x)[0..., (m - keep)..., 0...]
+                let tail = glm5NextProject(linear, x[0..., (m - keep)..., 0...])
+                assertBitwiseEqual(tail, full, "\(bits)b m=\(m)")
             }
         }
     }
