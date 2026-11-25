@@ -921,27 +921,32 @@ final class MiniMaxM3SparseMoeBlock: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray, residual: MLXArray?, routerInput: MLXArray? = nil)
         -> MLXArray
     {
-        let routed = routeTokens(routerInput ?? x)
-        let routedOutputs = experts(x, routed[0])
-        let shared = sharedExperts.map { $0(x) }
-        if let y = miniMaxM3Combine(
-            outputs: routedOutputs, weights: routed[1], factor: routedScalingFactor,
-            shared: shared, residual: residual)
-        {
-            return y
+        // `LabSectionTimer` sections are pass-throughs unless lab timing is on.
+        let routed = LabSectionTimer.run("moe.router", outputs: { $0 }) {
+            routeTokens(routerInput ?? x)
         }
-        var inputs = [routedOutputs, routed[1]]
-        if let shared {
-            inputs.append(shared)
-        }
-        if let residual {
-            // The combine reads the residual as its fourth input.
-            if sharedExperts == nil {
-                return residual + combine(inputs)[0]
+        let routedOutputs = LabSectionTimer.run("moe.experts") { experts(x, routed[0]) }
+        let shared = sharedExperts.map { mlp in LabSectionTimer.run("moe.shared") { mlp(x) } }
+        return LabSectionTimer.run("moe.combine") { () -> MLXArray in
+            if let y = miniMaxM3Combine(
+                outputs: routedOutputs, weights: routed[1], factor: routedScalingFactor,
+                shared: shared, residual: residual)
+            {
+                return y
             }
-            inputs.append(residual)
+            var inputs = [routedOutputs, routed[1]]
+            if let shared {
+                inputs.append(shared)
+            }
+            if let residual {
+                // The combine reads the residual as its fourth input.
+                if sharedExperts == nil {
+                    return residual + combine(inputs)[0]
+                }
+                inputs.append(residual)
+            }
+            return combine(inputs)[0]
         }
-        return combine(inputs)[0]
     }
 }
 
@@ -1283,12 +1288,21 @@ final class MiniMaxM3Attention: Module {
             return batchedAttention(x, batch: batch)
         }
         let selecting = (cache?.offset ?? 0) + x.dim(1) > blockSize * topkBlocks
-        let indexKeys = sparse ? indexKProj.map { $0(x) } : nil
-        let indexQueries = sparse && selecting ? indexQProj.map { $0(x) } : nil
-        return oProj(
-            attend(
-                q: qProj(x), k: kProj(x), v: vProj(x), indexK: indexKeys, indexQ: indexQueries,
-                mask: mask, cache: cache))
+        // `LabSectionTimer` sections are pass-throughs unless lab timing is on.
+        let (q, k, v) = LabSectionTimer.run("attn.qkv_proj", outputs: { [$0.0, $0.1, $0.2] }) {
+            (qProj(x), kProj(x), vProj(x))
+        }
+        let (indexKeys, indexQueries) = LabSectionTimer.run(
+            "attn.index_proj", outputs: { [$0.0, $0.1].compactMap { $0 } }
+        ) { () -> (MLXArray?, MLXArray?) in
+            (
+                sparse ? indexKProj.map { $0(x) } : nil,
+                sparse && selecting ? indexQProj.map { $0(x) } : nil
+            )
+        }
+        let attended = attend(
+            q: q, k: k, v: v, indexK: indexKeys, indexQ: indexQueries, mask: mask, cache: cache)
+        return LabSectionTimer.run("attn.out_proj") { oProj(attended) }
     }
 
     private func batchedAttention(_ x: MLXArray, batch: any MiniMaxM3BatchedSparseCache)
@@ -1303,11 +1317,17 @@ final class MiniMaxM3Attention: Module {
         let valid = (0 ..< B).map { lengths?[$0] ?? L }
         let selecting = zip(rows, valid).map { $0.offset + $1 > blockSize * topkBlocks }
 
-        let q = qProj(x)
-        let k = kProj(x)
-        let v = vProj(x)
-        let indexKeys = sparse ? indexKProj.map { $0(x) } : nil
-        let indexQueries = sparse && selecting.contains(true) ? indexQProj.map { $0(x) } : nil
+        let (q, k, v) = LabSectionTimer.run("attn.qkv_proj", outputs: { [$0.0, $0.1, $0.2] }) {
+            (qProj(x), kProj(x), vProj(x))
+        }
+        let (indexKeys, indexQueries) = LabSectionTimer.run(
+            "attn.index_proj", outputs: { [$0.0, $0.1].compactMap { $0 } }
+        ) { () -> (MLXArray?, MLXArray?) in
+            (
+                sparse ? indexKProj.map { $0(x) } : nil,
+                sparse && selecting.contains(true) ? indexQProj.map { $0(x) } : nil
+            )
+        }
 
         var outputs = [MLXArray]()
         for (index, rowCache) in rows.enumerated() {
@@ -1330,7 +1350,9 @@ final class MiniMaxM3Attention: Module {
                 outputs.append(out)
             }
         }
-        return oProj(outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0))
+        return LabSectionTimer.run("attn.out_proj") {
+            oProj(outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0))
+        }
     }
 
     /// `[B, L, heads * headDim]` attention before `o_proj` of the projected
@@ -1342,12 +1364,94 @@ final class MiniMaxM3Attention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let (B, L) = (qProjected.dim(0), qProjected.dim(1))
-        var q = qProjected.reshaped(B, L, heads, headDim)
-        var k = kProjected.reshaped(B, L, kvHeads, headDim)
         let v = vProjected.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
         let offset = cache?.ropeOffset
         let qStart = cache?.offset ?? 0
 
+        let roped = LabSectionTimer.run("attn.norm_rope", outputs: { $0 }) {
+            normsAndRope(
+                q: qProjected.reshaped(B, L, heads, headDim),
+                k: kProjected.reshaped(B, L, kvHeads, headDim), indexK: indexK, indexQ: indexQ,
+                offset: offset)
+        }
+        let q = roped[0]
+        let k = roped[1]
+
+        // A dense layer on a cache that attends from its own storage
+        // (a continuous-batching row batch) attends there.
+        if roped.count == 2, let attentionCache = cache as? KVCacheAttentionProtocol {
+            return LabSectionTimer.run("attn.kernel") {
+                attentionCache.updateAndAttend(
+                    queries: q, keys: k, values: v, scale: scale, mask: mask
+                ).transposed(0, 2, 1, 3).reshaped(B, L, -1)
+            }
+        }
+
+        var keys = k
+        var values = v
+        if let cache {
+            (keys, values) = LabSectionTimer.run("attn.cache_write", outputs: { [$0.0, $0.1] }) {
+                cache.update(keys: k, values: v)
+            }
+        }
+
+        var attentionMask = mask
+        if roped.count > 2 {
+            var ik = roped[2]
+            if let cache {
+                guard let sparseCache = cache as? any MiniMaxM3SparseCache else {
+                    fatalError(
+                        "MiniMax M3 sparse layers need a MiniMaxM3SparseCache, got \(type(of: cache))")
+                }
+                ik = LabSectionTimer.run("attn.cache_write") { sparseCache.updateIndex(ik) }
+            }
+            let total = ik.dim(2)
+            if roped.count > 3 {
+                let iq = roped[3]
+                let selectedLength = blockSize * topkBlocks
+                let useKernel =
+                    L > 1
+                    ? B == 1 && total >= selectedLength * Self.prefillKernelRatio
+                    : total >= selectedLength * Self.decodeKernelRatio
+                let blocks = LabSectionTimer.run("attn.select") {
+                    selectBlocks(queries: iq, keys: ik, qStart: qStart, sorted: useKernel)
+                }
+                if useKernel {
+                    let output = LabSectionTimer.run(
+                        "attn.kernel", outputs: { $0.map { [$0] } ?? [] }
+                    ) { () -> MLXArray? in
+                        let positions = broadcast(
+                            arange(qStart, qStart + L, dtype: .int32).reshaped(1, L), to: [B, L])
+                        return miniMaxM3SparseAttention(
+                            queries: q, keys: keys, values: values, blockIndices: blocks,
+                            queryPositions: positions, scale: scale, blockSize: blockSize
+                        )?.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+                    }
+                    if let output {
+                        return output
+                    }
+                }
+                attentionMask = .array(
+                    LabSectionTimer.run("attn.select") {
+                        blockMask(blocks, total: total, qStart: qStart)
+                    })
+            }
+        }
+
+        let finalMask = attentionMask
+        return LabSectionTimer.run("attn.kernel") {
+            MLXFast.scaledDotProductAttention(
+                queries: q, keys: keys, values: values, scale: scale, mask: finalMask
+            ).transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        }
+    }
+
+    /// The query and key heads (and the indexer's, when given) after their
+    /// head norms and RoPE, each `[B, heads, L, D]`: `[q, k, indexK?, indexQ?]`.
+    private func normsAndRope(
+        q: MLXArray, k: MLXArray, indexK: MLXArray?, indexQ: MLXArray?, offset: RoPEOffset?
+    ) -> [MLXArray] {
+        let (B, L) = (q.dim(0), q.dim(1))
         // Every roped tensor with the norm that precedes its RoPE.
         var raw: [(MLXArray, MiniMaxM3RMSNorm?)] = [(q, qNorm), (k, kNorm)]
         if let indexK, let indexKNorm {
@@ -1386,59 +1490,7 @@ final class MiniMaxM3Attention: Module {
                 applyRotaryPosition(rope, to: $0.transposed(0, 2, 1, 3), offset: offset)
             }
         }
-        q = roped[0]
-        k = roped[1]
-
-        // A dense layer on a cache that attends from its own storage
-        // (a continuous-batching row batch) attends there.
-        if roped.count == 2, let attentionCache = cache as? KVCacheAttentionProtocol {
-            let output = attentionCache.updateAndAttend(
-                queries: q, keys: k, values: v, scale: scale, mask: mask)
-            return output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
-        }
-
-        var keys = k
-        var values = v
-        if let cache {
-            (keys, values) = cache.update(keys: k, values: v)
-        }
-
-        var attentionMask = mask
-        if roped.count > 2 {
-            var ik = roped[2]
-            if let cache {
-                guard let sparseCache = cache as? any MiniMaxM3SparseCache else {
-                    fatalError(
-                        "MiniMax M3 sparse layers need a MiniMaxM3SparseCache, got \(type(of: cache))")
-                }
-                ik = sparseCache.updateIndex(ik)
-            }
-            let total = ik.dim(2)
-            if roped.count > 3 {
-                let iq = roped[3]
-                let selectedLength = blockSize * topkBlocks
-                let useKernel =
-                    L > 1
-                    ? B == 1 && total >= selectedLength * Self.prefillKernelRatio
-                    : total >= selectedLength * Self.decodeKernelRatio
-                let blocks = selectBlocks(queries: iq, keys: ik, qStart: qStart, sorted: useKernel)
-                if useKernel {
-                    let positions = broadcast(
-                        arange(qStart, qStart + L, dtype: .int32).reshaped(1, L), to: [B, L])
-                    if let output = miniMaxM3SparseAttention(
-                        queries: q, keys: keys, values: values, blockIndices: blocks,
-                        queryPositions: positions, scale: scale, blockSize: blockSize)
-                    {
-                        return output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
-                    }
-                }
-                attentionMask = .array(blockMask(blocks, total: total, qStart: qStart))
-            }
-        }
-
-        let output = MLXFast.scaledDotProductAttention(
-            queries: q, keys: keys, values: values, scale: scale, mask: attentionMask)
-        return output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        return roped
     }
 }
 
@@ -1493,18 +1545,27 @@ final class MiniMaxM3DecoderLayer: Module {
         if let alpha = ablationAlpha, let direction = refusalDirection {
             return ablated(x, mask: mask, cache: cache, alpha: alpha, direction: direction)
         }
-        let h = x + selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
+        // `LabSectionTimer` sections are pass-throughs unless lab timing is on.
+        let attention = selfAttn(
+            LabSectionTimer.run("norm.input") { inputLayerNorm(x) }, mask: mask, cache: cache)
+        let h = LabSectionTimer.run("residual") { x + attention }
         if let blockSparseMoe {
             // A float32 router takes the norm's float32 copy from the same
             // launch rather than casting the norm output on its own.
             if blockSparseMoe.routerReadsFloat32,
-                let normed = postAttentionLayerNorm.withFloat32Copy(h)
+                let normed = LabSectionTimer.run("norm.post_attn", outputs: { $0 ?? [] }, {
+                    postAttentionLayerNorm.withFloat32Copy(h)
+                })
             {
                 return blockSparseMoe(normed[0], residual: h, routerInput: normed[1])
             }
-            return blockSparseMoe(postAttentionLayerNorm(h), residual: h)
+            return blockSparseMoe(
+                LabSectionTimer.run("norm.post_attn") { postAttentionLayerNorm(h) }, residual: h)
         }
-        return h + mlp!(postAttentionLayerNorm(h))
+        let m = LabSectionTimer.run("mlp") {
+            mlp!(LabSectionTimer.run("norm.post_attn") { postAttentionLayerNorm(h) })
+        }
+        return LabSectionTimer.run("residual") { h + m }
     }
 
     /// `y - alpha * r * (r . y)` over the hidden dim, in float32, rounded
@@ -1522,21 +1583,32 @@ final class MiniMaxM3DecoderLayer: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
         alpha: Float, direction: MLXArray
     ) -> MLXArray {
-        let attention = selfAttn(inputLayerNorm(x), mask: mask, cache: cache)
-        let h = x + Self.project(attention, direction: direction, alpha: alpha)
+        let attention = selfAttn(
+            LabSectionTimer.run("norm.input") { inputLayerNorm(x) }, mask: mask, cache: cache)
+        let h = LabSectionTimer.run("ablation") {
+            x + Self.project(attention, direction: direction, alpha: alpha)
+        }
         let m: MLXArray
         if let blockSparseMoe {
             if blockSparseMoe.routerReadsFloat32,
-                let normed = postAttentionLayerNorm.withFloat32Copy(h)
+                let normed = LabSectionTimer.run("norm.post_attn", outputs: { $0 ?? [] }, {
+                    postAttentionLayerNorm.withFloat32Copy(h)
+                })
             {
                 m = blockSparseMoe(normed[0], residual: nil, routerInput: normed[1])
             } else {
-                m = blockSparseMoe(postAttentionLayerNorm(h), residual: nil)
+                m = blockSparseMoe(
+                    LabSectionTimer.run("norm.post_attn") { postAttentionLayerNorm(h) },
+                    residual: nil)
             }
         } else {
-            m = mlp!(postAttentionLayerNorm(h))
+            m = LabSectionTimer.run("mlp") {
+                mlp!(LabSectionTimer.run("norm.post_attn") { postAttentionLayerNorm(h) })
+            }
         }
-        return h + Self.project(m, direction: direction, alpha: alpha)
+        return LabSectionTimer.run("ablation") {
+            h + Self.project(m, direction: direction, alpha: alpha)
+        }
     }
 }
 
@@ -1557,12 +1629,14 @@ public final class MiniMaxM3ModelInner: Module {
     var norms: [MiniMaxM3RMSNorm] { layers.flatMap(\.norms) + [norm] }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var h = embedTokens(inputs)
+        // `LabSectionTimer` sections are pass-throughs unless lab timing is on.
+        var h = LabSectionTimer.run("embed") { embedTokens(inputs) }
         let mask = createAttentionMask(h: h, cache: cache?.first)
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])
         }
-        return norm(h)
+        let last = h
+        return LabSectionTimer.run("norm.final") { norm(last) }
     }
 }
 
@@ -1585,12 +1659,19 @@ public final class MiniMaxM3TextModel: Module, LLMModel, AdditionalWeightFilesPr
         super.init()
     }
 
+    /// With lab section timing on, `lm_head` sits outside the forward
+    /// bracket and evaluates on every forward, a prompt chunk's included
+    /// (whose logits the serve never reads): count it from the last forward.
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let out = model(inputs, cache: cache)
-        if let lmHead {
-            return lmHead(out)
+        let out = LabSectionTimer.forward(
+            tag: "rows=\(inputs.dim(0)),L=\(inputs.dim(1))", outputs: { [$0] }
+        ) { model(inputs, cache: cache) }
+        return LabSectionTimer.run("lm_head") {
+            if let lmHead {
+                return lmHead(out)
+            }
+            return model.embedTokens.asLinear(out)
         }
-        return model.embedTokens.asLinear(out)
     }
 
     /// Cache every Gemma norm's `1 + weight` and fuse each layer's gate and
