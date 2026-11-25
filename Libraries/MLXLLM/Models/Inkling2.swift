@@ -744,8 +744,10 @@ private func inkling2Project(_ linear: Linear, _ rows: Range<Int>, _ x: MLXArray
 /// product. Each output row of MLX's quantized matrix-vector product depends only on its own
 /// weight rows (the kernel is chosen by the input size and the row count, which do not change),
 /// so a part sliced from the span equals the part's own product. Only for quantized projections
-/// and a single input row, where a column slice stays row-contiguous; otherwise every part is
-/// projected on its own as before.
+/// at one-token decode; otherwise every part is projected on its own as before. A continuous
+/// batch of one-token rows takes the span too (#2505): on the row-invariant small-M route each
+/// row of a quantized product holds the bits it holds alone, so a batched row gets exactly the
+/// lone row's projection, where per-part products would tile their reductions differently.
 ///
 /// Ported from the single projection per input in Ollama's Inkling 2 attention (Ollama pull
 /// request 19843, `model/models/inkling2` `project`; MIT licence, Copyright (c) Ollama).
@@ -753,7 +755,7 @@ private final class Inkling2ProjectionSpans {
     private var spans: [(linear: Linear, input: MLXArray, rows: Range<Int>, out: MLXArray)] = []
     private let enabled: Bool
 
-    init(rows: Int) { enabled = rows == 1 && Inkling2FastPath.uses(.oneProjection) }
+    init(length: Int) { enabled = length == 1 && Inkling2FastPath.uses(.oneProjection) }
 
     /// Computes rows `rows` of `linear` on `x` once, for the parts inside them.
     func add(_ linear: Linear, _ rows: Range<Int>, _ x: MLXArray) {
@@ -921,8 +923,8 @@ public enum Inkling2FastPath {
         /// attention residual or the layer output's residual in the kernel, the global layers'
         /// dynamic ones compute their taps and lag products in the kernel.
         case convAdd = "convadd"
-        /// One quantized product per (fused projection, input) at single-row decode, sliced into
-        /// the parts, instead of one product per part.
+        /// One quantized product per (fused projection, input) at one-token decode (one row or a
+        /// continuous batch of rows), sliced into the parts, instead of one product per part.
         case oneProjection = "oneproj"
         /// The router's top-k, gather of the chosen scores, at single-row decode in the fork's
         /// shared one-dispatch top-k kernel instead of the sort and gather.
@@ -1616,6 +1618,16 @@ final class Inkling2SparseMoE: Module {
     /// `_route`: sigmoid scores in float32, top-k of the bias-corrected scores, weights
     /// normalised over the chosen experts and multiplied by `route_scale`.
     func route(_ x: MLXArray) -> (indices: MLXArray, weights: MLXArray) {
+        if x.ndim == 3, x.dim(0) > 1, x.dim(1) == 1 {
+            // A continuous batch of one-token rows (#2505): each row routes as it does alone. The
+            // float32 score product of several rows runs a matrix-matrix kernel whose reduction
+            // order differs from one row's matrix-vector kernel, and a low-bit score change can
+            // swap a chosen expert, so batched rows would leave their serial tokens.
+            let rows = (0 ..< x.dim(0)).map { route(x[$0 ..< ($0 + 1)]) }
+            return (
+                concatenated(rows.map(\.indices), axis: 0), concatenated(rows.map(\.weights), axis: 0)
+            )
+        }
         if Inkling2FastPath.uses(.router), Inkling2FastPath.onGPU, x.size == x.dim(-1) {
             // Single-row decode: the top-k and the gather in one dispatch. The shared kernel's
             // descending order is `argPartition(-selection, kth: K - 1)[..<K]`'s (stable, ties
@@ -1867,7 +1879,7 @@ final class Inkling2Attention: Module {
         }()
         // Row parts of `in_proj` (local) or `q_proj` (global) that read the query input.
         let (q, r, g, s) = isSliding ? (0, 3, 4, 5) : (0, 1, 2, 3)
-        let spans = Inkling2ProjectionSpans(rows: batch * length)
+        let spans = Inkling2ProjectionSpans(length: length)
         if let inProj {
             if keyInput === x && valueInput === x {
                 spans.add(inProj, 0 ..< inProj.weight.dim(0), x)
