@@ -48,7 +48,7 @@ private let clippedAttentionInputSource = """
         threadgroup float partial[Groups];
         const float qclip = as_type<float>(QClipBits);
         const float rclip = as_type<float>(RClipBits);
-        const float tau = HasTau ? float(temperature[l]) : 1.0f;
+        const float tau = HasTau ? float(temperature[TauPerRow ? rt : l]) : 1.0f;
 
         // Queries.
         const float qv = float(q[size_t(rt) * (Heads * HeadDim) + h * HeadDim + i])
@@ -98,7 +98,8 @@ package enum ClippedAttentionInputKernels {
 
     /// The prepared inputs, or nil when the kernel does not apply: projections `[B, L, heads * D]`
     /// (`q`), `[B, L, heads * dRel]` (`r`) and `[B, L, kvHeads * D]` (`k`, `v`), all of one
-    /// floating dtype; scales `[heads, D]` and `[heads, dRel]`; `temperature` float32 `[L]`;
+    /// floating dtype; scales `[heads, D]` and `[heads, dRel]`; `temperature` float32 `[L]`, or
+    /// `[B, L]` when the rows sit at their own positions (a batched cache);
     /// `D` a multiple of 32 up to 1024, `dRel <= D`, `kvHeads <= heads`, on the GPU.
     ///
     /// - Returns: `q [B, heads, L, D]`, `k` and `v [B, kvHeads, L, D]`, `r [B, L, heads, dRel]`.
@@ -119,13 +120,16 @@ package enum ClippedAttentionInputKernels {
             queryScale.size == heads * headDim, relativeScale.size == heads * relativeDim
         else { return nil }
         if let temperature {
-            guard temperature.dtype == .float32, temperature.size == length else { return nil }
+            guard temperature.dtype == .float32,
+                temperature.size == length || temperature.size == batch * length
+            else { return nil }
         }
         let out = kernel(
             [q, r, k, v, queryScale, relativeScale, temperature ?? queryScale],
             template: [
                 ("T", dtype), ("Heads", heads), ("KVHeads", kvHeads), ("HeadDim", headDim),
                 ("RelDim", relativeDim), ("HasTau", temperature != nil),
+                ("TauPerRow", temperature.map { $0.size != length } ?? false),
                 ("ValueNorm", valueNormEps != nil), ("QClipBits", bits(queryClip)),
                 ("RClipBits", bits(relativeClip)), ("EpsBits", bits(valueNormEps ?? 0)),
             ],
