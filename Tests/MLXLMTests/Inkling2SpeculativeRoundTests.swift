@@ -339,7 +339,7 @@ final class Inkling2SpeculativeRoundTests: XCTestCase {
                 "d_rel": 16, "rel_extent": 64, "sliding_window_size": 64,
                 "intermediate_size": 128,
             ], floatType: .bfloat16, quantizeLinears: true)
-            let cache = model.newCache(parameters: nil)
+            let cache = try model.newCache(parameters: nil)
             XCTAssertEqual(model.exactVerifyPositions(remainingIn: cache), 64)
             let saved = Inkling2FastPath.off
             defer { Inkling2FastPath.off = saved }
