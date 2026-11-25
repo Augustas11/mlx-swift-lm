@@ -828,7 +828,10 @@ enum Inkling2VerifyAttention {
 /// and at most ``Inkling2VerifyRows/maximum`` input rows: one row is ordinary decode, and a
 /// speculative verify of up to that many rows must take the same span product so each row gets
 /// its one-row bits (the full-span widths miss the fork's batched small-row window and run the
-/// per-row matrix-vector kernel at both sizes). Wider inputs project every part on its own.
+/// per-row matrix-vector kernel at both sizes). A continuous batch of one-token rows takes the
+/// span too (#2505): on the row-invariant small-M route each row of a quantized product holds the
+/// bits it holds alone, so a batched row gets exactly the lone row's projection, where per-part
+/// products would tile their reductions differently. Wider inputs project every part on its own.
 ///
 /// Ported from the single projection per input in Ollama's Inkling 2 attention (Ollama pull
 /// request 19843, `model/models/inkling2` `project`; MIT licence, Copyright (c) Ollama).
@@ -842,8 +845,9 @@ private final class Inkling2ProjectionSpans {
     ///   computation each row's decode step makes, in one dispatch. One multi-row product can
     ///   leave the one-row kernel: past the GPU's batched matrix-vector limit (6 rows for wide
     ///   outputs on some M1/M2 GPUs) MLX switches to its matrix kernel.
-    init(rows: Int, verify: Bool = false) {
-        enabled = (rows == 1 || verify) && Inkling2FastPath.uses(.oneProjection)
+    /// - Parameter oneToken: one-token decode rows (one row or a continuous batch, #2505).
+    init(rows: Int, oneToken: Bool = false, verify: Bool = false) {
+        enabled = (rows == 1 || oneToken || verify) && Inkling2FastPath.uses(.oneProjection)
         perRow = verify
     }
 
@@ -1031,8 +1035,8 @@ public enum Inkling2FastPath {
         /// attention residual or the layer output's residual in the kernel, the global layers'
         /// dynamic ones compute their taps and lag products in the kernel.
         case convAdd = "convadd"
-        /// One quantized product per (fused projection, input) at single-row decode, sliced into
-        /// the parts, instead of one product per part.
+        /// One quantized product per (fused projection, input) at one-token decode (one row or a
+        /// continuous batch of rows), sliced into the parts, instead of one product per part.
         case oneProjection = "oneproj"
         /// The router's top-k, gather of the chosen scores, at single-row decode in the fork's
         /// shared one-dispatch top-k kernel instead of the sort and gather.
@@ -1772,6 +1776,16 @@ final class Inkling2SparseMoE: Module {
                 concatenated(routed.map(\.weights), axis: 0).reshaped(shape + [topK])
             )
         }
+        if !verify, x.ndim == 3, x.dim(0) > 1, x.dim(1) == 1 {
+            // A continuous batch of one-token rows (#2505): each row routes as it does alone. The
+            // float32 score product of several rows runs a matrix-matrix kernel whose reduction
+            // order differs from one row's matrix-vector kernel, and a low-bit score change can
+            // swap a chosen expert, so batched rows would leave their serial tokens.
+            let rows = (0 ..< x.dim(0)).map { route(x[$0 ..< ($0 + 1)]) }
+            return (
+                concatenated(rows.map(\.indices), axis: 0), concatenated(rows.map(\.weights), axis: 0)
+            )
+        }
         if Inkling2FastPath.uses(.router), Inkling2FastPath.onGPU, x.size == x.dim(-1) {
             // Single-row decode: the top-k and the gather in one dispatch. The shared kernel's
             // descending order is `argPartition(-selection, kth: K - 1)[..<K]`'s (stable, ties
@@ -2043,7 +2057,7 @@ final class Inkling2Attention: Module {
         // Row parts of `in_proj` (local) or `q_proj` (global) that read the query input.
         let (q, r, g, s) = isSliding ? (0, 3, 4, 5) : (0, 1, 2, 3)
         let verify = batch == 1 && Inkling2VerifyRows.isVerify(length, cache: cache)
-        let spans = Inkling2ProjectionSpans(rows: batch * length, verify: verify)
+        let spans = Inkling2ProjectionSpans(rows: batch * length, oneToken: length == 1, verify: verify)
         if let inProj {
             if keyInput === x && valueInput === x {
                 spans.add(inProj, 0 ..< inProj.weight.dim(0), x)
