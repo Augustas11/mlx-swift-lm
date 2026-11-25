@@ -122,11 +122,17 @@ final class Inkling2VerifyKernelTests: XCTestCase {
                     concatenated([flat, flat], axis: 1), [rows, 1, 2304],
                     strides: [2 * 2304, 2304, 1])
                 let asStridedBatch = matmul(viewed, weight.transposed())
+                // A 3-D weight keeps the op from flattening the batch into M.
+                let broadcastWeight = broadcast(
+                    weight.transposed().expandedDimensions(axis: 0), to: [rows, 2304, 128])
+                let broadcastStrided = matmul(viewed, broadcastWeight)
+                let broadcastContiguous = matmul(flat, broadcastWeight)
                 for row in 0 ..< rows {
                     let one = matmul(x32[0..., row ..< (row + 1)], weight.transposed())
                     for (name, batch) in [
                         ("strided", plainBatch), ("contiguous", contiguous),
-                        ("asStrided", asStridedBatch),
+                        ("asStrided", asStridedBatch), ("broadcastStrided", broadcastStrided),
+                        ("broadcastContiguous", broadcastContiguous),
                     ] {
                         let b = batch[row ..< (row + 1)].reshaped(one.shape)
                         let same = arrayEqual(b, one).item(Bool.self)
