@@ -1129,6 +1129,15 @@ private let inkling2CompiledRouteScores:
             return (scores, scores + bias)
         }
 
+/// ``inkling2CompiledRouteScores`` for a batch of rows against a `[rows, K, experts]` weight
+/// (``Inkling2SparseMoE/batchedScores(_:)``): the same sigmoid and bias.
+private let inkling2CompiledBatchedRouteScores:
+    @Sendable (MLXArray, MLXArray, MLXArray) -> (MLXArray, MLXArray) =
+        compile(shapeless: false) { x, weight, bias in
+            let scores = sigmoid(matmul(x, weight))
+            return (scores, scores + bias)
+        }
+
 /// The router's weights from the chosen scores, compiled: normalised over the chosen experts
 /// and multiplied by `route_scale`, as ``inkling2CompiledRoute(topK:routeScale:)`` computes them.
 private func inkling2CompiledRouteWeights(routeScale: Float) -> @Sendable (MLXArray) -> MLXArray {
@@ -1734,9 +1743,25 @@ final class Inkling2SparseMoE: Module {
         if verify, rows > 1 {
             // A speculative verify: a multi-row float32 product takes a different kernel (and K
             // order) from the one-row matrix-vector product, so near-tie experts could swap. Each
-            // row routes exactly as its one-row decode step does (oMLX `_row_matmul`). One
-            // dispatch over a strided row batch (``batchedScores(_:)``) does not reproduce the
-            // one-row scores on the GPU yet, so each row routes alone.
+            // row routes exactly as its one-row decode step does (oMLX `_row_matmul`). On the
+            // GPU the scores and the top-k take one dispatch each: the scores over a strided row
+            // batch against the weight broadcast to 3-D (``batchedScores(_:)``), so the product
+            // stays one matrix-vector product per row, and the fused top-k runs one threadgroup
+            // per row. The weights stay row by row: their sum over a row's experts is a
+            // whole-array reduction on one row and a row reduction on several.
+            if Inkling2FastPath.uses(.router), Inkling2FastPath.onGPU {
+                let (scores, selection) = batchedScores(x)
+                if supportsFusedRouterTopK(selection[0], k: topK) {
+                    let top = fusedRouterTopK(
+                        selection: selection, values: scores, k: topK, normalize: false,
+                        order: .descending)
+                    let weights = concatenated(
+                        (0 ..< rows).map { compiledRouteWeights(top.scores[$0 ..< ($0 + 1)]) },
+                        axis: 0)
+                    let shape = Array(x.shape.dropLast()) + [topK]
+                    return (top.indices.reshaped(shape), weights.reshaped(shape))
+                }
+            }
             // Each row in the rank and shape a one-row decode step routes.
             let one = Array(repeating: 1, count: x.ndim - 1) + [x.dim(-1)]
             let flat = x.reshaped(rows, x.dim(-1))
@@ -1774,15 +1799,22 @@ final class Inkling2SparseMoE: Module {
         return (indices, weights)
     }
 
-    /// The router scores and selection of every row of `x` in one dispatch over a strided row
-    /// batch (``inkling2RowBatch``), for the bit-equality check against one-row routing.
+    /// The router scores and selection (`[rows, 1, experts]`) of every row of `x`, each as its
+    /// one-row decode step computes them, in one product. The rows are a `[rows, 1, K]` view
+    /// `2K` apart and the weight is broadcast to `[rows, K, experts]`: against a 2-D weight the
+    /// op folds a batch into one `rows`-row product (another kernel and K order), and a
+    /// contiguous batch is folded at evaluation; this pair keeps one matrix-vector product per
+    /// row. Then the compiled sigmoid and bias, elementwise like the one-row step's.
     func batchedScores(_ x: MLXArray) -> (scores: MLXArray, selection: MLXArray) {
-        inkling2CompiledRouteScores(inkling2RowBatch(x.asType(.float32)), routerWeight, routerBias)
-    }
-
-    /// One row's router scores and selection as its decode step computes them.
-    func oneRowScores(_ x: MLXArray) -> (scores: MLXArray, selection: MLXArray) {
-        inkling2CompiledRouteScores(x, routerWeight, routerBias)
+        let k = x.dim(-1)
+        let rows = x.size / k
+        let flat = x.asType(.float32).reshaped(rows, 1, k)
+        let view = asStrided(
+            concatenated([flat, flat], axis: 1), [rows, 1, k], strides: [2 * k, k, 1])
+        let weight = broadcast(
+            routerWeight.asType(.float32).transposed().expandedDimensions(axis: 0),
+            to: [rows, k, routerWeight.dim(0)])
+        return inkling2CompiledBatchedRouteScores(view, weight, routerBias)
     }
 
     /// - Parameter verify: a speculative verify: each row routes as its one-row decode step does.
