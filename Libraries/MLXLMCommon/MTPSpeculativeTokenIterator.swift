@@ -555,8 +555,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         // accepted draft prefix plus the verifier's correction/bonus token.
         // Keep the whole pending buffer within the remaining output budget.
         let roundStart = Date.timeIntervalSinceReferenceDate
-        let depthLimit = Swift.min(adaptiveDepth?.depth() ?? (blockSize - 1), blockSize - 1)
-        var depthLimit = depthLimit
+        var depthLimit = Swift.min(adaptiveDepth?.depth() ?? (blockSize - 1), blockSize - 1)
         if let remaining = (mainModel as? any MTPExactVerifyLimitModel)?
             .exactVerifyPositions(remainingIn: mainCache)
         {
