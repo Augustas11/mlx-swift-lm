@@ -1048,6 +1048,174 @@ final class GLM5NextTests: XCTestCase {
         }
     }
 
+    // MARK: - KDA prefill fusion
+
+    /// The fused KDA prefill kernels (`glm5NextKDAPrefillFusion`: conv + SiLU
+    /// + q/k l2norm, and the gated RMSNorm) reproduce the op path bit for bit
+    /// at GLM-5.3-Flash's linear-attention shapes (64 heads of head_dim 128,
+    /// bfloat16): output, conv state and recurrent state, for 2048-, 1625-
+    /// and 137-token chunks from an empty cache and over a prior chunk's
+    /// states, and for two rows. The hidden size is 512 instead of 4096: the
+    /// projections are not part of the fusion. A 2-head module with 12- and
+    /// 9-token chunks has fewer than 32 reduction rows (B * L * H), so the op
+    /// path's sums run `row_reduce_looped` instead of `row_reduce_simple`.
+    func testKDAPrefillFusionMatchesOpPathBitwise() throws {
+        var json = textConfigJSON(linearHeadDim: 128)
+        json = json.replacingOccurrences(of: #""hidden_size": 64"#, with: #""hidden_size": 512"#)
+        json = json.replacingOccurrences(
+            of: #""linear_attn_config": {"num_heads": 2"#,
+            with: #""linear_attn_config": {"num_heads": 64"#)
+        let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: Data(json.utf8))
+        XCTAssertEqual(config.linearNumHeads, 64)
+        XCTAssertEqual(config.linearHeadDim, 128)
+        let attention = GLM5NextLinearAttention(config)
+        randomize(attention, seed: 17)
+        castToBFloat16(attention)
+        attention.train(false)
+
+        let small = GLM5NextLinearAttention(try configuration(linearHeadDim: 128))
+        XCTAssertEqual(small.numHeads, 2)
+        randomize(small, seed: 23)
+        castToBFloat16(small)
+        small.train(false)
+
+        func bitsEqual(_ a: MLXArray?, _ b: MLXArray?, _ message: String) {
+            guard let a, let b else { return XCTFail("\(message): missing array") }
+            let bits: DType = a.dtype == .float32 ? .uint32 : .uint16
+            XCTAssertTrue(
+                arrayEqual(a.view(dtype: bits), b.view(dtype: bits)).item(Bool.self),
+                "\(message): bit patterns differ")
+        }
+
+        func compare(
+            _ attention: GLM5NextLinearAttention, hidden: Int,
+            _ cases: [(rows: Int, chunks: [Int])]
+        ) {
+            for (rows, chunks) in cases {
+                let input = withRandomState(MLXRandom.RandomState(seed: 19)) {
+                    MLXRandom.normal([rows, chunks.reduce(0, +), hidden]).asType(.bfloat16)
+                }
+                let fusedCache = MambaCache()
+                let opCache = MambaCache()
+                var start = 0
+                for width in chunks {
+                    let x = input[0..., start ..< (start + width)]
+                    let label =
+                        "heads \(attention.numHeads), rows \(rows), chunk at \(start)"
+                        + ", width \(width)"
+                    #if DEBUG
+                        let qkvRuns = attention.fusedPrefillQKVRuns
+                        let normRuns = attention.fusedPrefillNormGateRuns
+                    #endif
+                    attention.fusedPrefill = true
+                    let fused = attention(x, cache: fusedCache)
+                    attention.fusedPrefill = false
+                    let reference = attention(x, cache: opCache)
+                    attention.fusedPrefill = true
+                    #if DEBUG
+                        XCTAssertEqual(
+                            attention.fusedPrefillQKVRuns, qkvRuns + 1,
+                            "\(label): fused q/k/v ran")
+                        XCTAssertEqual(
+                            attention.fusedPrefillNormGateRuns, normRuns + 1,
+                            "\(label): fused gated norm ran")
+                    #endif
+                    assertBitwiseEqual(fused, reference, "\(label): output")
+                    assertBitwiseEqual(fusedCache[0], opCache[0], "\(label): conv state")
+                    assertBitwiseEqual(fusedCache[1], opCache[1], "\(label): recurrent state")
+                    bitsEqual(fused, reference, "\(label): output")
+                    bitsEqual(fusedCache[0], opCache[0], "\(label): conv state")
+                    bitsEqual(fusedCache[1], opCache[1], "\(label): recurrent state")
+                    start += width
+                }
+            }
+        }
+        compare(
+            attention, hidden: config.hiddenSize,
+            [(1, [2048, 137]), (1, [1625, 2048]), (1, [137, 1625]), (2, [137, 137])])
+        compare(small, hidden: small.qProj.weight.dim(1), [(1, [12, 9])])
+
+        // The kernels cover the real shape (B = 1, L = 137, 64 x 128) in
+        // release builds too, where the run counters do not exist.
+        let x = withRandomState(MLXRandom.RandomState(seed: 29)) {
+            MLXRandom.normal([1, 137, config.hiddenSize]).asType(.bfloat16)
+        }
+        let qkvWidth = 3 * attention.numHeads * attention.headDim
+        XCTAssertNotNil(
+            glm5NextKDAPrefillQKV(
+                q: attention.qProj(x), k: attention.kProj(x), v: attention.vProj(x),
+                convState: MLXArray.zeros([1, 3, qkvWidth], dtype: .bfloat16),
+                convWeight: attention.conv1d.weight, heads: attention.numHeads,
+                headDim: attention.headDim),
+            "the fused q/k/v kernel must cover the real prefill shape")
+        let headShape = [1, 137, attention.numHeads, attention.headDim]
+        let (y, gate) = withRandomState(MLXRandom.RandomState(seed: 31)) {
+            (
+                MLXRandom.normal(headShape).asType(.bfloat16),
+                MLXRandom.normal(headShape).asType(.bfloat16)
+            )
+        }
+        XCTAssertNotNil(
+            glm5NextKDAPrefillNormGate(
+                y, gate: gate, weight: attention.oNorm.weight, eps: attention.oNorm.eps),
+            "the fused gated norm kernel must cover the real prefill shape")
+        XCTAssertFalse(attention.training, "fused paths only run in evaluation mode")
+    }
+
+    /// A small model's prefill logits are identical with the KDA prefill
+    /// fusion on and off: a 40-token prefill from an empty cache, a 25-token
+    /// chunk over its states, then decode steps over the resulting caches.
+    func testKDAPrefillFusionKeepsModelLogitsBitwise() throws {
+        let model = GLM5NextTextModel(try configuration(indexTopk: 8, linearHeadDim: 128))
+        randomize(model)
+        castToBFloat16(model)
+        model.train(false)
+        let input = tokens(70)
+        let linear = model.model.layers.filter { $0.isLinear }.map {
+            $0.selfAttn as! GLM5NextLinearAttention
+        }
+        XCTAssertFalse(linear.isEmpty)
+
+        func run(fused: Bool) throws -> [MLXArray] {
+            for attention in linear {
+                attention.fusedPrefill = fused
+            }
+            let cache = try model.newCache(parameters: nil)
+            var logits = [model(input[0..., ..<40], cache: cache)]
+            logits.append(model(input[0..., 40 ..< 65], cache: cache))
+            for t in 65 ..< 70 {
+                logits.append(model(input[0..., t ..< (t + 1)], cache: cache))
+            }
+            eval(logits)
+            return logits
+        }
+        #if DEBUG
+            let qkvRuns = linear.map { $0.fusedPrefillQKVRuns }
+            let normRuns = linear.map { $0.fusedPrefillNormGateRuns }
+        #endif
+        let fused = try run(fused: true)
+        #if DEBUG
+            for (i, attention) in linear.enumerated() {
+                XCTAssertGreaterThan(
+                    attention.fusedPrefillQKVRuns, qkvRuns[i], "KDA layer \(i): fused q/k/v ran")
+                XCTAssertGreaterThan(
+                    attention.fusedPrefillNormGateRuns, normRuns[i],
+                    "KDA layer \(i): fused gated norm ran")
+            }
+            let fusedQKVRuns = linear.map { $0.fusedPrefillQKVRuns }
+        #endif
+        let reference = try run(fused: false)
+        #if DEBUG
+            XCTAssertEqual(
+                linear.map { $0.fusedPrefillQKVRuns }, fusedQKVRuns,
+                "the reference run keeps the op path")
+        #endif
+        XCTAssertEqual(fused.count, reference.count)
+        for (step, (a, b)) in zip(fused, reference).enumerated() {
+            assertBitwiseEqual(a, b, "logits at step \(step)")
+        }
+    }
+
     // MARK: - Wide prefill slices (#2451)
 
     /// `glm5NextPrefillSlicesKey`: one forward over consecutive prompt

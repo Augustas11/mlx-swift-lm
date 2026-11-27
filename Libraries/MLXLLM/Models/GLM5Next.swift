@@ -645,6 +645,17 @@ final class GLM5NextLinearAttention: Module {
     /// delta rule and gated norm of every row).
     var fusedDecode = true
 
+    /// Prefill (more than 8 tokens per row) runs the conv + SiLU + q/k
+    /// l2norm as one dispatch (`glm5NextKDAPrefillQKV`) and the gated RMSNorm
+    /// as another (`glm5NextKDAPrefillNormGate`), bit for bit as the op path,
+    /// when `glm5NextKDAPrefillFusion` covers the inputs.
+    var fusedPrefill = true
+    #if DEBUG
+        /// Prefill calls that ran each fused kernel (tests).
+        var fusedPrefillQKVRuns = 0
+        var fusedPrefillNormGateRuns = 0
+    #endif
+
     func callAsFunction(_ x: MLXArray, cache: MambaCache?, checkpointAfter: Int? = nil) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
         if let split = checkpointAfter, let cache, L > 1 {
@@ -653,27 +664,52 @@ final class GLM5NextLinearAttention: Module {
         if fusedDecode, !training, let cache, L <= 8, let y = fusedDecodeStep(x, cache: cache) {
             return y
         }
-        let mixed = concatenated(
-            [glm5NextProject(qProj, x), glm5NextProject(kProj, x), glm5NextProject(vProj, x)],
-            axis: -1)
+        let projections = [
+            glm5NextProject(qProj, x), glm5NextProject(kProj, x), glm5NextProject(vProj, x),
+        ]
 
         let convState =
             cache?[0]
             ?? MLXArray.zeros([B, convKernelSize - 1, 3 * projectionDim], dtype: x.dtype)
-        let convInput = concatenated([convState, mixed], axis: 1)
-        let convOut = silu(conv1d(convInput))
-
-        let parts = split(convOut, indices: [projectionDim, 2 * projectionDim], axis: -1)
         let shape = [B, L, numHeads, headDim]
-        // mlx-vlm `_l2norm`: x * rsqrt(sum(x^2) + 1e-6) in float32; q also scaled by Dk^-1/2.
-        func l2norm(_ x: MLXArray) -> MLXArray {
-            x * rsqrt((x * x).sum(axis: -1, keepDims: true) + 1e-6)
+        let fused = fusedPrefill && !training && glm5NextKDAPrefillFusion(x, convState: convState)
+        let q: MLXArray
+        let k: MLXArray
+        let v: MLXArray
+        let newConvState: MLXArray
+        if fused,
+            let qkv = glm5NextKDAPrefillQKV(
+                q: projections[0], k: projections[1], v: projections[2], convState: convState,
+                convWeight: conv1d.weight, heads: numHeads, headDim: headDim)
+        {
+            #if DEBUG
+                fusedPrefillQKVRuns += 1
+            #endif
+            q = qkv.q
+            k = qkv.k
+            v = qkv.v
+            // `convInput[..., -3:, :]` below: with L > 3 these are the last
+            // three projection rows, copied unchanged.
+            newConvState = concatenated(
+                projections.map { $0[0..., (1 - convKernelSize)..., 0...] }, axis: -1)
+        } else {
+            let mixed = concatenated(projections, axis: -1)
+            let convInput = concatenated([convState, mixed], axis: 1)
+            let convOut = silu(conv1d(convInput))
+
+            let parts = split(convOut, indices: [projectionDim, 2 * projectionDim], axis: -1)
+            // mlx-vlm `_l2norm`: x * rsqrt(sum(x^2) + 1e-6) in float32; q also scaled by Dk^-1/2.
+            func l2norm(_ x: MLXArray) -> MLXArray {
+                x * rsqrt((x * x).sum(axis: -1, keepDims: true) + 1e-6)
+            }
+            q =
+                (l2norm(parts[0].reshaped(shape).asType(.float32))
+                    * Float(pow(Double(headDim), -0.5)))
+                .asType(x.dtype)
+            k = l2norm(parts[1].reshaped(shape).asType(.float32)).asType(x.dtype)
+            v = parts[2].reshaped(shape)
+            newConvState = contiguous(convInput[0..., (1 - convKernelSize)..., 0...])
         }
-        let q =
-            (l2norm(parts[0].reshaped(shape).asType(.float32)) * Float(pow(Double(headDim), -0.5)))
-            .asType(x.dtype)
-        let k = l2norm(parts[1].reshaped(shape).asType(.float32)).asType(x.dtype)
-        let v = parts[2].reshaped(shape)
 
         let decay = forgetGate(x)
         let beta = sigmoid(glm5NextProject(bProj, x))
@@ -681,13 +717,41 @@ final class GLM5NextLinearAttention: Module {
             q: q, k: k, v: v, g: decay, beta: beta, state: cache?[1], useKernel: !training)
 
         if let cache {
-            cache[0] = contiguous(convInput[0..., (1 - convKernelSize)..., 0...])
+            cache[0] = newConvState
             cache[1] = state
             cache.advance(L)
         }
 
         let gate = glm5NextProject(gBProj, glm5NextProject(gAProj, x)).reshaped(shape)
-        return glm5NextProject(oProj, oNorm(out, gate: gate).reshaped(B, L, -1))
+        let normed: MLXArray
+        if fused,
+            let y = glm5NextKDAPrefillNormGate(
+                out, gate: gate, weight: oNorm.weight, eps: oNorm.eps)
+        {
+            #if DEBUG
+                fusedPrefillNormGateRuns += 1
+            #endif
+            normed = y
+        } else {
+            normed = oNorm(out, gate: gate)
+        }
+        return glm5NextProject(oProj, normed.reshaped(B, L, -1))
+    }
+
+    /// Whether a prefill call (`L > 8` tokens per row, past the decode
+    /// kernels) runs the fused KDA prefill kernels: bfloat16 activations,
+    /// conv weights and conv state, head_dim 128, a 4-tap conv. Everything
+    /// else (float16, float32, other head sizes) keeps the op path. The
+    /// projections, forget gate, recurrence and o_proj are unchanged either
+    /// way, so quantization does not matter here.
+    private func glm5NextKDAPrefillFusion(_ x: MLXArray, convState: MLXArray) -> Bool {
+        let (B, L) = (x.dim(0), x.dim(1))
+        return x.ndim == 3 && L > 8 && x.dtype == .bfloat16 && headDim == 128
+            && convKernelSize == 4
+            && conv1d.bias == nil && conv1d.weight.dtype == .bfloat16
+            && conv1d.weight.shape == [3 * projectionDim, convKernelSize, 1]
+            && convState.dtype == .bfloat16
+            && convState.shape == [B, convKernelSize - 1, 3 * projectionDim]
     }
 
     /// MTP verification: every column computed as its one-token decode step
