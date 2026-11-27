@@ -535,6 +535,226 @@ func glm5NextKDAVerifyStep(
     return (outputs[0], outputs[1], outputs[2])
 }
 
+// MARK: - KDA prefill (conv + SiLU + q/k l2norm; gated RMSNorm)
+
+/// q, k, v of a KDA prefill in one dispatch: one simdgroup per (row, token,
+/// head, part), lane `l` owning channels `4l ..< 4l + 4` of the head.
+///
+/// Bit-exact with the op path of `GLM5NextLinearAttention` (MLX at the
+/// fork's pin), op by op, for any token count:
+/// - `conv1d` with groups == channels, stride 1, no padding or flip runs
+///   `depthwise_conv_1D_gpu` for every shape (backend/metal/conv.cpp,
+///   `conv_1D_gpu` fast path), whose `depthwise_conv_1d` (kernels/conv.metal)
+///   is `float acc = 0; acc += float(in[t + i]) * w[i]` for i = 0..3, then
+///   `T(acc)`. Window rows below 3 come from the conv state, the rest from
+///   the projections, which is what `concatenate([state, q|k|v])` holds.
+/// - `silu` is MLXNN's `compile(shapeless:) { x * sigmoid(x) }`: Sigmoid
+///   (kernels/unary_ops.h, here `glm_sigmoid<T>`) rounded to T, then the
+///   product in T.
+/// - `sum(x * x, -1)` over the 128 fp32 channels: row size 128 > 64, so
+///   `row_reduce_simple` (>= 32 rows) or `row_reduce_looped` (backend/metal/
+///   reduce.cpp, `row_reduce_general_dispatch`); both run one simdgroup per
+///   row (`threadgroup_size_from_row_size(128)` = 32) with N_READS = 4,
+///   blocks = 1, extra = 0 (kernels/reduction/reduce_row.h): thread `l` adds
+///   elements `4l..4l+3` in order to 0, then `simd_sum`. The looped kernel's
+///   extra `0 + row_total` is exact. Squares of bf16 values are exact in
+///   fp32, so FMA contraction cannot change the sum.
+/// - `+ 1e-6`, `rsqrt` (Rsqrt: `metal::precise::rsqrt`), `x * r`,
+///   `* Dk^-0.5` are separate fp32 roundings, then the cast to T; v is the
+///   SiLU output itself.
+/// - Custom kernels compile with `MathMode::Safe` (backend/common/
+///   metal_kernel.h `CompileOptions`), as MLX's own kernels (no fast math:
+///   kernels/CMakeLists.txt `-fno-fast-math`), so `1 / (1 + exp)` is IEEE.
+/// The arithmetic is the decode kernel's (`glm5NextKDASource` steps 1 and 2),
+/// which `testFusedKDADecodeMatchesOpPathBitwise` checks against the same
+/// op graph.
+private let glm5NextKDAPrefillQKVSource = """
+      constexpr int CK = 4;
+      constexpr int NPL = DK / 32;
+      const uint lane = thread_index_in_simdgroup;
+      const int part = int(simdgroup_index_in_threadgroup);
+      const int h = int(threadgroup_position_in_grid.x);
+      const int t = int(threadgroup_position_in_grid.y);
+      const int b = int(threadgroup_position_in_grid.z);
+      const int L = int(threadgroups_per_grid.y);
+      const float q_scale = consts[0];
+      const float l2_eps = consts[1];
+      const device T* src = part == 0 ? q_in : (part == 1 ? k_in : v_in);
+      device T* dst = part == 0 ? q_out : (part == 1 ? k_out : v_out);
+      const size_t row0 = size_t(b) * size_t(L);
+
+      // Short conv over [conv_state; q|k|v] and SiLU.
+      T sv[NPL];
+      for (int e = 0; e < NPL; e++) {
+        const int col = h * DK + NPL * int(lane) + e;
+        const int gc = part * QKV + col;
+        const device T* w = conv_w + gc * CK;
+        float acc = 0.0;
+        for (int j = 0; j < CK; ++j) {
+          const int r = t + j;
+          T xin = r < CK - 1
+              ? conv_state[(size_t(b) * (CK - 1) + r) * (3 * QKV) + gc]
+              : src[(row0 + size_t(r - (CK - 1))) * QKV + col];
+          acc += static_cast<float>(xin) * w[j];
+        }
+        T co = static_cast<T>(acc);
+        T sgm = glm_sigmoid<T>(co);
+        sv[e] = co * sgm;
+      }
+
+      const size_t o = ((row0 + size_t(t)) * H + h) * DK + NPL * lane;
+      if (part == 2) {
+        for (int e = 0; e < NPL; e++) {
+          dst[o + e] = sv[e];
+        }
+      } else {
+        // l2norm(q) * q_scale, l2norm(k): x * rsqrt(sum(x * x) + eps) in fp32.
+        float x[NPL];
+        float tot = 0.0f;
+        for (int e = 0; e < NPL; e++) {
+          x[e] = static_cast<float>(sv[e]);
+          float sq = x[e] * x[e];
+          tot = sq + tot;
+        }
+        tot = simd_sum(tot);
+        float u = tot + l2_eps;
+        float r = metal::precise::rsqrt(u);
+        for (int e = 0; e < NPL; e++) {
+          float xn = x[e] * r;
+          if (part == 0) {
+            float xs = xn * q_scale;
+            dst[o + e] = static_cast<T>(xs);
+          } else {
+            dst[o + e] = static_cast<T>(xn);
+          }
+        }
+      }
+    """
+
+/// `GLM5NextGatedRMSNorm(x, gate)` over `[rows, 128]`: one simdgroup per
+/// row, lane `l` owning channels `4l ..< 4l + 4`.
+///
+/// Bit-exact with `GLM5NextGatedRMSNorm.callAsFunction` (MLX at the fork's
+/// pin), op by op, for any row count:
+/// - `mean(xf * xf, -1)` is `multiply(sum(...), 1/n)` (mlx/ops.cpp `mean`,
+///   normalizer from `number_of_elements(..., inverted)`; 1/128 is exact).
+///   The sum is the same 128-wide fp32 row reduction as in
+///   `glm5NextKDAPrefillQKVSource` (`row_reduce_simple` or `_looped`, one
+///   simdgroup, 4 ordered reads per lane, `simd_sum`), over squares of bf16
+///   values, which are exact.
+/// - `variance + eps` (fp32; `* 2^-7` is exact, so a contracted FMA rounds
+///   the same), `rsqrt` (`metal::precise::rsqrt`), `xf * r`,
+///   `weight.f32 * (...)`, `sigmoid(gate.f32)` (Sigmoid functor on fp32,
+///   `glm_sigmoid<float>`) and the product are separate fp32 roundings, then
+///   the cast to T.
+/// The arithmetic is the decode kernel's step 5 (`glm5NextKDASource`).
+private let glm5NextKDAPrefillNormGateSource = """
+      constexpr int NPL = DK / 32;
+      const uint lane = thread_index_in_simdgroup;
+      const size_t row = size_t(thread_position_in_grid.x) / 32;
+      const size_t base = row * DK + NPL * lane;
+      const float norm_eps = consts[0];
+      const float inv_n = consts[1];
+      float x[NPL];
+      float tot = 0.0f;
+      for (int e = 0; e < NPL; e++) {
+        x[e] = static_cast<float>(x_in[base + e]);
+        float sq = x[e] * x[e];
+        tot = sq + tot;
+      }
+      tot = simd_sum(tot);
+      float var = tot * inv_n;
+      float u = var + norm_eps;
+      float r = metal::precise::rsqrt(u);
+      for (int e = 0; e < NPL; e++) {
+        const int c = NPL * int(lane) + e;
+        float xn = x[e] * r;
+        float wf = static_cast<float>(norm_w[c]);
+        float wx = wf * xn;
+        float gf = static_cast<float>(gate[base + e]);
+        float gsg = glm_sigmoid<float>(gf);
+        float o = wx * gsg;
+        y[base + e] = static_cast<T>(o);
+      }
+    """
+
+private final class GLM5NextKDAPrefillKernels: Sendable {
+    static let shared = GLM5NextKDAPrefillKernels()
+    let qkv: MLXFast.MLXFastKernel
+    let normGate: MLXFast.MLXFastKernel
+
+    private init() {
+        qkv = MLXFast.metalKernel(
+            name: "glm5next_kda_prefill_qkv",
+            inputNames: ["q_in", "k_in", "v_in", "conv_state", "conv_w", "consts"],
+            outputNames: ["q_out", "k_out", "v_out"], source: glm5NextKDAPrefillQKVSource,
+            header: glm5NextKernelHeader)
+        normGate = MLXFast.metalKernel(
+            name: "glm5next_kda_prefill_norm_gate",
+            inputNames: ["x_in", "gate", "norm_w", "consts"],
+            outputNames: ["y"], source: glm5NextKDAPrefillNormGateSource,
+            header: glm5NextKernelHeader)
+    }
+}
+
+/// The KDA prefill's q `[B, L, H, Dk]` (conv, SiLU, l2norm, `* Dk^-0.5`),
+/// k (conv, SiLU, l2norm) and v (conv, SiLU) from the `[B, L, H * Dk]`
+/// projections and the `[B, 3, 3 * H * Dk]` conv state, bit for bit as the
+/// op path. bfloat16, head_dim 128 and `L >= 3` only; `nil` otherwise (the caller keeps
+/// the op path). The new conv state is the caller's (the last 3 projection
+/// rows).
+func glm5NextKDAPrefillQKV(
+    q: MLXArray, k: MLXArray, v: MLXArray, convState: MLXArray, convWeight: MLXArray,
+    heads: Int, headDim: Int, l2Eps: Float = 1e-6
+) -> (q: MLXArray, k: MLXArray, v: MLXArray)? {
+    let dtype = q.dtype
+    // L >= 3: the caller's new conv state is the last 3 projection rows.
+    guard dtype == .bfloat16, headDim == 128, heads >= 1, q.ndim == 3, q.dim(0) >= 1,
+        q.dim(1) >= 3
+    else { return nil }
+    let (B, L) = (q.dim(0), q.dim(1))
+    let qkv = heads * headDim
+    for part in [q, k, v] where part.shape != [B, L, qkv] || part.dtype != dtype {
+        return nil
+    }
+    guard convState.shape == [B, 3, 3 * qkv], convState.dtype == dtype,
+        convWeight.shape == [3 * qkv, 4, 1], convWeight.dtype == dtype
+    else { return nil }
+    // Python float scalars, as the reference builds them (double, then float32).
+    let consts = MLXArray([Float(pow(Double(headDim), -0.5)), l2Eps])
+    let shape = [B, L, heads, headDim]
+    let outputs = GLM5NextKDAPrefillKernels.shared.qkv(
+        [q, k, v, convState, convWeight, consts],
+        template: [("T", dtype), ("DK", headDim), ("QKV", qkv), ("H", heads)],
+        grid: (96 * heads, L, B),
+        threadGroup: (96, 1, 1),
+        outputShapes: [shape, shape, shape],
+        outputDTypes: [dtype, dtype, dtype])
+    return (outputs[0], outputs[1], outputs[2])
+}
+
+/// `GLM5NextGatedRMSNorm(x, gate:)` for bfloat16 `x`, `gate` `[..., 128]`,
+/// bit for bit; `nil` when not covered (the caller keeps the op path).
+func glm5NextKDAPrefillNormGate(_ x: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float)
+    -> MLXArray?
+{
+    guard x.dtype == .bfloat16, x.ndim >= 2, x.dim(-1) == 128, x.size >= 128,
+        gate.shape == x.shape, gate.dtype == x.dtype, weight.shape == [128],
+        [.bfloat16, .float16, .float32].contains(weight.dtype)
+    else { return nil }
+    let rows = x.size / 128
+    // 32 threads per row in grid x, which must stay within Int32.
+    guard rows <= Int(Int32.max) / 32 else { return nil }
+    let consts = MLXArray([eps, Float(1.0 / Double(128))])
+    return GLM5NextKDAPrefillKernels.shared.normGate(
+        [x, gate, weight, consts],
+        template: [("T", x.dtype), ("DK", 128)],
+        grid: (32 * rows, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [x.shape],
+        outputDTypes: [x.dtype])[0]
+}
+
 // MARK: - Multi-projection qmv (one token)
 
 /// `[linear(x) for linear in parts]` for up to six affine projections with
