@@ -94,7 +94,11 @@ let package = Package(
         // and core v0.32.4-macprovider.16: .15 plus ml-explore/mlx #4883 (do not
         // wire user-provided buffers), #4881 (MetalAllocator::malloc(0)) and
         // #4930 (no allocation inside quantize_impl).
-        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "52ae025cbfac595328bd7fad23c8bce560bbe57c"),
+        // mlx-swift macprovider/v0.32.5 (be16992): .28 with core 4ff2db419, the
+        // fork stack merged with upstream mlx v0.32.5 (small-M routes 1 and 2
+        // unchanged; route 0 = upstream's v0.32.5 routing), mlx-c 715780d
+        // (fast SDPA window_size) and regenerated sources. Tag cut at merge.
+        .package(url: "https://github.com/Augustas11/mlx-swift", revision: "be169924bed0b9956125eeab3c9c1eb8b9cb8f6b"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
